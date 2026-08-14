@@ -1,0 +1,26 @@
+[Unit]
+Description=wcloud agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root (by design — it invokes root-level deploy/delete scripts).
+User=root
+WorkingDirectory=/opt/wcloud
+# Load config from an env file (keep AGENT_TOKEN out of the unit file).
+EnvironmentFile=/opt/wcloud/.env
+ExecStart=/usr/bin/node /opt/wcloud/src/server.js
+Restart=on-failure
+RestartSec=3
+# Basic hardening (the agent still needs broad access to run deploys, so these
+# are conservative — tighten per your environment).
+NoNewPrivileges=false
+ProtectSystem=false
+# Log to journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wcloud
+
+[Install]
+WantedBy=multi-user.target
