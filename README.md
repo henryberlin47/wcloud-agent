@@ -23,7 +23,7 @@ All logic is native JS in `src/operations/*.js`, built on shared helpers in
 
 | Operation | Params | What it does |
 |---|---|---|
-| **deploy** | `{ domain, wp_user?, wp_password? }` | `wo site create --wp` + SSL + records DB creds |
+| **deploy** | `{ domain, wp_user?, wp_password? }` | `wo site create --wp` + SSL |
 | **update** | `{ domain }` | `wp core update` + `wp core update-db` + php-fpm restart |
 | **delete** | `{ domain, confirm: true }` | Removes cron, files, WordOps site, nginx config, certs |
 | **ssl** | `{ domain }` | `wo site update --le --force` |
@@ -111,7 +111,7 @@ must come from an allowed IP.
 | GET | `/healthz` | Liveness (no auth, skips the IP allowlist) |
 | GET | `/api/info` | System info (memory, disk, CPU load, software stack, OS/kernel, uptime) + supported operations |
 | GET | `/api/sites` | List websites (`wo site list`) |
-| GET | `/api/sites/:domain/credentials` | DB credentials recorded at deploy time |
+| GET | `/api/sites/:domain/credentials` | DB credentials, read live from the site's `wp-config.php` |
 | POST | `/api/op/:type` | Start an operation → `{ jobId }` |
 | GET | `/api/jobs` | List recent jobs |
 | GET | `/api/jobs/:id` | Job status |

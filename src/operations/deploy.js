@@ -1,20 +1,18 @@
 import config from '../config.js';
-import { run, woSiteExists, nginxTest, nginxReload, wpCli, resolveWpRoot, getPhpVersion } from '../lib/sys.js';
+import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
-import { setCredentials } from '../lib/credentials.js';
 
 // ============================================================
 //  deploy — create a vanilla WordPress site on this server
 // ============================================================
-// Three steps:
+// Two steps:
 //   1) wo site create <domain> --wp [--user --pass --email]  (provisions WP
 //      + local MySQL; --user/--pass are wo's own flags — see
 //      https://docs.wordops.net/commands/site/#site-create)
 //   2) wo site update <domain> --le --force  (issue/renew SSL)
-//   3) record DB credentials for the DB button on the portal's Sites page
-//      (the WP password isn't re-read here — the portal already showed it to
-//      the operator right after they submitted the deploy form, since it's
-//      the one who chose it; see resetPassword.js for changing it later)
+// DB credentials are NOT recorded here — the portal reads them live from
+// wp-config.php on demand (see lib/credentials.js). The WP admin password can't
+// be read back (WordPress keeps only a bcrypt hash); see resetPassword.js.
 // ============================================================
 
 export async function runDeploy(job, helpers, p) {
@@ -55,23 +53,6 @@ export async function runDeploy(job, helpers, p) {
     warn(`SSL failed (DNS/propagation?) — run "wo site update ${domain} --le --force" later`);
   }
 
-  // 3) Record DB credentials — always readable straight from wp-config.php
-  // via `wp config get`, unlike the WP admin password (WordPress only keeps
-  // a bcrypt hash, so it can never be read back after the fact).
-  step('Recording DB credentials');
-  try {
-    const wpRoot = await resolveWpRoot(domain);
-    const wp = wpCli(helpers, wpRoot);
-    const dbResults = await Promise.all(
-      ['DB_NAME', 'DB_USER', 'DB_PASSWORD'].map((key) => wp(['config', 'get', key]))
-    );
-    const [dbName, dbUser, dbPassword] = dbResults.map((r) => (r.code === 0 ? r.stdout.trim() : ''));
-
-    setCredentials(domain, { db_name: dbName, db_user: dbUser, db_password: dbPassword });
-    dbName ? ok('DB credentials recorded') : warn(`Could not read DB config at ${wpRoot}`);
-  } catch (e) {
-    warn(`Could not record DB credentials: ${e.message}`);
-  }
 
   log(`Deploy completed: ${domain}`);
 }

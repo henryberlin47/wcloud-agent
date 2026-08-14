@@ -6,7 +6,7 @@ import { getOperation } from './operations/index.js';
 import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './jobs.js';
 import { woSiteList, run } from './lib/sys.js';
 import { enforceAdminPanelCert } from './lib/panelcert.js';
-import { getCredentials } from './lib/credentials.js';
+import { readDbCredentials } from './lib/credentials.js';
 import { enroll } from './enroll.js';
 
 // --- startup validation -----------------------------------------------------
@@ -302,14 +302,18 @@ app.post('/api/jobs/:id/cancel', (req, res) => {
   res.json({ ok: true });
 });
 
-// --- get recorded WordPress credentials for a domain (set by deploy) --------
-// Already behind requireAuth (mounted above). 404 covers both "never
-// deployed through this agent" and "captured over an hour ago".
-app.get('/api/sites/:domain/credentials', (req, res) => {
-  const creds = getCredentials(req.params.domain);
-  if (!creds) return res.status(404).json({ error: 'not_found' });
-  const { timestamp, ...rest } = creds;
-  res.json(rest);
+// --- get a site's DB credentials, read live from wp-config.php --------------
+// Already behind requireAuth (mounted above). 404 = not a WordPress site the
+// agent can read (missing/invalid wp-config.php).
+app.get('/api/sites/:domain/credentials', async (req, res) => {
+  const helpers = { log: () => {}, err: () => {}, onCancel: () => {} };
+  try {
+    const creds = await readDbCredentials(helpers, req.params.domain);
+    if (!creds) return res.status(404).json({ error: 'not_found' });
+    res.json(creds);
+  } catch (e) {
+    res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
+  }
 });
 
 // --- 404 + error handlers ---------------------------------------------------
