@@ -115,12 +115,39 @@ for c in wget bash openssl sed systemctl ip awk hostname; do
 done
 
 # ------------------------------------------------------------
+step "Fetching agent source"
+# When run via `curl … | bash`, the repo isn't on disk yet — clone it. On a
+# re-run of an existing git checkout, fast-forward instead.
+REPO="${REPO:-https://github.com/henryberlin47/wcloud-agent.git}"
+if ! command -v git >/dev/null 2>&1; then
+  info "Installing git..."
+  apt-get update -qq && apt-get install -y -qq git || die "Could not install git (needed to fetch the agent)."
+fi
+if [ -d /opt/wcloud/.git ]; then
+  info "Updating existing agent checkout..."
+  git -C /opt/wcloud pull --ff-only || warn "git pull failed — using the existing checkout."
+elif [ -f /opt/wcloud/src/server.js ]; then
+  ok "Agent already present at /opt/wcloud (non-git) — skipping clone."
+else
+  info "Cloning $REPO -> /opt/wcloud ..."
+  git clone --depth 1 "$REPO" /opt/wcloud || die "git clone failed."
+fi
+ok "Agent source ready at /opt/wcloud."
+
+# ------------------------------------------------------------
 step "Installing WordOps"
 if command -v wo >/dev/null 2>&1; then
   ok "WordOps already installed ($(wo --version 2>/dev/null | head -n1 || echo present)) — skipping."
 else
+  # WordOps' installer prompts for a git name/email to save server configs. Under
+  # `curl | bash` there's no TTY, so its read loops forever on empty input. Seed a
+  # random git identity first so it finds one and skips the prompt.
+  GIT_RAND=$(openssl rand -hex 4)
+  git config --global user.name  >/dev/null 2>&1 || git config --global user.name  "wcloud-$GIT_RAND"
+  git config --global user.email >/dev/null 2>&1 || git config --global user.email "wcloud-$GIT_RAND@wcloud.local"
+
   info "Downloading WordOps installer (wops.cc)..."
-  if wget -qO /tmp/wo-install wops.cc && bash /tmp/wo-install; then
+  if wget -qO /tmp/wo-install wops.cc && bash /tmp/wo-install </dev/null; then
     ok "WordOps installed."
   else
     rm -f /tmp/wo-install
@@ -350,18 +377,34 @@ else
     WARNINGS+=("AGENT_HOST=$SERVER_IP is a private address — verify it's reachable by the control panel.")
   fi
 
+  # Allowlist = only the portal may reach this root agent. Derive its IP from the
+  # enroll URL host when provided; otherwise fall back to the known panel IP.
+  # ponytail: uses the portal's *ingress* IP — override AGENT_ALLOWED_IPS if the
+  # portal's egress differs (multi-homed / behind a separate NAT).
+  PORTAL_IP="91.108.105.205"
+  if [ -n "${ENROLL_URL:-}" ]; then
+    PORTAL_HOST=$(printf '%s' "$ENROLL_URL" | sed -E 's#^[a-zA-Z]+://##; s#[:/].*$##')
+    RESOLVED=$(getent hosts "$PORTAL_HOST" 2>/dev/null | awk '{print $1; exit}')
+    [ -n "$RESOLVED" ] && PORTAL_IP="$RESOLVED"
+  fi
+
   # Replace placeholder values in the config file
   sed -i "s|^AGENT_TOKEN=.*|AGENT_TOKEN=$AGENT_TOKEN|" "$AGENT_CONFIG"
   sed -i "s|^AGENT_HOST=.*|AGENT_HOST=$SERVER_IP|" "$AGENT_CONFIG"
-  sed -i "s|^AGENT_ALLOWED_IPS=.*|AGENT_ALLOWED_IPS=91.108.105.205|" "$AGENT_CONFIG"
+  sed -i "s|^AGENT_ALLOWED_IPS=.*|AGENT_ALLOWED_IPS=$PORTAL_IP|" "$AGENT_CONFIG"
   sed -i "s|^AGENT_SERVER_NAME=.*|AGENT_SERVER_NAME=$(hostname)|" "$AGENT_CONFIG"
+
+  # Portal enrollment (passed in by the portal's install command). Lets the agent
+  # self-register on startup instead of a manual "add server" form.
+  [ -n "${ENROLL_URL:-}" ]   && sed -i "s|^PORTAL_ENROLL_URL=.*|PORTAL_ENROLL_URL=$ENROLL_URL|" "$AGENT_CONFIG"
+  [ -n "${ENROLL_TOKEN:-}" ] && sed -i "s|^ENROLL_TOKEN=.*|ENROLL_TOKEN=$ENROLL_TOKEN|" "$AGENT_CONFIG"
 
   # Verify the injections actually landed (guards against a changed .env.example)
   grep -q "^AGENT_TOKEN=$AGENT_TOKEN$" "$AGENT_CONFIG" \
     || die "Token injection failed — AGENT_TOKEN key missing in .env.example?"
   grep -q "^AGENT_HOST=$SERVER_IP$" "$AGENT_CONFIG" \
     || die "Host injection failed — AGENT_HOST key missing in .env.example?"
-  grep -q "^AGENT_ALLOWED_IPS=91.108.105.205$" "$AGENT_CONFIG" \
+  grep -q "^AGENT_ALLOWED_IPS=$PORTAL_IP$" "$AGENT_CONFIG" \
     || die "Allowlist injection failed — AGENT_ALLOWED_IPS key missing in .env.example?"
 
   # Verify no unfilled placeholders remain (empty required values)
@@ -373,7 +416,7 @@ else
   ok "Agent configuration created at $AGENT_CONFIG"
   info "Generated token: $AGENT_TOKEN"
   info "Server IP: $SERVER_IP"
-  info "Control panel IP: 91.108.105.205"
+  info "Control panel IP: $PORTAL_IP"
 fi
 
 # ------------------------------------------------------------

@@ -6,6 +6,7 @@ import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './j
 import { woSiteList, run } from './lib/sys.js';
 import { enforceAdminPanelCert } from './lib/panelcert.js';
 import { getCredentials } from './lib/credentials.js';
+import { enroll } from './enroll.js';
 
 // --- startup validation -----------------------------------------------------
 const problems = validateConfig();
@@ -312,6 +313,7 @@ const server = app.listen(config.port, config.host, () => {
       `(allowlist: ${config.allowedIps.length ? config.allowedIps.join(',') : 'ANY'}, ` +
       `concurrency: ${config.maxConcurrentJobs})`
   );
+  enroll(); // self-register with the portal if PORTAL_ENROLL_URL/ENROLL_TOKEN are set
 });
 
 // Graceful shutdown

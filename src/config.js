@@ -42,6 +42,14 @@ const config = {
 
   // Identify this server in responses (handy when the panel manages many).
   serverName: process.env.AGENT_SERVER_NAME || process.env.HOSTNAME || 'unknown',
+
+  // Self-enrollment (optional). When both are set, the agent registers itself
+  // with the portal on startup, so there's no manual "add server" step.
+  enrollUrl: process.env.PORTAL_ENROLL_URL || '',
+  enrollToken: process.env.ENROLL_TOKEN || '',
+  // URL the portal uses to reach this agent. Defaults to the bind host:port;
+  // override if the agent is behind NAT/proxy with a different public address.
+  advertiseUrl: process.env.AGENT_ADVERTISE_URL || '',
 };
 
 export function validateConfig() {

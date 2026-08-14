@@ -29,6 +29,24 @@ All logic is native JS in `src/operations/*.js`, built on shared helpers in
 
 ## Install
 
+### Quick install (recommended)
+
+In the portal, **Servers → Add Server** generates a one-liner. Run it as root on
+a fresh Ubuntu box — it clones this repo, installs WordOps + the agent via
+`init.sh`, and the agent **self-registers** with the portal (no manual form):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/henryberlin47/wcloud-agent/main/init.sh \
+  | REPO='https://github.com/henryberlin47/wcloud-agent.git' \
+    ENROLL_URL='https://YOUR-PORTAL/api/enroll' ENROLL_TOKEN='<token>' bash
+```
+
+`ENROLL_URL`/`ENROLL_TOKEN` become `PORTAL_ENROLL_URL`/`ENROLL_TOKEN` in `.env`;
+on startup the agent POSTs its `base_url` + `api_key` to the portal, which upserts
+the server under the token's owner. The token is short-lived (60 min).
+
+### Manual install
+
 ```bash
 sudo mkdir -p /opt/wcloud
 sudo cp -r src package.json /opt/wcloud/
@@ -65,6 +83,9 @@ sudo journalctl -u wcloud -f
 | `AGENT_MAX_CONCURRENT` | `1` | no |
 | `AGENT_JOB_RETENTION_MS` | `3600000` (1h) | no |
 | `AGENT_JOB_TIMEOUT_MS` | `1200000` (20m) | no |
+| `PORTAL_ENROLL_URL` | *(none)* | no — set by the install command for self-enrollment |
+| `ENROLL_TOKEN` | *(none)* | no — short-lived owner token, paired with the above |
+| `AGENT_ADVERTISE_URL` | `http://AGENT_HOST:PORT` | no — override if the portal reaches the agent at a different URL |
 
 The agent **refuses to start** if the token is missing or if bound to `0.0.0.0`.
 
