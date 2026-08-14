@@ -1,4 +1,5 @@
 import express from 'express';
+import { execSync } from 'node:child_process';
 import config, { validateConfig } from './config.js';
 import { requireAuth } from './auth.js';
 import { getOperation } from './operations/index.js';
@@ -14,6 +15,17 @@ if (problems.length) {
   console.error('Refusing to start due to configuration problems:');
   for (const p of problems) console.error('  - ' + p);
   process.exit(1);
+}
+
+// WordOps' `wo` prompts for a git identity when none is set, which hangs any
+// endpoint that shells out to it (e.g. /api/info). Seed one so `wo` stays
+// non-interactive — covers servers installed before init.sh did this.
+try {
+  execSync('git config --global user.name', { stdio: 'ignore' });
+} catch {
+  try {
+    execSync('git config --global user.name wcloud && git config --global user.email agent@wcloud.local', { stdio: 'ignore' });
+  } catch { /* git absent or unwritable — best-effort */ }
 }
 
 // Pin the :22222 admin panel to its self-signed cert and lock it immutable, so
@@ -155,8 +167,9 @@ app.get('/api/info', async (req, res) => {
       if (s) info.mariadbStatus = s;
     }
 
-    // WordOps version
-    const wo = await run(helpers, 'wo', ['--version'], { quiet: true });
+    // WordOps version. Timeout-guarded: `wo` prompts (and hangs) if git has no
+    // identity configured, which would otherwise stall this whole endpoint.
+    const wo = await run(helpers, 'wo', ['--version'], { quiet: true, timeout: 8000 });
     if (wo.code === 0) {
       info.wordops = wo.stdout.trim();
     }

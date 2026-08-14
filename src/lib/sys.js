@@ -29,7 +29,7 @@ import config from '../config.js';
  *   asUser      → run via `sudo -u <user> -H` (for wp-cli as www-data)
  */
 export function run(helpers, command, args = [], opts = {}) {
-  const { cwd, env = {}, stdin, quiet = false, verbose = false, asUser } = opts;
+  const { cwd, env = {}, stdin, quiet = false, verbose = false, asUser, timeout } = opts;
   const { log, err, onCancel } = helpers;
 
   let cmd = command;
@@ -46,6 +46,13 @@ export function run(helpers, command, args = [], opts = {}) {
     let stdout = '';
     let stderr = '';
     let killed = false;
+    let timedOut = false;
+
+    // Optional hard timeout so a probe that hangs (e.g. an interactive tool with
+    // no tty) can't stall the caller forever. Resolves with code -1, not reject.
+    const timer = timeout
+      ? setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch {} }, timeout)
+      : null;
 
     onCancel?.((reason) => {
       killed = true;
@@ -60,9 +67,11 @@ export function run(helpers, command, args = [], opts = {}) {
     if (stdin != null) child.stdin.write(stdin);
     child.stdin.end();
 
-    child.on('error', (e) => reject(new Error(`spawn failed for ${cmd}: ${e.message}`)));
+    child.on('error', (e) => { if (timer) clearTimeout(timer); reject(new Error(`spawn failed for ${cmd}: ${e.message}`)); });
     child.on('close', (code, signal) => {
+      if (timer) clearTimeout(timer);
       if (killed) return reject(new Error(`cancelled (signal ${signal || 'n/a'})`));
+      if (timedOut) return resolve({ code: -1, stdout, stderr });
       const c = code ?? -1;
       // Failure is the only time the raw command + output are worth the noise.
       if (c !== 0 && !quiet && !verbose) {

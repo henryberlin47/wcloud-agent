@@ -116,19 +116,26 @@ fi
 # Portal provisioning stream (optional). When the install command supplies a
 # PROVISION_ID, mirror all output + step milestones to the portal so the user can
 # watch this install live. Best-effort — it must never break the install.
+# The command is reusable across servers, so each run mints its own provision id
+# (the portal creates the record on first log). Keeps every server's progress on
+# its own card.
 PROVISION_ID="${PROVISION_ID:-}"
+if [ -z "$PROVISION_ID" ] && [ -n "${ENROLL_URL:-}" ]; then
+  PROVISION_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "prov-$(openssl rand -hex 8)")
+fi
 PORTAL_ORIGIN=""
 PROVISION_LOG=""
 UPLOADER_PID=""
 
 if [ -n "$PROVISION_ID" ] && [ -n "${ENROLL_URL:-}" ] && [ -n "${ENROLL_TOKEN:-}" ] && command -v curl >/dev/null 2>&1; then
   PORTAL_ORIGIN=$(printf '%s' "$ENROLL_URL" | sed -E 's#/api/enroll/?$##')
+  PROVISION_NAME=$(hostname 2>/dev/null || echo server)
 
   # Real milestone poster (replaces the early no-op stub).
   provision_event() { # $1=status $2=step $3=step_no $4=step_total
     [ -n "$PORTAL_ORIGIN" ] || return 0
     curl -fsS -m 8 -X POST "$PORTAL_ORIGIN/api/provision/$PROVISION_ID/log" \
-      -H "Authorization: Bearer $ENROLL_TOKEN" \
+      -H "Authorization: Bearer $ENROLL_TOKEN" -H "X-Name: $PROVISION_NAME" \
       ${1:+-H "X-Status: $1"} ${2:+-H "X-Step: $2"} ${3:+-H "X-Step-No: $3"} ${4:+-H "X-Step-Total: $4"} \
       >/dev/null 2>&1 || true
   }
