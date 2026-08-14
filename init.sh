@@ -141,15 +141,19 @@ if [ -n "$PROVISION_ID" ] && [ -n "${ENROLL_URL:-}" ] && [ -n "${ENROLL_TOKEN:-}
   }
 
   PROVISION_LOG=$(mktemp)
-  # Ship new log bytes to the portal every few seconds (text body, no escaping).
+  ESC=$(printf '\033')
+  # Ship new log bytes to the portal every few seconds. Strip ANSI colour codes
+  # and carriage returns first (our script AND WordOps colour their output, and
+  # `curl | bash` leaves stdout a tty) so the portal shows clean text.
   ( off=0
     while true; do
       sz=$(wc -c < "$PROVISION_LOG" 2>/dev/null || echo 0)
       if [ "${sz:-0}" -gt "$off" ]; then
-        if tail -c +$((off + 1)) "$PROVISION_LOG" 2>/dev/null | \
-             curl -fsS -m 8 -X POST "$PORTAL_ORIGIN/api/provision/$PROVISION_ID/log" \
-               -H "Authorization: Bearer $ENROLL_TOKEN" -H 'Content-Type: text/plain' \
-               --data-binary @- >/dev/null 2>&1; then
+        if tail -c +$((off + 1)) "$PROVISION_LOG" 2>/dev/null \
+             | sed "s/${ESC}\[[0-9;?]*[A-Za-z]//g" | tr -d '\r' \
+             | curl -fsS -m 8 -X POST "$PORTAL_ORIGIN/api/provision/$PROVISION_ID/log" \
+                 -H "Authorization: Bearer $ENROLL_TOKEN" -H 'Content-Type: text/plain' \
+                 --data-binary @- >/dev/null 2>&1; then
           off=$sz
         fi
       fi
@@ -435,15 +439,19 @@ else
     WARNINGS+=("AGENT_HOST=$SERVER_IP is a private address — verify it's reachable by the control panel.")
   fi
 
-  # Allowlist = only the portal may reach this root agent. Derive its IP from the
-  # enroll URL host when provided; otherwise fall back to the known panel IP.
-  # ponytail: uses the portal's *ingress* IP — override AGENT_ALLOWED_IPS if the
-  # portal's egress differs (multi-homed / behind a separate NAT).
-  PORTAL_IP="91.108.105.205"
-  if [ -n "${ENROLL_URL:-}" ]; then
-    PORTAL_HOST=$(printf '%s' "$ENROLL_URL" | sed -E 's#^[a-zA-Z]+://##; s#[:/].*$##')
-    RESOLVED=$(getent hosts "$PORTAL_HOST" 2>/dev/null | awk '{print $1; exit}')
-    [ -n "$RESOLVED" ] && PORTAL_IP="$RESOLVED"
+  # Allowlist = only the portal may reach this root agent. Best source is the
+  # portal's own declared egress IP(s) passed in as ALLOWED_IPS (comma list).
+  # Fall back to resolving the enroll URL host (its *ingress* IP — only right when
+  # the portal isn't behind a proxy/CDN), then a last-resort hardcoded IP.
+  if [ -n "${ALLOWED_IPS:-}" ]; then
+    PORTAL_IP="$ALLOWED_IPS"
+  else
+    PORTAL_IP="91.108.105.205"
+    if [ -n "${ENROLL_URL:-}" ]; then
+      PORTAL_HOST=$(printf '%s' "$ENROLL_URL" | sed -E 's#^[a-zA-Z]+://##; s#[:/].*$##')
+      RESOLVED=$(getent hosts "$PORTAL_HOST" 2>/dev/null | awk '{print $1; exit}')
+      [ -n "$RESOLVED" ] && PORTAL_IP="$RESOLVED"
+    fi
   fi
 
   # Replace placeholder values in the config file
