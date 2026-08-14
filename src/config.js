@@ -47,6 +47,8 @@ const config = {
   // with the portal on startup, so there's no manual "add server" step.
   enrollUrl: process.env.PORTAL_ENROLL_URL || '',
   enrollToken: process.env.ENROLL_TOKEN || '',
+  // Links this agent back to the portal's live install/provision record.
+  provisionId: process.env.PROVISION_ID || '',
   // URL the portal uses to reach this agent. Defaults to the bind host:port;
   // override if the agent is behind NAT/proxy with a different public address.
   advertiseUrl: process.env.AGENT_ADVERTISE_URL || '',

@@ -29,7 +29,7 @@ fi
 
 BOX_WIDTH=60
 STEP_NO=0
-STEP_TOTAL=13
+STEP_TOTAL=14
 WARNINGS=()
 
 _repeat() { local n=$1 ch=$2 out=''; while ((n-- > 0)); do out+="$ch"; done; printf '%s' "$out"; }
@@ -58,6 +58,7 @@ step() {
   printf '\n%s%s[%d/%d]%s %s%s%s\n' \
     "$C_BOLD" "$C_BLUE" "$STEP_NO" "$STEP_TOTAL" "$C_RESET" \
     "$C_BOLD" "$1" "$C_RESET"
+  provision_event running "$1" "$STEP_NO" "$STEP_TOTAL"
 }
 
 info()  { printf '   %s%s%s %s\n' "$C_GREY" "$G_DOT" "$C_RESET" "$1"; }
@@ -65,7 +66,11 @@ ok()    { printf '   %s%s%s %s\n' "$C_GREEN" "$G_OK" "$C_RESET" "$1"; }
 warn()  { printf '   %s%s%s %s\n' "$C_YELLOW" "$G_WARN" "$C_RESET" "$1"; }
 err()   { printf '   %s%s%s %s\n' "$C_RED" "$G_ERR" "$C_RESET" "$1" >&2; }
 
-die() { err "$1"; exit "${2:-1}"; }
+die() { err "$1"; provision_event failed "$1" "$STEP_NO" "$STEP_TOTAL"; exit "${2:-1}"; }
+
+# Post a provision milestone/status to the portal. Redefined with real behaviour
+# below once we know we're provisioning; this stub keeps early calls safe.
+provision_event() { :; }
 
 run() {
   local label="$1"; shift
@@ -105,6 +110,51 @@ fi
 TARGET_USER="${SUDO_USER:-}"
 if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
   TARGET_USER="$(logname 2>/dev/null || echo root)"
+fi
+
+# ------------------------------------------------------------
+# Portal provisioning stream (optional). When the install command supplies a
+# PROVISION_ID, mirror all output + step milestones to the portal so the user can
+# watch this install live. Best-effort — it must never break the install.
+PROVISION_ID="${PROVISION_ID:-}"
+PORTAL_ORIGIN=""
+PROVISION_LOG=""
+UPLOADER_PID=""
+
+if [ -n "$PROVISION_ID" ] && [ -n "${ENROLL_URL:-}" ] && [ -n "${ENROLL_TOKEN:-}" ] && command -v curl >/dev/null 2>&1; then
+  PORTAL_ORIGIN=$(printf '%s' "$ENROLL_URL" | sed -E 's#/api/enroll/?$##')
+
+  # Real milestone poster (replaces the early no-op stub).
+  provision_event() { # $1=status $2=step $3=step_no $4=step_total
+    [ -n "$PORTAL_ORIGIN" ] || return 0
+    curl -fsS -m 8 -X POST "$PORTAL_ORIGIN/api/provision/$PROVISION_ID/log" \
+      -H "Authorization: Bearer $ENROLL_TOKEN" \
+      ${1:+-H "X-Status: $1"} ${2:+-H "X-Step: $2"} ${3:+-H "X-Step-No: $3"} ${4:+-H "X-Step-Total: $4"} \
+      >/dev/null 2>&1 || true
+  }
+
+  PROVISION_LOG=$(mktemp)
+  # Ship new log bytes to the portal every few seconds (text body, no escaping).
+  ( off=0
+    while true; do
+      sz=$(wc -c < "$PROVISION_LOG" 2>/dev/null || echo 0)
+      if [ "${sz:-0}" -gt "$off" ]; then
+        if tail -c +$((off + 1)) "$PROVISION_LOG" 2>/dev/null | \
+             curl -fsS -m 8 -X POST "$PORTAL_ORIGIN/api/provision/$PROVISION_ID/log" \
+               -H "Authorization: Bearer $ENROLL_TOKEN" -H 'Content-Type: text/plain' \
+               --data-binary @- >/dev/null 2>&1; then
+          off=$sz
+        fi
+      fi
+      sleep 3
+    done ) &
+  UPLOADER_PID=$!
+
+  # Mirror stdout+stderr into that file (console still shows everything).
+  exec > >(tee -a "$PROVISION_LOG") 2>&1
+  # On exit: let the final chunk flush, then stop the uploader.
+  trap 'sleep 4; [ -n "$UPLOADER_PID" ] && kill "$UPLOADER_PID" 2>/dev/null; :' EXIT
+  provision_event running "Starting install" 0 "$STEP_TOTAL"
 fi
 
 # ------------------------------------------------------------
@@ -399,6 +449,7 @@ else
   # self-register on startup instead of a manual "add server" form.
   [ -n "${ENROLL_URL:-}" ]   && sed -i "s|^PORTAL_ENROLL_URL=.*|PORTAL_ENROLL_URL=$ENROLL_URL|" "$AGENT_CONFIG"
   [ -n "${ENROLL_TOKEN:-}" ] && sed -i "s|^ENROLL_TOKEN=.*|ENROLL_TOKEN=$ENROLL_TOKEN|" "$AGENT_CONFIG"
+  [ -n "${PROVISION_ID:-}" ] && sed -i "s|^PROVISION_ID=.*|PROVISION_ID=$PROVISION_ID|" "$AGENT_CONFIG"
 
   # Verify the injections actually landed (guards against a changed .env.example)
   grep -q "^AGENT_TOKEN=$AGENT_TOKEN$" "$AGENT_CONFIG" \
