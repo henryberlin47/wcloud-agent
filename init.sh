@@ -439,20 +439,12 @@ else
     WARNINGS+=("AGENT_HOST=$SERVER_IP is a private address — verify it's reachable by the control panel.")
   fi
 
-  # Allowlist = only the portal may reach this root agent. Best source is the
-  # portal's own declared egress IP(s) passed in as ALLOWED_IPS (comma list).
-  # Fall back to resolving the enroll URL host (its *ingress* IP — only right when
-  # the portal isn't behind a proxy/CDN), then a last-resort hardcoded IP.
-  if [ -n "${ALLOWED_IPS:-}" ]; then
-    PORTAL_IP="$ALLOWED_IPS"
-  else
-    PORTAL_IP="91.108.105.205"
-    if [ -n "${ENROLL_URL:-}" ]; then
-      PORTAL_HOST=$(printf '%s' "$ENROLL_URL" | sed -E 's#^[a-zA-Z]+://##; s#[:/].*$##')
-      RESOLVED=$(getent hosts "$PORTAL_HOST" 2>/dev/null | awk '{print $1; exit}')
-      [ -n "$RESOLVED" ] && PORTAL_IP="$RESOLVED"
-    fi
-  fi
+  # Allowlist = only the portal may reach this root agent. This must be the
+  # portal's EGRESS IP (what the agent sees). Behind Cloudflare/any proxy that is
+  # NOT what the portal's domain resolves to, so it's passed in explicitly as
+  # ALLOWED_IPS (the portal bakes in PORTAL_EGRESS_IPS); fall back to the known
+  # panel IP. Comma-separated for multi-homed.
+  PORTAL_IP="${ALLOWED_IPS:-91.108.105.205}"
 
   # Replace placeholder values in the config file
   sed -i "s|^AGENT_TOKEN=.*|AGENT_TOKEN=$AGENT_TOKEN|" "$AGENT_CONFIG"
