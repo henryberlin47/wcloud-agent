@@ -126,14 +126,16 @@ export function existsSync(p) {
   return fssync.existsSync(p);
 }
 
-// WordOps puts a site's webroot in <domain>/htdocs; some older code in this
-// repo assumed it sat directly in <domain>. Check both instead of guessing,
-// so wp-cli calls don't silently fail against an empty directory.
+// wp-cli's --path must point at the WordPress CORE (where wp-load.php lives), not
+// at wp-config.php. WordOps puts the core in <domain>/htdocs but keeps
+// wp-config.php one level ABOVE it, so detecting by wp-config would wrongly pick
+// the parent dir (wp-cli then reports "not a WordPress installation"). Detect the
+// core via wp-load.php; wp-cli finds the config by walking up from there.
 export async function resolveWpRoot(domain) {
   const base = `${config.wwwDir}/${domain}`;
-  if (await pathExists(`${base}/htdocs/wp-config.php`)) return `${base}/htdocs`;
-  if (await pathExists(`${base}/wp-config.php`)) return base;
-  return `${base}/htdocs`; // WordOps' documented default; let wp-cli report the real error
+  if (await pathExists(`${base}/htdocs/wp-load.php`)) return `${base}/htdocs`;
+  if (await pathExists(`${base}/wp-load.php`)) return base;
+  return `${base}/htdocs`; // WordOps default; let wp-cli report the real error
 }
 
 // Detect installed PHP version from /etc/php directories
