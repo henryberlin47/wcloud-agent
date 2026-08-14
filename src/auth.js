@@ -35,8 +35,11 @@ export function requireAuth(req, res, next) {
   const ip = clientIp(req);
 
   if (!ipAllowed(ip)) {
-    // Don't reveal whether the token would have been valid.
-    return res.status(403).json({ error: 'forbidden', reason: 'ip_not_allowed' });
+    // Log + echo the source IP so a mismatched allowlist is diagnosable (the
+    // caller already knows its own IP, so echoing it leaks nothing). Don't reveal
+    // whether the token would have been valid.
+    console.warn(`[agent] 403 ip_not_allowed from ${ip} (allowlist: ${config.allowedIps.join(',') || 'none'})`);
+    return res.status(403).json({ error: 'forbidden', reason: 'ip_not_allowed', seen_ip: ip });
   }
 
   const hdr = req.headers['authorization'] || '';
