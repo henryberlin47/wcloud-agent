@@ -136,16 +136,17 @@ ok "Agent source ready at /opt/wcloud."
 
 # ------------------------------------------------------------
 step "Installing WordOps"
+# WordOps prompts for a git name/email (to save server configs) on install AND on
+# every `wo` invocation until one is set. Under `curl | bash` there's no TTY, so
+# its read loops forever. Seed a random identity up front — unconditionally, so it
+# also covers a half-installed `wo` left by an interrupted earlier run.
+GIT_RAND=$(openssl rand -hex 4)
+git config --global user.name  >/dev/null 2>&1 || git config --global user.name  "wcloud-$GIT_RAND"
+git config --global user.email >/dev/null 2>&1 || git config --global user.email "wcloud-$GIT_RAND@wcloud.local"
+
 if command -v wo >/dev/null 2>&1; then
   ok "WordOps already installed ($(wo --version 2>/dev/null | head -n1 || echo present)) — skipping."
 else
-  # WordOps' installer prompts for a git name/email to save server configs. Under
-  # `curl | bash` there's no TTY, so its read loops forever on empty input. Seed a
-  # random git identity first so it finds one and skips the prompt.
-  GIT_RAND=$(openssl rand -hex 4)
-  git config --global user.name  >/dev/null 2>&1 || git config --global user.name  "wcloud-$GIT_RAND"
-  git config --global user.email >/dev/null 2>&1 || git config --global user.email "wcloud-$GIT_RAND@wcloud.local"
-
   info "Downloading WordOps installer (wops.cc)..."
   if wget -qO /tmp/wo-install wops.cc && bash /tmp/wo-install </dev/null; then
     ok "WordOps installed."
