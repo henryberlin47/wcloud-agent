@@ -40,7 +40,7 @@ app.use(express.json({ limit: '64kb' }));
 // --- health (unauthenticated, minimal) --------------------------------------
 // Useful for the panel to see the server is up before auth. Reveals nothing.
 app.get('/healthz', (req, res) => {
-  res.json({ ok: true, server: config.serverName, time: Date.now() });
+  res.json({ ok: true, server: config.serverName, version: config.version, time: Date.now() });
 });
 
 // Everything below requires auth + passes the IP allowlist.
@@ -51,6 +51,7 @@ app.get('/api/info', async (req, res) => {
   const helpers = { log: () => {}, err: () => {}, onCancel: () => {} };
   const info = {
     server: config.serverName,
+    version: config.version,
     operations: ['deploy', 'update', 'delete', 'ssl', 'purge', 'resetPassword'],
     maxConcurrentJobs: config.maxConcurrentJobs,
   };

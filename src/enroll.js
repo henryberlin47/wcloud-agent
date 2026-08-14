@@ -22,6 +22,7 @@ export async function enroll() {
     port: config.port,
     name: config.serverName,
     hostname: os.hostname(),
+    version: config.version,
     provision_id: config.provisionId,
   };
 

@@ -1,10 +1,18 @@
 // Centralised configuration. All values come from environment variables so
 // nothing sensitive is baked into the source. See .env.example.
 
+import { readFileSync } from 'node:fs';
+
 function parseList(v) {
   if (!v) return [];
   return v.split(',').map((s) => s.trim()).filter(Boolean);
 }
+
+// Agent version, read once from package.json (repo root, one level up from src).
+let agentVersion = '';
+try {
+  agentVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version || '';
+} catch { /* running without package.json — leave blank */ }
 
 const config = {
   // HTTP
@@ -42,6 +50,9 @@ const config = {
 
   // Identify this server in responses (handy when the panel manages many).
   serverName: process.env.AGENT_SERVER_NAME || process.env.HOSTNAME || 'unknown',
+
+  // This agent's version (from package.json), surfaced in /healthz + /api/info.
+  version: agentVersion,
 
   // Self-enrollment (optional). When both are set, the agent registers itself
   // with the portal on startup, so there's no manual "add server" step.
