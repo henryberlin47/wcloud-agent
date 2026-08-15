@@ -3,6 +3,7 @@ import { execSync } from 'node:child_process';
 import config, { validateConfig } from './config.js';
 import { requireAuth } from './auth.js';
 import { getOperation } from './operations/index.js';
+import { serveExport } from './operations/export.js';
 import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './jobs.js';
 import { woSiteList, run, getPhpVersion } from './lib/sys.js';
 import { enforceAdminPanelCert } from './lib/panelcert.js';
@@ -43,6 +44,20 @@ app.get('/healthz', (req, res) => {
   res.json({ ok: true, server: config.serverName, version: config.version, time: Date.now() });
 });
 
+// --- export archive (one-time token, no auth needed) -------------------------
+// The token is the access control — one-time use, expires in 1 hour.
+app.get('/api/export/:token', async (req, res) => {
+  try {
+    await serveExport(req.params.token, res);
+  } catch (e) {
+    console.error('[agent] export serve error:', e.message);
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'serve_failed' }));
+    }
+  }
+});
+
 // Everything below requires auth + passes the IP allowlist.
 app.use(requireAuth);
 
@@ -54,7 +69,7 @@ app.get('/api/info', async (req, res) => {
   const info = {
     server: config.serverName,
     version: config.version,
-    operations: ['deploy', 'update', 'delete', 'ssl', 'purge', 'resetPassword'],
+    operations: ['deploy', 'update', 'delete', 'ssl', 'purge', 'resetPassword', 'export', 'import'],
     maxConcurrentJobs: config.maxConcurrentJobs,
   };
 

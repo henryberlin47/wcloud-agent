@@ -4,6 +4,8 @@ import { runDeploy } from './deploy.js';
 import { runSsl } from './ssl.js';
 import { runPurge } from './purge.js';
 import { runResetPassword } from './resetPassword.js';
+import { runExport } from './export.js';
+import { runImport } from './import.js';
 
 // ============================================================
 //  Operation registry
@@ -161,9 +163,63 @@ const resetPassword = {
   },
 };
 
+// ============================================================
+//  export — create a portable archive of a site (files + DB + optional SSL)
+// ============================================================
+const exportOp = {
+  name: 'export',
+  // params: { domain, includeSsl?: boolean, encryptKey?: string }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    return {
+      ok: errors.length === 0,
+      errors,
+      clean: { domain: p.domain, includeSsl: p.includeSsl === true, encryptKey: p.encryptKey || '' },
+    };
+  },
+  async run(job, helpers, p) {
+    await runExport(job, helpers, p);
+  },
+};
+
+// ============================================================
+//  import — restore a site from an export archive
+// ============================================================
+const importOp = {
+  name: 'import',
+  // params: { sourceUrl, domain, sourceDomain?, includeSsl?, sameServer?, localArchive?, encryptKey? }
+  validate(p = {}) {
+    const out = { ...p };
+    if (typeof out.domain === 'string') out.domain = normDomain(out.domain);
+    if (typeof out.sourceDomain === 'string') out.sourceDomain = normDomain(out.sourceDomain);
+    const errors = [];
+    if (!out.sourceUrl || typeof out.sourceUrl !== 'string') errors.push('sourceUrl is required');
+    reqDomain(errors, 'domain', out.domain);
+    if (out.sourceDomain && !isDomain(out.sourceDomain)) errors.push('sourceDomain must be a valid domain');
+    return {
+      ok: errors.length === 0,
+      errors,
+      clean: {
+        sourceUrl: out.sourceUrl,
+        domain: out.domain,
+        sourceDomain: out.sourceDomain || out.domain,
+        includeSsl: out.includeSsl === true,
+        sameServer: out.sameServer === true,
+        localArchive: out.localArchive || null,
+        encryptKey: out.encryptKey || '',
+      },
+    };
+  },
+  async run(job, helpers, p) {
+    await runImport(job, helpers, p);
+  },
+};
+
 // ---------------------------------------------------------------------------
 
-export const operations = { deploy, update, delete: del, ssl, purge, resetPassword };
+export const operations = { deploy, update, delete: del, ssl, purge, resetPassword, export: exportOp, import: importOp };
 
 export function getOperation(type) {
   return operations[type] || null;

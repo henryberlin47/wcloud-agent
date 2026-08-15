@@ -14,15 +14,11 @@ export const STATE = {
 
 const TERMINAL = new Set([STATE.SUCCEEDED, STATE.FAILED, STATE.TIMEOUT, STATE.CANCELLED]);
 
-// In-memory job store. For a single-server agent this is fine; jobs are
-// ephemeral operational records, not durable state. Restarting the agent
-// forgets history (acceptable — the control panel is the system of record).
 const jobs = new Map();
 
 let running = 0;
 const queue = [];
 
-// Each job gets its own emitter for log/line + state events (SSE subscribes).
 function makeJob(type, params) {
   const id = crypto.randomUUID();
   const job = {
@@ -33,14 +29,14 @@ function makeJob(type, params) {
     createdAt: Date.now(),
     startedAt: null,
     finishedAt: null,
-    exitReason: null, // human string on failure
-    // Ring buffer of log lines (cap to avoid unbounded memory).
+    exitReason: null,
     log: [],
     logCap: 5000,
+    result: null, // ops can set this to return structured data
     _emitter: new EventEmitter(),
-    _cancel: null, // set to a cancel function while running
+    _cancel: null,
   };
-  job._emitter.setMaxListeners(50); // many SSE clients could attach
+  job._emitter.setMaxListeners(50);
   jobs.set(id, job);
   return job;
 }
@@ -55,7 +51,6 @@ export function listJobs() {
     .map(publicView);
 }
 
-// What we expose over the API (no emitter, no internals).
 export function publicView(job) {
   return {
     id: job.id,
@@ -67,11 +62,12 @@ export function publicView(job) {
     finishedAt: job.finishedAt,
     exitReason: job.exitReason,
     logLines: job.log.length,
+    result: job.result ? redactParams(job.result) : null,
   };
 }
 
-// Never echo secrets (DB passwords, tokens) back in job views.
 function redactParams(params = {}) {
+  if (!params || typeof params !== 'object') return params;
   const clone = { ...params };
   for (const k of Object.keys(clone)) {
     if (/pass|secret|token|key/i.test(k)) clone[k] = '***';
@@ -79,7 +75,6 @@ function redactParams(params = {}) {
   return clone;
 }
 
-// Append a log line, emit it, and trim the ring buffer.
 export function appendLog(job, line, stream = 'stdout') {
   const entry = { t: Date.now(), stream, line: String(line) };
   job.log.push(entry);
@@ -101,8 +96,6 @@ function scheduleCleanup(job) {
   }, config.jobRetentionMs).unref?.();
 }
 
-// Subscribe to a job's live events. Returns an unsubscribe function.
-// Immediately replays existing log lines so a late SSE client sees full history.
 export function subscribe(job, onLine, onState) {
   for (const entry of job.log) onLine(entry);
   if (TERMINAL.has(job.state)) {
@@ -117,13 +110,6 @@ export function subscribe(job, onLine, onState) {
   };
 }
 
-/**
- * Enqueue a new job.
- * @param {string} type  operation name (deploy/update/delete/ssl/purge/resetPassword)
- * @param {object} params validated params for the operation
- * @param {function} runner  async (job, helpers) => void ; throws on failure
- * @returns {object} the job (public view via publicView)
- */
 export function enqueue(type, params, runner) {
   const job = makeJob(type, params);
   job._runner = runner;
@@ -132,7 +118,6 @@ export function enqueue(type, params, runner) {
   return job;
 }
 
-// Attempt to start queued jobs up to the concurrency limit.
 function drain() {
   while (running < config.maxConcurrentJobs && queue.length > 0) {
     const job = queue.shift();
@@ -156,10 +141,7 @@ async function startJob(job) {
   const helpers = {
     log: (line) => appendLog(job, line, 'stdout'),
     err: (line) => appendLog(job, line, 'stderr'),
-    // Operations set this so the runner can be interrupted (e.g. kill a child).
-    onCancel: (fn) => {
-      job._cancel = fn;
-    },
+    onCancel: (fn) => { job._cancel = fn; },
   };
 
   try {
@@ -184,7 +166,6 @@ async function startJob(job) {
   }
 }
 
-// Cancel a queued or running job. Running jobs need a cooperative cancel fn.
 export function cancelJob(id) {
   const job = jobs.get(id);
   if (!job) return { ok: false, reason: 'not_found' };
