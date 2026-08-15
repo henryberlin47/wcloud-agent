@@ -4,7 +4,7 @@ import config, { validateConfig } from './config.js';
 import { requireAuth } from './auth.js';
 import { getOperation } from './operations/index.js';
 import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './jobs.js';
-import { woSiteList, run } from './lib/sys.js';
+import { woSiteList, run, getPhpVersion } from './lib/sys.js';
 import { enforceAdminPanelCert } from './lib/panelcert.js';
 import { readDbCredentials } from './lib/credentials.js';
 import { enroll } from './enroll.js';
@@ -46,9 +46,11 @@ app.get('/healthz', (req, res) => {
 // Everything below requires auth + passes the IP allowlist.
 app.use(requireAuth);
 
+const NOOP_HELPERS = { log: () => {}, err: () => {}, onCancel: () => {} };
+
 // --- server info ------------------------------------------------------------
 app.get('/api/info', async (req, res) => {
-  const helpers = { log: () => {}, err: () => {}, onCancel: () => {} };
+  const helpers = NOOP_HELPERS;
   const info = {
     server: config.serverName,
     version: config.version,
@@ -139,7 +141,6 @@ app.get('/api/info', async (req, res) => {
     }
 
     // PHP-FPM service status
-    const { getPhpVersion } = await import('./lib/sys.js');
     const phpVer = getPhpVersion();
     const phpStatus = await run(helpers, 'systemctl', ['is-active', phpVer.service], { quiet: true });
     info.phpFpm = {
@@ -207,7 +208,7 @@ app.get('/api/info', async (req, res) => {
 // Read-only; runs `wo site list` directly (not a job).
 app.get('/api/sites', async (req, res) => {
   // sys.run expects a helpers object; for a one-shot read we discard output.
-  const helpers = { log: () => {}, err: () => {}, onCancel: () => {} };
+  const helpers = NOOP_HELPERS;
   try {
     const sites = await woSiteList(helpers);
     res.json({ server: config.serverName, count: sites.length, sites });
@@ -307,7 +308,7 @@ app.post('/api/jobs/:id/cancel', (req, res) => {
 // Already behind requireAuth (mounted above). 404 = not a WordPress site the
 // agent can read (missing/invalid wp-config.php).
 app.get('/api/sites/:domain/credentials', async (req, res) => {
-  const helpers = { log: () => {}, err: () => {}, onCancel: () => {} };
+  const helpers = NOOP_HELPERS;
   try {
     const creds = await readDbCredentials(helpers, req.params.domain);
     if (!creds) return res.status(404).json({ error: 'not_found' });

@@ -8,9 +8,9 @@ const pexec = promisify(execFile);
 // make the file immutable, so nothing (`wo secure`, scripts, hand-edits) can
 // repoint it at a deletable site's Let's Encrypt cert — which is what keeps
 // breaking `nginx -t` server-wide when that site is later deleted.
-const SSL_CONF = '/var/www/22222/conf/nginx/ssl.conf';
-const CRT = '/var/www/22222/cert/22222.crt';
-const KEY = '/var/www/22222/cert/22222.key';
+export const SSL_CONF = '/var/www/22222/conf/nginx/ssl.conf';
+export const CRT = '/var/www/22222/cert/22222.crt';
+export const KEY = '/var/www/22222/cert/22222.key';
 const DESIRED = `ssl_certificate     ${CRT};\nssl_certificate_key ${KEY};\n`;
 
 const exists = async (p) => { try { await fs.access(p); return true; } catch { return false; } };

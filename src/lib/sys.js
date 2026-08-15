@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import fssync from 'node:fs';
-import config from '../config.js';
 
 // ============================================================
 //  sys.js — shared system helpers for native operation logic
@@ -89,15 +88,6 @@ function tailLines(s, n) {
   return lines.slice(-n);
 }
 
-// Like run(), but throws if the command exits non-zero.
-export async function runOrThrow(helpers, command, args = [], opts = {}) {
-  const r = await run(helpers, command, args, opts);
-  if (r.code !== 0) {
-    throw new Error(`${command} exited ${r.code}${r.stderr ? `: ${r.stderr.trim().split('\n').slice(-1)[0]}` : ''}`);
-  }
-  return r;
-}
-
 function lineReader(stream, onLine) {
   let buf = '';
   stream.setEncoding('utf8');
@@ -120,10 +110,6 @@ export async function pathExists(p) {
 
 export async function removePath(p) {
   await fs.rm(p, { recursive: true, force: true });
-}
-
-export function existsSync(p) {
-  return fssync.existsSync(p);
 }
 
 // wp-cli's --path must point at the WordPress CORE (where wp-load.php lives), not

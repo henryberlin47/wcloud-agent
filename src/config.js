@@ -34,7 +34,6 @@ const config = {
   trustProxy: process.env.AGENT_TRUST_PROXY === '1',
 
   // Paths
-  binDir: process.env.AGENT_BIN_DIR || '/usr/local/bin',
   wwwDir: process.env.AGENT_WWW_DIR || '/var/www',
 
   // Job execution

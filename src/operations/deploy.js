@@ -1,4 +1,3 @@
-import config from '../config.js';
 import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 

@@ -5,6 +5,7 @@ import {
   nginxTest, nginxReload, systemctl, woSiteDelete, woSiteExists,
 } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
+import { CRT, KEY, SSL_CONF } from '../lib/panelcert.js';
 
 // ============================================================
 //  delete — permanently remove a WordPress site
@@ -113,10 +114,6 @@ export async function runDelete(job, helpers, p, opts = {}) {
 // If the :22222 admin panel's ssl.conf references the just-deleted domain's LE
 // cert, rewrite it to use the panel's self-signed cert so nginx stays valid.
 async function repointAdminPanelCert(domain, { warn, ok }) {
-  const SSL_CONF = '/var/www/22222/conf/nginx/ssl.conf';
-  const CRT = '/var/www/22222/cert/22222.crt';
-  const KEY = '/var/www/22222/cert/22222.key';
-
   if (!(await pathExists(SSL_CONF))) return; // panel not installed
   let conf;
   try { conf = await fs.readFile(SSL_CONF, 'utf8'); } catch { return; }
