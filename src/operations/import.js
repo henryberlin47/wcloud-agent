@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import config from '../config.js';
 import {
   run, woSiteExists, nginxTest, nginxReload, getPhpVersion,
-  wpCli, clearWpCaches, pathExists, removePath,
+  wpCli, clearWpCaches, pathExists, removePath, setCanonical,
 } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 
@@ -261,6 +261,12 @@ export async function runImport(job, helpers, p) {
       } else {
         warn(`SSL failed (DNS/propagation?) — run "wo site update ${domain} --le --force" later`);
       }
+    }
+
+    // Set canonical domain redirect (after DB import so WP options aren't overwritten).
+    if (p.canonical) {
+      step('Set canonical domain');
+      await setCanonical(helpers, domain, p.canonical);
     }
 
     // 10) Validate + reload nginx.

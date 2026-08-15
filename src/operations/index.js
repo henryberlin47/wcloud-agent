@@ -29,6 +29,7 @@ export function normDomain(v) {
     .trim()
     .replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, '') // strip scheme
     .replace(/\/.*$/, '')                          // drop path / trailing slash
+    .replace(/^www\./, '')                         // strip leading www.
     .toLowerCase();
 }
 
@@ -53,7 +54,7 @@ function reqDomain(errors, name, v) {
 // ============================================================
 const deploy = {
   name: 'deploy',
-  // params: { domain, wp_user?, wp_password? }
+  // params: { domain, wp_user?, wp_password?, canonical? }
   validate(p = {}) {
     p = sanitize(p);
     const errors = [];
@@ -67,7 +68,9 @@ const deploy = {
     // erroring — wo needs both --user and --pass together to be meaningful.
     if (!wpUser || !wpPassword) { wpUser = ''; wpPassword = ''; }
 
-    return { ok: errors.length === 0, errors, clean: { domain: p.domain, wp_user: wpUser, wp_password: wpPassword } };
+    const canonical = (p.canonical === 'root' || p.canonical === 'www') ? p.canonical : 'root';
+
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, wp_user: wpUser, wp_password: wpPassword, canonical } };
   },
   async run(job, helpers, p) {
     await runDeploy(job, helpers, p);
@@ -189,7 +192,7 @@ const exportOp = {
 // ============================================================
 const importOp = {
   name: 'import',
-  // params: { sourceUrl, domain, sourceDomain?, includeSsl?, sameServer?, localArchive?, encryptKey? }
+  // params: { sourceUrl, domain, sourceDomain?, includeSsl?, sameServer?, localArchive?, encryptKey?, canonical? }
   validate(p = {}) {
     const out = { ...p };
     if (typeof out.domain === 'string') out.domain = normDomain(out.domain);
@@ -198,6 +201,7 @@ const importOp = {
     if (!out.sourceUrl || typeof out.sourceUrl !== 'string') errors.push('sourceUrl is required');
     reqDomain(errors, 'domain', out.domain);
     if (out.sourceDomain && !isDomain(out.sourceDomain)) errors.push('sourceDomain must be a valid domain');
+    const canonical = (out.canonical === 'root' || out.canonical === 'www') ? out.canonical : 'root';
     return {
       ok: errors.length === 0,
       errors,
@@ -209,6 +213,7 @@ const importOp = {
         sameServer: out.sameServer === true,
         localArchive: out.localArchive || null,
         encryptKey: out.encryptKey || '',
+        canonical,
       },
     };
   },

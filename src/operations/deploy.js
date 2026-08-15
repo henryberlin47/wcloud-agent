@@ -1,4 +1,4 @@
-import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion } from '../lib/sys.js';
+import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion, setCanonical } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 
 // ============================================================
@@ -52,6 +52,15 @@ export async function runDeploy(job, helpers, p) {
     warn(`SSL failed (DNS/propagation?) — run "wo site update ${domain} --le --force" later`);
   }
 
+  // Set canonical domain redirect.
+  if (p.canonical) {
+    step('Set canonical domain');
+    await setCanonical(helpers, domain, p.canonical);
+    if (await nginxTest(helpers)) {
+      await nginxReload(helpers);
+      ok('nginx reloaded');
+    }
+  }
 
   log(`Deploy completed: ${domain}`);
 }

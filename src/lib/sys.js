@@ -251,6 +251,38 @@ export function wpCli(helpers, srcDir, opts = {}) {
   };
 }
 
+// Set canonical domain: nginx 301 redirect for non-canonical host + WP home/siteurl.
+// canonical: "root" (example.com) or "www" (www.example.com).
+export async function setCanonical(helpers, domain, canonical) {
+  const { log } = helpers;
+  const bare = domain.startsWith('www.') ? domain.slice(4) : domain;
+  const isWww = canonical === 'www';
+  const canonicalHost = isWww ? `www.${bare}` : bare;
+  const nonCanonicalHost = isWww ? bare : `www.${bare}`;
+
+  // Check if SSL exists to decide redirect scheme.
+  const sslCert = `/etc/letsencrypt/live/${bare}/fullchain.pem`;
+  const hasSsl = await pathExists(sslCert);
+  const scheme = hasSsl ? 'https://' : '$scheme://';
+
+  // Write nginx redirect snippet. WordOps includes conf/nginx/*.conf inside
+  // the server { } block, so an if() { return 301 } works here (simple host
+  // match + return is one of nginx's safe-if patterns).
+  const confDir = `${config.wwwDir}/${bare}/conf/nginx`;
+  const confContent = `# force canonical host — 301 the other variant, preserve path + query\nif ($host = ${nonCanonicalHost}) {\n    return 301 ${scheme}${canonicalHost}$request_uri;\n}\n`;
+  await fs.mkdir(confDir, { recursive: true });
+  await fs.writeFile(`${confDir}/canonical.conf`, confContent);
+  log(`Canonical nginx config written: ${nonCanonicalHost} → ${canonicalHost}`);
+
+  // Set WP home/siteurl to the canonical host (match scheme to cert state).
+  const wpRoot = await resolveWpRoot(bare);
+  const wp = wpCli(helpers, wpRoot);
+  const wpScheme = hasSsl ? 'https' : 'http';
+  await wp(['option', 'update', 'home', `${wpScheme}://${canonicalHost}`]);
+  await wp(['option', 'update', 'siteurl', `${wpScheme}://${canonicalHost}`]);
+  log(`WP home/siteurl set to ${wpScheme}://${canonicalHost}`);
+}
+
 // Standard cache-clear routine used after code/DB changes:
 //   - WP Rocket page cache (native fn via eval; disk fallback if provided)
 //   - object cache flush
