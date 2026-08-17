@@ -52,15 +52,10 @@ export async function runDeploy(job, helpers, p) {
     warn(`SSL failed (DNS/propagation?) — run "wo site update ${domain} --le --force" later`);
   }
 
-  // Set canonical domain redirect.
-  if (p.canonical) {
-    step('Set canonical domain');
-    await setCanonical(helpers, domain, p.canonical);
-    if (await nginxTest(helpers)) {
-      await nginxReload(helpers);
-      ok('nginx reloaded');
-    }
-  }
+  // Apply domain preferences (canonical redirect + www enablement). Handles
+  // none/enable-www itself and reloads nginx only if it changed something.
+  step('Apply domain preferences');
+  await setCanonical(helpers, domain, p.canonical, p.enableWww);
 
   log(`Deploy completed: ${domain}`);
 }

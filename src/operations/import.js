@@ -263,11 +263,10 @@ export async function runImport(job, helpers, p) {
       }
     }
 
-    // Set canonical domain redirect (after DB import so WP options aren't overwritten).
-    if (p.canonical) {
-      step('Set canonical domain');
-      await setCanonical(helpers, domain, p.canonical);
-    }
+    // Apply domain preferences (after DB import so WP options aren't
+    // overwritten by imported values). Handles none/enable-www itself.
+    step('Apply domain preferences');
+    await setCanonical(helpers, domain, p.canonical, p.enableWww);
 
     // 10) Validate + reload nginx.
     step('Validate + reload nginx');

@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import fssync from 'node:fs';
+import config from '../config.js';
+import { logger } from './log.js';
 
 // ============================================================
 //  sys.js — shared system helpers for native operation logic
@@ -251,36 +253,137 @@ export function wpCli(helpers, srcDir, opts = {}) {
   };
 }
 
-// Set canonical domain: nginx 301 redirect for non-canonical host + WP home/siteurl.
-// canonical: "root" (example.com) or "www" (www.example.com).
-export async function setCanonical(helpers, domain, canonical) {
-  const { log } = helpers;
-  const bare = domain.startsWith('www.') ? domain.slice(4) : domain;
-  const isWww = canonical === 'www';
-  const canonicalHost = isWww ? `www.${bare}` : bare;
-  const nonCanonicalHost = isWww ? bare : `www.${bare}`;
+// Add or remove www.<base> on every `server_name ...;` that lists <base>.
+// Returns { out, changed }; files whose server_name doesn't mention the
+// base come back unchanged.
+export function adjustServerNames(content, base, wwwHost, enableWww) {
+  let changed = false;
+  const out = content.replace(/server_name\s+([^;]+);/g, (m, hosts) => {
+    const list = hosts.trim().split(/\s+/);
+    if (!list.includes(base) && !list.includes(wwwHost)) return m;
+    if (enableWww && !list.includes(wwwHost)) {
+      changed = true;
+      return `server_name ${[...list, wwwHost].join(' ')};`;
+    }
+    if (!enableWww && list.includes(wwwHost)) {
+      const next = list.filter((h) => h !== wwwHost);
+      if (!next.length) return m; // never leave an empty server_name
+      changed = true;
+      return `server_name ${next.join(' ')};`;
+    }
+    return m;
+  });
+  return { out, changed };
+}
 
-  // Check if SSL exists to decide redirect scheme.
-  const sslCert = `/etc/letsencrypt/live/${bare}/fullchain.pem`;
-  const hasSsl = await pathExists(sslCert);
-  const scheme = hasSsl ? 'https://' : '$scheme://';
+// True if the cert's SAN list includes host (quiet probe).
+export async function certCovers(helpers, certPath, host) {
+  const r = await run(helpers, 'openssl', ['x509', '-in', certPath, '-noout', '-ext', 'subjectAltName'], { quiet: true, timeout: 15_000 });
+  if (r.code !== 0) return false;
+  return r.stdout.includes(`DNS:${host}`);
+}
 
-  // Write nginx redirect snippet. WordOps includes conf/nginx/*.conf inside
-  // the server { } block, so an if() { return 301 } works here (simple host
-  // match + return is one of nginx's safe-if patterns).
-  const confDir = `${config.wwwDir}/${bare}/conf/nginx`;
-  const confContent = `# force canonical host — 301 the other variant, preserve path + query\nif ($host = ${nonCanonicalHost}) {\n    return 301 ${scheme}${canonicalHost}$request_uri;\n}\n`;
-  await fs.mkdir(confDir, { recursive: true });
-  await fs.writeFile(`${confDir}/canonical.conf`, confContent);
-  log(`Canonical nginx config written: ${nonCanonicalHost} → ${canonicalHost}`);
+// Apply the user's domain preferences to a live site.
+//   canonical "www"|"root" → 301 the other variant (conf/nginx/canonical.conf)
+//                            + pin WP home/siteurl to the preferred host
+//   canonical "none"       → delete any prior redirect, leave WP as-is
+//   enableWww true/false   → ensure/remove www.<domain> in the vhost's
+//                            server_name (backup + nginx -t + rollback)
+// Reloads nginx at the end when (and only when) something changed.
+export async function setCanonical(helpers, domain, canonical, enableWww = true) {
+  const { ok, warn, err } = logger(helpers);
+  const wwwHost = `www.${domain}`;
+  const confPath = `${config.wwwDir}/${domain}/conf/nginx/canonical.conf`;
+  let changed = false;
 
-  // Set WP home/siteurl to the canonical host (match scheme to cert state).
-  const wpRoot = await resolveWpRoot(bare);
-  const wp = wpCli(helpers, wpRoot);
-  const wpScheme = hasSsl ? 'https' : 'http';
-  await wp(['option', 'update', 'home', `${wpScheme}://${canonicalHost}`]);
-  await wp(['option', 'update', 'siteurl', `${wpScheme}://${canonicalHost}`]);
-  log(`WP home/siteurl set to ${wpScheme}://${canonicalHost}`);
+  // 1) Redirect snippet / WP options.
+  if (canonical === 'none') {
+    if (await pathExists(confPath)) {
+      await removePath(confPath);
+      ok(`Removed preferred-domain redirect for ${domain}`);
+      changed = true;
+    } else {
+      ok('No preferred domain — both versions served, no redirect');
+    }
+  } else {
+    const canonicalHost = canonical === 'www' ? wwwHost : domain;
+    const otherHost = canonical === 'www' ? domain : wwwHost;
+    const certPath = `/etc/letsencrypt/live/${domain}/fullchain.pem`;
+    const hasSsl = await pathExists(certPath);
+    if (!hasSsl) warn(`No SSL cert for ${domain} yet — redirect keeps $scheme so http stays http`);
+
+    // WordOps includes conf/nginx/*.conf inside the server { } block, so
+    // if(host) + return is one of nginx's safe-if patterns here.
+    const confDir = `${config.wwwDir}/${domain}/conf/nginx`;
+    await fs.mkdir(confDir, { recursive: true });
+    await fs.writeFile(confPath,
+      `# force canonical host — 301 the other variant, preserve path + query\n` +
+      `if ($host = ${otherHost}) {\n    return 301 ${hasSsl ? 'https' : '$scheme'}://${canonicalHost}$request_uri;\n}\n`);
+    ok(`${otherHost} 301 → ${hasSsl ? 'https' : '$scheme'}://${canonicalHost}`);
+    changed = true;
+
+    // Pin WP home/siteurl to the preferred host (scheme matches cert state)
+    // so WP's own links + redirect backstop agree with nginx.
+    const wp = wpCli(helpers, await resolveWpRoot(domain));
+    const scheme = hasSsl ? 'https' : 'http';
+    for (const key of ['home', 'siteurl']) {
+      const r = await wp(['option', 'update', key, `${scheme}://${canonicalHost}`]);
+      if (r.code !== 0) warn(`wp option update ${key} failed (code ${r.code}) — WP links may use the wrong host`);
+    }
+    ok(`WP home/siteurl = ${scheme}://${canonicalHost}`);
+  }
+
+  // 2) www enablement — edit the vhost's server_name. This is the one edit
+  //    that can take a live site down: back up, edit, nginx -t, roll back.
+  //    WordOps' main vhost is /etc/nginx/sites-available/<domain> (same path
+  //    delete.js removes); the port-443 block may live in the per-site
+  //    ssl.conf instead, so probe both. No-op when no file mentions the host.
+  const files = [];
+  for (const f of [`/etc/nginx/sites-available/${domain}`, `${config.wwwDir}/${domain}/conf/nginx/ssl.conf`]) {
+    if (await pathExists(f)) files.push(f);
+  }
+  if (!files.length) {
+    warn(`No nginx vhost found for ${domain} — www ${enableWww ? 'enablement' : 'removal'} skipped; verify the config manually`);
+  }
+  for (const path of files) {
+    const orig = await fs.readFile(path, 'utf8');
+    const { out, changed: c } = adjustServerNames(orig, domain, wwwHost, enableWww);
+    if (!c) continue;
+    const backup = `${path}.wcloud-bak`;
+    await fs.copyFile(path, backup);
+    await fs.writeFile(path, out);
+    if (await nginxTest(helpers)) {
+      await removePath(backup);
+      ok(`${enableWww ? 'Enabled' : 'Removed'} ${wwwHost} in ${path}`);
+      changed = true;
+    } else {
+      await fs.copyFile(backup, path);
+      await removePath(backup);
+      err(`server_name change in ${path} failed nginx -t — rolled back; ${wwwHost} ${enableWww ? 'not enabled' : 'still served'}`);
+    }
+  }
+
+  // 3) Cert coverage: a redirect needs BOTH hosts to pass TLS. If www is
+  //    served but the cert lacks it, re-issue (requires www DNS to resolve).
+  if (canonical !== 'none' && enableWww) {
+    const certPath = `/etc/letsencrypt/live/${domain}/fullchain.pem`;
+    if ((await pathExists(certPath)) && !(await certCovers(helpers, certPath, wwwHost))) {
+      warn(`Cert for ${domain} does not cover ${wwwHost} — re-issuing (needs www DNS to resolve)`);
+      const r = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force']);
+      if (r.code === 0) { ok(`SSL re-issued to cover ${wwwHost}`); changed = true; }
+      else warn(`Cert re-issue failed — is DNS for ${wwwHost} ready? Re-run the SSL op once it is.`);
+    }
+  }
+
+  // 4) Final validate + reload, only when something above actually changed.
+  if (changed) {
+    if (await nginxTest(helpers)) {
+      await nginxReload(helpers);
+      ok('nginx reloaded');
+    } else {
+      err('nginx -t FAILED after canonical changes — review config');
+    }
+  }
 }
 
 // Standard cache-clear routine used after code/DB changes:

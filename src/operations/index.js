@@ -54,7 +54,7 @@ function reqDomain(errors, name, v) {
 // ============================================================
 const deploy = {
   name: 'deploy',
-  // params: { domain, wp_user?, wp_password?, canonical? }
+  // params: { domain, wp_user?, wp_password?, canonical?: "www"|"root"|"none", enableWww? }
   validate(p = {}) {
     p = sanitize(p);
     const errors = [];
@@ -68,9 +68,11 @@ const deploy = {
     // erroring — wo needs both --user and --pass together to be meaningful.
     if (!wpUser || !wpPassword) { wpUser = ''; wpPassword = ''; }
 
-    const canonical = (p.canonical === 'root' || p.canonical === 'www') ? p.canonical : 'root';
+    let canonical = (p.canonical === 'www' || p.canonical === 'root' || p.canonical === 'none') ? p.canonical : 'none';
+    const enableWww = p.enableWww !== false;
+    if (canonical === 'www' && !enableWww) canonical = 'root'; // can't redirect to a host we don't serve
 
-    return { ok: errors.length === 0, errors, clean: { domain: p.domain, wp_user: wpUser, wp_password: wpPassword, canonical } };
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww } };
   },
   async run(job, helpers, p) {
     await runDeploy(job, helpers, p);
@@ -192,7 +194,7 @@ const exportOp = {
 // ============================================================
 const importOp = {
   name: 'import',
-  // params: { sourceUrl, domain, sourceDomain?, includeSsl?, sameServer?, localArchive?, encryptKey?, canonical? }
+  // params: { sourceUrl, domain, sourceDomain?, includeSsl?, sameServer?, localArchive?, encryptKey?, canonical?: "www"|"root"|"none", enableWww? }
   validate(p = {}) {
     const out = { ...p };
     if (typeof out.domain === 'string') out.domain = normDomain(out.domain);
@@ -201,7 +203,9 @@ const importOp = {
     if (!out.sourceUrl || typeof out.sourceUrl !== 'string') errors.push('sourceUrl is required');
     reqDomain(errors, 'domain', out.domain);
     if (out.sourceDomain && !isDomain(out.sourceDomain)) errors.push('sourceDomain must be a valid domain');
-    const canonical = (out.canonical === 'root' || out.canonical === 'www') ? out.canonical : 'root';
+    let canonical = (out.canonical === 'www' || out.canonical === 'root' || out.canonical === 'none') ? out.canonical : 'none';
+    const enableWww = out.enableWww !== false;
+    if (canonical === 'www' && !enableWww) canonical = 'root'; // can't redirect to a host we don't serve
     return {
       ok: errors.length === 0,
       errors,
@@ -214,6 +218,7 @@ const importOp = {
         localArchive: out.localArchive || null,
         encryptKey: out.encryptKey || '',
         canonical,
+        enableWww,
       },
     };
   },
