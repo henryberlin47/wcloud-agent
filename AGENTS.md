@@ -17,6 +17,15 @@ for the portal side and the full two-repo picture.
 A small Express app. Returns a **job ID** immediately for operations and streams
 **live logs** over SSE. Node 18+, ESM (`"type": "module"`).
 
+## Codebase map (optional)
+
+A graphify knowledge graph of the whole workspace (portal + agent) is at
+`../graphify-out/`. `GRAPH_REPORT.md` there lists the god nodes (most-connected
+functions), how the code clusters, and cross-repo links — handy for "what
+connects to X / how does this flow work". It's a snapshot: rebuild with
+`/graphify --update` after significant changes, and treat **this file (AGENTS.md)
+as the source of truth for writing code** — the graph is only a map.
+
 ---
 
 ## 2. Request lifecycle
