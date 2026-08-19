@@ -1,5 +1,8 @@
 import express from 'express';
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import config, { validateConfig } from './config.js';
 import { requireAuth } from './auth.js';
 import { getOperation } from './operations/index.js';
@@ -62,6 +65,10 @@ app.get('/api/export/:token', async (req, res) => {
 app.use(requireAuth);
 
 const NOOP_HELPERS = { log: () => {}, err: () => {}, onCancel: () => {} };
+
+// The git checkout this server.js runs from (src/..). On managed servers that's
+// /opt/wcloud; derived from the file location so it also works elsewhere.
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // --- server info ------------------------------------------------------------
 app.get('/api/info', async (req, res) => {
@@ -330,6 +337,40 @@ app.get('/api/sites/:domain/credentials', async (req, res) => {
     res.json(creds);
   } catch (e) {
     res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
+  }
+});
+
+// --- self-update -------------------------------------------------------------
+// Pull-only update: hard reset to origin/main (never `git pull` — the checkout
+// accumulates local drift; .env/.enrolled are gitignored so config survives) and
+// reinstall deps. The restart is scheduled in systemd (systemd-run timer), not
+// in this process, so it fires after the response has flushed even though the
+// restart SIGTERMs us. Runs as root, so the origin/branch are hardcoded —
+// nothing from the request body ever reaches a shell.
+app.post('/api/self-update', async (req, res) => {
+  const helpers = NOOP_HELPERS;
+  const git = (args, timeout = 120000) =>
+    run(helpers, 'git', args, { cwd: REPO_ROOT, quiet: true, timeout });
+  const tail = (r) => (r.stderr || r.stdout || '').trim().split('\n').slice(-3).join(' | ');
+
+  const before = await git(['rev-parse', '--short', 'HEAD'], 10000);
+  if (before.code !== 0) return res.status(500).json({ ok: false, error: `not a git checkout: ${tail(before)}` });
+  const fetchR = await git(['fetch', 'origin']);
+  if (fetchR.code !== 0) return res.status(500).json({ ok: false, error: `git fetch failed: ${tail(fetchR)}` });
+  const reset = await git(['reset', '--hard', 'origin/main']);
+  if (reset.code !== 0) return res.status(500).json({ ok: false, error: `git reset failed: ${tail(reset)}` });
+  const after = (await git(['rev-parse', '--short', 'HEAD'], 10000)).stdout.trim();
+  const inst = await run(helpers, 'npm', ['install', '--omit=dev', '--no-audit', '--no-fund'],
+    { cwd: REPO_ROOT, quiet: true, timeout: 300000 });
+  if (inst.code !== 0) return res.status(500).json({ ok: false, error: `npm install failed: ${tail(inst)}` });
+
+  const version = JSON.parse(readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8')).version;
+  res.json({ ok: true, updated: before.stdout.trim() !== after, old_commit: before.stdout.trim(), new_commit: after, version });
+  // Detached: the transient unit (and its 2s delay) lives under systemd, not us.
+  try {
+    spawn('systemd-run', ['--on-active=2', 'systemctl', 'restart', 'wcloud'], { detached: true, stdio: 'ignore' }).unref();
+  } catch (e) {
+    console.error('[agent] self-update: failed to schedule restart:', e.message);
   }
 });
 
