@@ -9,6 +9,7 @@ import { getOperation } from './operations/index.js';
 import { serveExport } from './operations/export.js';
 import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './jobs.js';
 import { woSiteList, run, getPhpVersion } from './lib/sys.js';
+import { ensureRclone, spacesEnv, remotePath } from './lib/spaces.js';
 import { enforceAdminPanelCert } from './lib/panelcert.js';
 import { readDbCredentials } from './lib/credentials.js';
 import { enroll } from './enroll.js';
@@ -250,7 +251,8 @@ app.post('/api/op/:type', (req, res) => {
   const { ok, errors, clean } = op.validate(req.body || {});
   if (!ok) return res.status(400).json({ error: 'validation_failed', errors });
 
-  const job = enqueue(type, clean, (j, helpers) => op.run(j, helpers, clean));
+  const job = enqueue(type, clean, (j, helpers) => op.run(j, helpers, clean),
+    op.timeout ? { timeout: op.timeout } : {});
   res.status(202).json({ jobId: job.id, state: job.state, view: publicView(job) });
 });
 
@@ -371,6 +373,53 @@ app.post('/api/self-update', async (req, res) => {
     spawn('systemd-run', ['--on-active=2', 'systemctl', 'restart', 'wcloud'], { detached: true, stdio: 'ignore' }).unref();
   } catch (e) {
     console.error('[agent] self-update: failed to schedule restart:', e.message);
+  }
+});
+
+// --- Spaces validation / deletion (quick calls, not jobs) ------------------
+// Creds ride in the authenticated request body, live in the rclone subprocess
+// env for the duration of one call, and never touch logs (command lines have
+// no secrets) or disk.
+function spacesBodyOk(p) {
+  return typeof p === 'object' && p !== null &&
+    typeof p.space === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(p.space) &&
+    typeof p.endpoint === 'string' && p.endpoint.length > 0 &&
+    typeof p.accessKeyId === 'string' && p.accessKeyId.length > 0 &&
+    typeof p.secretAccessKey === 'string' && p.secretAccessKey.length > 0;
+}
+
+app.post('/api/backup-test', async (req, res) => {
+  const p = req.body || {};
+  if (!spacesBodyOk(p)) return res.status(400).json({ error: 'validation_failed', errors: ['space, endpoint, accessKeyId, secretAccessKey are required'] });
+  try {
+    await ensureRclone(NOOP_HELPERS);
+    const r = await run(NOOP_HELPERS, 'rclone', ['lsd', remotePath(p.space, '')], { env: spacesEnv(p), quiet: true, timeout: 30_000 });
+    if (r.code !== 0) {
+      return res.status(502).json({ error: 'spaces_unreachable', message: (r.stderr || r.stdout || '').trim().slice(-300) });
+    }
+    const dirs = r.stdout.trim().split('\n').filter(Boolean).length;
+    res.json({ ok: true, dirs });
+  } catch (e) {
+    res.status(500).json({ error: 'test_failed', message: e?.message || 'failed' });
+  }
+});
+
+app.post('/api/backup-delete', async (req, res) => {
+  const p = req.body || {};
+  if (!spacesBodyOk(p)) return res.status(400).json({ error: 'validation_failed', errors: ['space, endpoint, accessKeyId, secretAccessKey are required'] });
+  if (typeof p.key !== 'string' || !p.key.startsWith('backups/') || p.key.includes('..')) {
+    return res.status(400).json({ error: 'validation_failed', errors: ['key must be a backups/ object key'] });
+  }
+  try {
+    await ensureRclone(NOOP_HELPERS);
+    const r = await run(NOOP_HELPERS, 'rclone', ['deletefile', remotePath(p.space, p.key)], { env: spacesEnv(p), quiet: true, timeout: 120_000 });
+    const notFound = /does not exist|no such file/i.test(`${r.stderr}\n${r.stdout}`);
+    if (r.code !== 0 && !notFound) {
+      return res.status(502).json({ error: 'delete_failed', message: (r.stderr || '').trim().slice(-300) });
+    }
+    res.json({ ok: true, deleted: r.code === 0 });
+  } catch (e) {
+    res.status(500).json({ error: 'delete_failed', message: e?.message || 'failed' });
   }
 });
 

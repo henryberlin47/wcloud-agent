@@ -110,9 +110,10 @@ export function subscribe(job, onLine, onState) {
   };
 }
 
-export function enqueue(type, params, runner) {
+export function enqueue(type, params, runner, opts = {}) {
   const job = makeJob(type, params);
   job._runner = runner;
+  job._timeout = opts.timeout || null; // per-op override (e.g. long backups)
   queue.push(job);
   drain();
   return job;
@@ -135,7 +136,7 @@ async function startJob(job) {
   const timer = setTimeout(() => {
     timedOut = true;
     if (typeof job._cancel === 'function') job._cancel('timeout');
-  }, config.jobTimeoutMs);
+  }, job._timeout || config.jobTimeoutMs);
   timer.unref?.();
 
   const helpers = {

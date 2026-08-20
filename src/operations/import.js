@@ -6,31 +6,23 @@ import {
 } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 
-// params: { sourceUrl, domain, sourceDomain?, includeSsl?, sameServer?, localArchive?, encryptKey? }
+// params: { sourceUrl, domain, sourceDomain?, includeSsl?, sameServer?, localArchive?, encryptKey?, canonical?, enableWww? }
 export async function runImport(job, helpers, p) {
-  const { log, step, ok, warn, err } = logger(helpers);
-  const sourceUrl = p.sourceUrl;
+  const { step, ok, err } = logger(helpers);
   const domain = p.domain;
   const sourceDomain = p.sourceDomain || domain;
-  const sameServer = p.sameServer === true;
-  const domainChanged = sourceDomain !== domain;
-  const encryptKey = p.encryptKey || '';
 
   if (await woSiteExists(helpers, domain)) {
     throw new Error(`Site already exists: ${domain}`);
   }
 
   const tmpDir = `/tmp/wcloud_import_${Date.now()}`;
-  const siteDir = `${config.wwwDir}/${domain}`;
-  let siteCreated = false;
-
+  await fs.mkdir(tmpDir, { recursive: true, mode: 0o700 });
+  await run(helpers, 'chown', ['www-data:www-data', tmpDir]);
   try {
-    // 1) Fetch and extract archive.
+    // 1) Fetch archive to `${tmpDir}/export.tar.gz.enc` (or copy a local one).
     step('Fetch export archive');
-    await fs.mkdir(tmpDir, { recursive: true, mode: 0o700 });
-    await run(helpers, 'chown', ['www-data:www-data', tmpDir]);
-
-    if (sameServer && p.localArchive) {
+    if (p.sameServer && p.localArchive) {
       await run(helpers, 'cp', [p.localArchive, `${tmpDir}/export.tar.gz.enc`]);
       // Clean up the source archive after copying (same-server migration).
       await removePath(p.localArchive);
@@ -39,7 +31,7 @@ export async function runImport(job, helpers, p) {
       const fetchR = await run(helpers, 'curl', [
         '-sL', '--fail', '--create-dirs',
         '-o', `${tmpDir}/export.tar.gz.enc`,
-        sourceUrl,
+        p.sourceUrl,
       ], { timeout: 300_000 });
       if (fetchR.code !== 0) {
         err(`Failed to fetch archive: ${fetchR.stderr.slice(-200)}`);
@@ -47,7 +39,34 @@ export async function runImport(job, helpers, p) {
       }
       ok('Archive downloaded');
     }
+  } catch (e) {
+    await removePath(tmpDir);
+    throw e;
+  }
 
+  await runRestoreFromLocal(job, helpers, {
+    tmpDir, domain, sourceDomain,
+    includeSsl: p.includeSsl, encryptKey: p.encryptKey,
+    canonical: p.canonical, enableWww: p.enableWww,
+  });
+}
+
+// The restore proper, shared by import (HTTP / same-server archive) and the
+// backup restore op (archive downloaded from Spaces). Expects the archive at
+// `${tmpDir}/export.tar.gz.enc` (plaintext `.tar.gz` renamed is fine too).
+// Owns tmpDir cleanup and rollback of a half-created site on failure.
+//
+// params: { tmpDir, domain, sourceDomain, includeSsl?, encryptKey?, canonical?, enableWww? }
+export async function runRestoreFromLocal(job, helpers, {
+  tmpDir, domain, sourceDomain,
+  includeSsl = false, encryptKey = '', canonical = 'none', enableWww = true,
+}) {
+  const { log, step, ok, warn, err } = logger(helpers);
+  const domainChanged = sourceDomain !== domain;
+  const siteDir = `${config.wwwDir}/${domain}`;
+  let siteCreated = false;
+
+  try {
     // Decrypt if encrypted.
     if (encryptKey) {
       step('Decrypt archive');
@@ -199,7 +218,7 @@ export async function runImport(job, helpers, p) {
     }
 
     // 9) Handle SSL.
-    if (p.includeSsl === true) {
+    if (includeSsl) {
       step('Restore SSL certificates');
       const sslLive = `${tmpDir}/ssl/live`;
       const sslArchiveDir = `${tmpDir}/ssl/archive`;
@@ -245,14 +264,6 @@ export async function runImport(job, helpers, p) {
 
       ok('SSL certificates restored');
       warn('Copied certs will not auto-renew. After DNS points here, run the SSL op to get acme.sh-managed certs with renewal.');
-    } else if (!domainChanged) {
-      step('Issue SSL certificate');
-      const sslR = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force']);
-      if (sslR.code === 0) {
-        ok(`SSL issued for ${domain}`);
-      } else {
-        warn(`SSL failed (DNS/propagation?) — run "wo site update ${domain} --le --force" later`);
-      }
     } else {
       step('Issue SSL certificate');
       const sslR = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force']);
@@ -266,7 +277,7 @@ export async function runImport(job, helpers, p) {
     // Apply domain preferences (after DB import so WP options aren't
     // overwritten by imported values). Handles none/enable-www itself.
     step('Apply domain preferences');
-    await setCanonical(helpers, domain, p.canonical, p.enableWww);
+    await setCanonical(helpers, domain, canonical, enableWww);
 
     // 10) Validate + reload nginx.
     step('Validate + reload nginx');
@@ -277,11 +288,12 @@ export async function runImport(job, helpers, p) {
       err('nginx -t FAILED — review config');
     }
 
-    log(`Import completed: ${domain}`);
+    log(`Restore completed: ${domain}`);
   } catch (e) {
-    // Rollback: if we created the site but import failed, clean up the half-site.
+    // Rollback: if we created the site but the restore failed, clean up the
+    // half-site.
     if (siteCreated) {
-      warn('Import failed — rolling back half-created site');
+      warn('Restore failed — rolling back half-created site');
       try {
         await run(helpers, 'wo', ['site', 'delete', domain, '--no-prompt', '--force'], { stdin: '' });
         ok('Half-created site removed');

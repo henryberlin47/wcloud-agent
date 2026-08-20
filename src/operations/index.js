@@ -6,6 +6,8 @@ import { runPurge } from './purge.js';
 import { runResetPassword } from './resetPassword.js';
 import { runExport } from './export.js';
 import { runImport } from './import.js';
+import { runBackup } from './backup.js';
+import { runRestore } from './restore.js';
 
 // ============================================================
 //  Operation registry
@@ -47,6 +49,21 @@ function isDomain(v) {
 }
 function reqDomain(errors, name, v) {
   if (!isDomain(v)) errors.push(`${name} must be a valid domain`);
+}
+
+// S3/Spaces fields shared by the backup + restore ops. Validated here (the
+// injection boundary); the agent passes them through to rclone's env and never
+// stores or logs them.
+function reqSpaces(p, errors) {
+  for (const f of ['space', 'key', 'endpoint', 'accessKeyId', 'secretAccessKey']) {
+    if (typeof p[f] !== 'string' || !p[f]) errors.push(`${f} is required`);
+  }
+  if (typeof p.space === 'string' && p.space && !/^[a-z0-9][a-z0-9-]*$/.test(p.space)) {
+    errors.push('space must be a valid Space name');
+  }
+  if (typeof p.key === 'string' && p.key && (!p.key.startsWith('backups/') || p.key.includes('..'))) {
+    errors.push('key must be a backups/ object key');
+  }
 }
 
 // ============================================================
@@ -227,9 +244,80 @@ const importOp = {
   },
 };
 
+// ============================================================
+//  backup — encrypted site archive uploaded to the user's Spaces
+// ============================================================
+// Backups can take hours on big sites, so this op runs past the default job
+// timeout (AGENT_BACKUP_TIMEOUT_MS).
+const BACKUP_TIMEOUT_MS = parseInt(process.env.AGENT_BACKUP_TIMEOUT_MS || String(12 * 3600 * 1000), 10);
+
+const backup = {
+  name: 'backup',
+  timeout: BACKUP_TIMEOUT_MS,
+  // params: { domain, includeSsl?, encryptKey?, space, key, endpoint, accessKeyId, secretAccessKey }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    reqSpaces(p, errors);
+    return {
+      ok: errors.length === 0,
+      errors,
+      clean: {
+        domain: p.domain,
+        includeSsl: p.includeSsl === true,
+        encryptKey: typeof p.encryptKey === 'string' ? p.encryptKey : '',
+        space: p.space, key: p.key, endpoint: p.endpoint,
+        accessKeyId: p.accessKeyId, secretAccessKey: p.secretAccessKey,
+      },
+    };
+  },
+  async run(job, helpers, p) {
+    await runBackup(job, helpers, p);
+  },
+};
+
+// ============================================================
+//  restore — bring a site back from a Spaces backup (see restore.js)
+// ============================================================
+const restoreOp = {
+  name: 'restore',
+  timeout: BACKUP_TIMEOUT_MS,
+  // params: { domain, sourceDomain?, includeSsl?, encryptKey?, canonical?, enableWww?, space, key, endpoint, accessKeyId, secretAccessKey }
+  validate(p = {}) {
+    const out = { ...p };
+    if (typeof out.domain === 'string') out.domain = normDomain(out.domain);
+    if (typeof out.sourceDomain === 'string') out.sourceDomain = normDomain(out.sourceDomain);
+    const errors = [];
+    reqDomain(errors, 'domain', out.domain);
+    if (out.sourceDomain && !isDomain(out.sourceDomain)) errors.push('sourceDomain must be a valid domain');
+    reqSpaces(out, errors);
+    let canonical = (out.canonical === 'www' || out.canonical === 'root' || out.canonical === 'none') ? out.canonical : 'none';
+    const enableWww = out.enableWww !== false;
+    if (canonical === 'www' && !enableWww) canonical = 'root';
+    return {
+      ok: errors.length === 0,
+      errors,
+      clean: {
+        domain: out.domain,
+        sourceDomain: out.sourceDomain || out.domain,
+        includeSsl: out.includeSsl === true,
+        encryptKey: typeof out.encryptKey === 'string' ? out.encryptKey : '',
+        canonical,
+        enableWww,
+        space: out.space, key: out.key, endpoint: out.endpoint,
+        accessKeyId: out.accessKeyId, secretAccessKey: out.secretAccessKey,
+      },
+    };
+  },
+  async run(job, helpers, p) {
+    await runRestore(job, helpers, p);
+  },
+};
+
 // ---------------------------------------------------------------------------
 
-export const operations = { deploy, update, delete: del, ssl, purge, resetPassword, export: exportOp, import: importOp };
+export const operations = { deploy, update, delete: del, ssl, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

@@ -46,6 +46,8 @@ as the source of truth for writing code** — the graph is only a map.
 - `GET /api/sites/:domain/credentials` — DB creds read **live** from `wp-config.php`
   (see §6). 404 = not a readable WP site.
 - `POST /api/op/:type` — validate + enqueue an operation → `{ jobId, state }`.
+- `POST /api/self-update` — `git fetch origin` + `reset --hard origin/main` + `npm install`, respond `{ ok, updated, old_commit, new_commit, version }`, then restart via a *systemd-run 2s timer* (detached — the timer outlives the process that gets SIGTERM'd). Origin/branch hardcoded: this runs remote code as root, no request body ever reaches a shell.
+- `POST /api/backup-test`, `POST /api/backup-delete` — quick rclone calls against the Spaces creds passed **in the request body** (per user, per job). Creds live in the rclone subprocess `env` for one call only — never written to config, never logged (command lines carry no secrets).
 - `GET /api/jobs`, `/api/jobs/:id`, `/logs`, `/stream` (SSE), `POST /:id/cancel` —
   job status/logs/cancel. Jobs are **in-memory** (`src/jobs.js`), serialized
   (`AGENT_MAX_CONCURRENT=1`), forgotten ~1h after finishing.
@@ -65,7 +67,14 @@ Each descriptor has:
 Current ops: **deploy** (`wo site create --wp` + SSL), **update** (`wp core update`
 + `update-db` + php-fpm restart), **delete** (removes site, nginx, certs; requires
 `confirm:true`), **ssl** (`wo site update --le --force`), **purge** (WP Rocket +
-object cache), **resetPassword** (`wp user update --user_pass`). No shells are used
+object cache), **resetPassword** (`wp user update --user_pass`), **export** (builds
+the archived site; `buildSiteArchive` in `export.js` is the shared archive builder),
+**import** (restores an archive; `runRestoreFromLocal` in `import.js` is the shared
+restore body — decrypt/extract/DB/SSL/canonical all live there), **backup** (build
+archive via the shared helper + rclone-upload to Spaces) and **restore** (rclone-
+download + the shared restore path; in-place restore first runs the full **delete**
+op). backup/restore take the user's Spaces creds per call in params and run with a
+longer per-op timeout (`AGENT_BACKUP_TIMEOUT_MS`, default 12h). No shells are used
 — args are arrays, so domain values can't inject shell syntax.
 
 **Log format** — ops use `logger(helpers)` (`src/lib/log.js`). Commands are silent

@@ -402,6 +402,22 @@ command -v npm >/dev/null 2>&1 && ok "npm present ($(npm --version 2>/dev/null))
   || { warn "npm not found — agent dependency installs may fail."; WARNINGS+=("npm missing after Node.js install."); }
 
 # ------------------------------------------------------------
+step "Installing rclone"
+# rclone moves site backups to/from the user's DigitalOcean Spaces (S3).
+# Without it, backup/restore of sites does not work.
+if command -v rclone >/dev/null 2>&1; then
+  ok "rclone already installed ($(rclone version 2>/dev/null | head -n1))"
+else
+  info "rclone not found — installing from rclone.org..."
+  if curl --fail --show-error -sSL https://rclone.org/install.sh | bash; then
+    ok "rclone installed ($(rclone version 2>/dev/null | head -n1))"
+  else
+    warn "rclone install failed — site backups/restores will not work until it's installed."
+    WARNINGS+=("rclone install failed")
+  fi
+fi
+
+# ------------------------------------------------------------
 step "Generating agent configuration"
 # Canonical location — .env in the agent's working directory so both
 # systemd EnvironmentFile= and dotenv (require('dotenv').config()) find it.

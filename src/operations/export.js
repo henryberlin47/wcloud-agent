@@ -8,19 +8,16 @@ import { logger } from '../lib/log.js';
 // Temporary export archives and their one-time tokens.
 const exports = new Map();
 
-// params: { domain, includeSsl: boolean, encryptKey: string }
-export async function runExport(job, helpers, p) {
-  const { log, step, ok, warn, err } = logger(helpers);
-  const domain = p.domain;
-  const includeSsl = p.includeSsl === true;
-  const encryptKey = p.encryptKey || '';
-
-  if (!(await woSiteExists(helpers, domain))) {
-    throw new Error(`Site not found: ${domain}`);
-  }
-
+// Build the site archive (DB dump + files + optional SSL), encrypting it when
+// an encryptKey is given. Shared by the export op (served over HTTP) and the
+// backup op (uploaded to Spaces) — one implementation, two transports.
+//
+// params: { domain, includeSsl?: boolean, encryptKey?: string }
+// returns: { path }  (encrypted `<path>.enc` when encryptKey is non-empty)
+// The caller owns the returned path and must remove it when done.
+export async function buildSiteArchive(helpers, domain, { includeSsl = false, encryptKey = '' } = {}) {
+  const { step, ok } = logger(helpers);
   const stamp = Date.now();
-  const token = crypto.randomUUID();
   const tmpDir = `/tmp/wcloud_export_${stamp}`;
   const archivePath = `${tmpDir}.tar.gz`;
   const siteDir = `${config.wwwDir}/${domain}`;
@@ -105,9 +102,25 @@ export async function runExport(job, helpers, p) {
     ok('Archive encrypted');
   }
 
-  const finalPath = encryptKey ? `${archivePath}.enc` : archivePath;
+  return { path: encryptKey ? `${archivePath}.enc` : archivePath };
+}
+
+// params: { domain, includeSsl: boolean, encryptKey: string }
+export async function runExport(job, helpers, p) {
+  const { log, ok } = logger(helpers);
+  const domain = p.domain;
+
+  if (!(await woSiteExists(helpers, domain))) {
+    throw new Error(`Site not found: ${domain}`);
+  }
+
+  const { path: finalPath } = await buildSiteArchive(helpers, domain, {
+    includeSsl: p.includeSsl,
+    encryptKey: p.encryptKey,
+  });
 
   // 6) Register for serving.
+  const token = crypto.randomUUID();
   const expires = Date.now() + 3600_000;
   exports.set(token, { path: finalPath, expires });
   cleanupExports();
