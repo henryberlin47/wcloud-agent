@@ -48,8 +48,14 @@ as the source of truth for writing code** — the graph is only a map.
 - `GET /api/sites/:domain/ssl` — live SSL state, parsed **on demand** from the cert
   on disk (`/etc/letsencrypt/live/<domain>/fullchain.pem`): `{ enabled, source:
   none|letsencrypt|letsencrypt-manual|custom, auto_renew, issuer, subject, sans[],
-  not_after, days_left, self_signed }`. Nothing is stored — the disk is the source
-  of truth (see §3, ssl).
+   not_after, days_left, self_signed }`. Nothing is stored — the disk is the source
+   of truth (see §3, ssl).
+- `GET /api/sites/:domain/ssl-challenge` — the pending manual DNS-01 challenge for
+   a site (`{ domain, pending, started_at?, txt_records? }`), read from the state
+   file step 1 writes (`/var/lib/wcloud/ssl-challenge/<domain>.json`). `pending:
+   false` when none. This is the **only** persistent per-site state (jobs die on
+   restart); it exists so the two-step DNS flow survives page reloads and agent
+   restarts. Cleared by the verify step, a hard verify failure, and site delete.
 - `POST /api/op/:type` — validate + enqueue an operation → `{ jobId, state }`.
 - `POST /api/self-update` — `git fetch origin` + `reset --hard origin/main` + `npm install`, respond `{ ok, updated, old_commit, new_commit, version }`, then restart via a *systemd-run 2s timer* (detached — the timer outlives the process that gets SIGTERM'd). Origin/branch hardcoded: this runs remote code as root, no request body ever reaches a shell.
 - `POST /api/backup-test`, `POST /api/backup-delete` — quick rclone calls against the Spaces creds passed **in the request body** (per user, per job). Creds live in the rclone subprocess `env` for one call only — never written to config, never logged (command lines carry no secrets).
@@ -72,6 +78,7 @@ Each descriptor has:
 Current ops: **deploy** (`wo site create --wp` + optional SSL, `issueSsl` flag),
 **update** (`wp core update` + `update-db` + php-fpm restart), **delete** (removes
 site, nginx, certs; requires `confirm:true`), **ssl** (mode-driven, below),
+**sslDnsVerify** (step 2 of manual DNS-01, below),
 **purge** (WP Rocket + object cache), **resetPassword** (`wp user update --user_pass`),
 **export** (builds the archived site; `buildSiteArchive` in `export.js` is the shared
 archive builder), **import** (restores an archive; `runRestoreFromLocal` in
@@ -89,12 +96,33 @@ syntax.
   if `nginx -t` passes (backup → edit → `nginx -t` → rollback, the setCanonical
   contract). No dangling `ssl_certificate` without a `listen 443`.
 - `le-http` — `wo site update <domain> --le --force` (HTTP-01, auto-renews).
+- `le-dns-manual` — **step 1 of the two-step manual DNS-01 flow** (provider-
+  independent, for domains behind Cloudflare/proxies where HTTP-01 can't reach
+  the origin): `acme.sh --issue --dns -d D --force --yes-I-know...` prints the TXT
+  records, saves the ACME order, exits 3. The op stores them in the challenge
+  state file (§2) and returns `{ pending, txt_records }`; nothing on the box is
+  changed yet. **Step 2** is the `sslDnsVerify` op — the user has added the TXT
+  records at their DNS provider by then.
 - `custom` — pasted fullchain + key. **Validated before anything is written**: both
   parse as PEM, the key's public key equals the cert's (public-key compare — covers
   RSA/EC/Ed25519), and the cert's SAN covers the domain. A bad pair never touches
   disk. Then `installCertFiles` + `applySslConf` (shared wiring, §5). `cert`/`key`
   arrive in the authenticated body only, the key is written `600 root:root`, and
   neither is ever logged or echoed (job views redact both).
+
+**Manual DNS-01 state machine** — `src/lib/acmedns.js` owns it. acme.sh clears
+`Le_Vlist` (the saved ACME order) after *every* verification attempt, and a lost
+vlist means a new order = a new TXT the user must re-add. So the agent captures
+the vlist at step 1 and **restores it into the domain conf before every verify**
+— the same token stays valid for as long as propagation takes. `sslDnsVerify`
+runs `acme.sh --renew -d D --force --yes-I-know...`: exit 0 → `--install-cert`
+into `/etc/letsencrypt/live/<domain>/` (600 root:root) + `writeManualMarker` +
+`applySslConf` + clear state; exit 3 → a fresh order was created, new TXT
+records stored back in the state file; exit 1 with "DNS problem/NXDOMAIN" →
+**soft fail** (the CA can't see the record yet — state + same TXT stay, the user
+retries); any other failure → hard fail, state cleared. The resulting cert is
+flagged by the `.wcloud-ssl-manual` marker → `source: letsencrypt-manual`,
+`auto_renew: false` in the live status.
 
 **Cert/nginx wiring** — `src/lib/certinstall.js` owns it: all certs (LE, custom,
 manual-DNS) live at `/etc/letsencrypt/live/<domain>/` (`fullchain.pem`, `key.pem`)
@@ -145,6 +173,7 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   guard on the domain.
 - **certinfo.js / certinstall.js** — live SSL state + cert/nginx wiring (see §3
   "ssl"). Disk is the source of truth; nothing per-site is stored.
+- **acmedns.js** — the manual DNS-01 two-step flow + its state file (see §3).
 - **panelcert.js** — pins the `:22222` WordOps panel to its self-signed cert and
   locks it, so it can't be repointed at a deletable site cert. Called at startup.
 - **log.js** — the step logger used by operations.
@@ -206,7 +235,7 @@ src/enroll.js          self-registration with the portal (§4)
 src/jobs.js            in-memory job queue + SSE
 src/operations/        one file per op + index.js registry (§3)
 src/lib/               sys.js, credentials.js, panelcert.js, log.js,
-                       certinfo.js, certinstall.js (§5)
+                       certinfo.js, certinstall.js, acmedns.js (§5)
 src/templates/         nginx snippets (custom-cache.conf)
 init.sh                one-shot server bootstrap (clone, install, enroll, stream) (§4)
 wcloud.service         systemd unit

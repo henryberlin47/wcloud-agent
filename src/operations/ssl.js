@@ -11,15 +11,18 @@ import {
   removeManualMarker,
 } from '../lib/certinstall.js';
 import { logger } from '../lib/log.js';
+import { startManualDns, verifyManualDns } from '../lib/acmedns.js';
 
 // ============================================================
 //  ssl — mode-driven SSL management for a site
 // ============================================================
 // The live cert on disk is the source of truth (see GET
 // /api/sites/:domain/ssl); this op applies a mode:
-//   off         → drop the port-443 include (certs stay on disk)
-//   le-http     → wo site update <domain> --le --force (HTTP-01, auto-renews)
-//   custom      → paste a fullchain + key; validated BEFORE anything is written
+//   off            → drop the port-443 include (certs stay on disk)
+//   le-http        → wo site update <domain> --le --force (HTTP-01, auto-renews)
+//   le-dns-manual  → step 1 of manual DNS-01: start the challenge, print TXT
+//                    records (verified later by the sslDnsVerify op)
+//   custom         → paste a fullchain + key; validated BEFORE anything is written
 // ============================================================
 
 export async function runSsl(job, helpers, p) {
@@ -30,9 +33,24 @@ export async function runSsl(job, helpers, p) {
   switch (p.mode) {
     case 'off': return runSslOff(helpers, domain);
     case 'le-http': return runSslLeHttp(helpers, domain);
+    case 'le-dns-manual': {
+      const state = await startManualDns(helpers, domain);
+      job.result = { pending: true, txt_records: state.txt_records };
+      return state;
+    }
     case 'custom': return runSslCustom(helpers, domain, p);
     default: throw new Error(`unknown SSL mode: ${p.mode}`);
   }
+}
+
+// Step 2 of manual DNS-01 — a standalone op (POST /api/op/sslDnsVerify):
+// the TXT records are already in place, verify them against the CA.
+export async function runSslDnsVerify(job, helpers, p) {
+  const domain = p.domain;
+  if (!(await woSiteExists(helpers, domain))) {
+    throw new Error(`Site not found: ${domain}`);
+  }
+  return verifyManualDns(helpers, domain);
 }
 
 // --- off --------------------------------------------------------------------

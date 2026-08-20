@@ -13,6 +13,7 @@ import { ensureRclone, spacesEnv, remotePath } from './lib/spaces.js';
 import { enforceAdminPanelCert } from './lib/panelcert.js';
 import { readDbCredentials } from './lib/credentials.js';
 import { readSiteSsl } from './lib/certinfo.js';
+import { readChallenge } from './lib/acmedns.js';
 import { enroll } from './enroll.js';
 import { normDomain, isDomain } from './operations/index.js';
 
@@ -81,7 +82,7 @@ app.get('/api/info', async (req, res) => {
   const info = {
     server: config.serverName,
     version: config.version,
-    operations: ['deploy', 'update', 'delete', 'ssl', 'purge', 'resetPassword', 'export', 'import'],
+    operations: ['deploy', 'update', 'delete', 'ssl', 'sslDnsVerify', 'purge', 'resetPassword', 'export', 'import'],
     maxConcurrentJobs: config.maxConcurrentJobs,
   };
 
@@ -355,6 +356,23 @@ app.get('/api/sites/:domain/ssl', async (req, res) => {
   const helpers = NOOP_HELPERS;
   try {
     res.json(await readSiteSsl(helpers, domain));
+  } catch (e) {
+    res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
+  }
+});
+
+// --- pending manual DNS-01 challenge for a site -------------------------------
+// Step 1 of the manual flow leaves TXT records in a state file (the agent is
+// stateless otherwise — jobs die on restart). The portal polls this to show
+// the records, so the flow survives page reloads and agent restarts.
+app.get('/api/sites/:domain/ssl-challenge', async (req, res) => {
+  const domain = normDomain(req.params.domain);
+  if (!isDomain(domain)) return res.status(400).json({ error: 'invalid_domain' });
+  try {
+    const state = await readChallenge(domain);
+    res.json(state
+      ? { domain, pending: true, started_at: state.started_at, txt_records: state.txt_records }
+      : { domain, pending: false });
   } catch (e) {
     res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
   }

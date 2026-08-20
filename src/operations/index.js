@@ -1,7 +1,7 @@
 import { runDelete } from './delete.js';
 import { runUpdate } from './update.js';
 import { runDeploy } from './deploy.js';
-import { runSsl } from './ssl.js';
+import { runSsl, runSslDnsVerify } from './ssl.js';
 import { runPurge } from './purge.js';
 import { runResetPassword } from './resetPassword.js';
 import { runExport } from './export.js';
@@ -134,11 +134,12 @@ const del = {
 };
 
 // ============================================================
-//  ssl — mode-driven SSL: off | le-http | custom
+//  ssl — mode-driven SSL: off | le-http | le-dns-manual | custom
 // ============================================================
 // cert/key ride the authenticated body only. redactParams (jobs.js) masks
-// them in every job view; the ops never log them.
-const SSL_MODES = ['off', 'le-http', 'custom'];
+// them in every job view; the ops never log them. le-dns-manual starts the
+// two-step manual DNS-01 flow (verified by the sslDnsVerify op).
+const SSL_MODES = ['off', 'le-http', 'le-dns-manual', 'custom'];
 const ssl = {
   name: 'ssl',
   // params: { domain, mode: "off"|"le-http"|"custom", cert?, key? }
@@ -168,6 +169,23 @@ const ssl = {
   },
   async run(job, helpers, p) {
     await runSsl(job, helpers, p);
+  },
+};
+
+// ============================================================
+//  sslDnsVerify — step 2 of manual DNS-01 (verify the TXT records)
+// ============================================================
+const sslDnsVerify = {
+  name: 'sslDnsVerify',
+  // params: { domain }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain } };
+  },
+  async run(job, helpers, p) {
+    await runSslDnsVerify(job, helpers, p);
   },
 };
 
@@ -341,7 +359,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { deploy, update, delete: del, ssl, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { deploy, update, delete: del, ssl, sslDnsVerify, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

@@ -6,6 +6,7 @@ import {
 } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import { CRT, KEY, SSL_CONF } from '../lib/panelcert.js';
+import { clearChallenge } from '../lib/acmedns.js';
 
 // ============================================================
 //  delete — permanently remove a WordPress site
@@ -87,6 +88,8 @@ export async function runDelete(job, helpers, p, opts = {}) {
   await removePath(`/etc/letsencrypt/live/${domain}`);
   await removePath(`/etc/letsencrypt/archive/${domain}`);
   await removePath(`/etc/letsencrypt/renewal/${domain}.conf`);
+  await removePath(`/etc/letsencrypt/renewal/${domain}_ecc`); // acme.sh v3 (ECC default)
+  await clearChallenge(domain); // any pending manual DNS-01 challenge
   ok('Certificate files cleared');
 
   // 7b) If the WordOps admin panel (:22222) was pointed at THIS domain's cert
