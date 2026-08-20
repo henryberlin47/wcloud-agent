@@ -6,7 +6,7 @@ import {
 } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 
-// params: { sourceUrl, domain, sourceDomain?, includeSsl?, sameServer?, localArchive?, encryptKey?, canonical?, enableWww? }
+// params: { sourceUrl, domain, sourceDomain?, includeSsl?, issueSsl?, sameServer?, localArchive?, encryptKey?, canonical?, enableWww? }
 export async function runImport(job, helpers, p) {
   const { step, ok, err } = logger(helpers);
   const domain = p.domain;
@@ -46,7 +46,7 @@ export async function runImport(job, helpers, p) {
 
   await runRestoreFromLocal(job, helpers, {
     tmpDir, domain, sourceDomain,
-    includeSsl: p.includeSsl, encryptKey: p.encryptKey,
+    includeSsl: p.includeSsl, issueSsl: p.issueSsl, encryptKey: p.encryptKey,
     canonical: p.canonical, enableWww: p.enableWww,
   });
 }
@@ -56,12 +56,14 @@ export async function runImport(job, helpers, p) {
 // `${tmpDir}/export.tar.gz.enc` (plaintext `.tar.gz` renamed is fine too).
 // Owns tmpDir cleanup and rollback of a half-created site on failure.
 //
-// params: { tmpDir, domain, sourceDomain, includeSsl?, encryptKey?, canonical?, enableWww? }
+// params: { tmpDir, domain, sourceDomain, includeSsl?, issueSsl?, encryptKey?, canonical?, enableWww? }
+// includeSsl → copy the source's certs; issueSsl → issue Let's Encrypt; both
+// false → no SSL (explicit "No SSL" choice from the portal).
 export async function runRestoreFromLocal(job, helpers, {
   tmpDir, domain, sourceDomain,
-  includeSsl = false, encryptKey = '', canonical = 'none', enableWww = true,
+  includeSsl = false, issueSsl = true, encryptKey = '', canonical = 'none', enableWww = true,
 }) {
-  const { log, step, ok, warn, err } = logger(helpers);
+  const { log, step, ok, warn, err, skip } = logger(helpers);
   const domainChanged = sourceDomain !== domain;
   const siteDir = `${config.wwwDir}/${domain}`;
   let siteCreated = false;
@@ -264,14 +266,16 @@ export async function runRestoreFromLocal(job, helpers, {
 
       ok('SSL certificates restored');
       warn('Copied certs will not auto-renew. After DNS points here, run the SSL op to get acme.sh-managed certs with renewal.');
-    } else {
+    } else if (issueSsl) {
       step('Issue SSL certificate');
       const sslR = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force']);
       if (sslR.code === 0) {
         ok(`SSL issued for ${domain}`);
       } else {
-        warn(`SSL failed (DNS/propagation?) — run "wo site update ${domain} --le --force" later`);
+        warn(`SSL failed (DNS/propagation?) — run the SSL op from the site page later`);
       }
+    } else {
+      skip('SSL — "No SSL" selected');
     }
 
     // Apply domain preferences (after DB import so WP options aren't

@@ -70,7 +70,8 @@ function redactParams(params = {}) {
   if (!params || typeof params !== 'object') return params;
   const clone = { ...params };
   for (const k of Object.keys(clone)) {
-    if (/pass|secret|token|key/i.test(k)) clone[k] = '***';
+    // cert = the pasted fullchain (public, but never echoed either); key = secret.
+    if (/pass|secret|token|key|cert/i.test(k)) clone[k] = '***';
   }
   return clone;
 }

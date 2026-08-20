@@ -12,7 +12,9 @@ import { woSiteList, run, getPhpVersion } from './lib/sys.js';
 import { ensureRclone, spacesEnv, remotePath } from './lib/spaces.js';
 import { enforceAdminPanelCert } from './lib/panelcert.js';
 import { readDbCredentials } from './lib/credentials.js';
+import { readSiteSsl } from './lib/certinfo.js';
 import { enroll } from './enroll.js';
+import { normDomain, isDomain } from './operations/index.js';
 
 // --- startup validation -----------------------------------------------------
 const problems = validateConfig();
@@ -40,7 +42,9 @@ enforceAdminPanelCert().catch((e) => console.error('[agent] panel-cert enforce f
 const app = express();
 app.disable('x-powered-by');
 if (config.trustProxy) app.set('trust proxy', true);
-app.use(express.json({ limit: '64kb' }));
+// 256kb: a pasted custom cert+key pair (up to 60KB each, see the ssl op) plus
+// JSON overhead must fit in the authenticated body.
+app.use(express.json({ limit: '256kb' }));
 
 // --- health (unauthenticated, minimal) --------------------------------------
 // Useful for the panel to see the server is up before auth. Reveals nothing.
@@ -337,6 +341,20 @@ app.get('/api/sites/:domain/credentials', async (req, res) => {
     const creds = await readDbCredentials(helpers, req.params.domain);
     if (!creds) return res.status(404).json({ error: 'not_found' });
     res.json(creds);
+  } catch (e) {
+    res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
+  }
+});
+
+// --- live SSL state for a site ------------------------------------------------
+// The cert on disk is the source of truth — nothing stored, everything parsed
+// on demand. Feeds the site page's SSL status card.
+app.get('/api/sites/:domain/ssl', async (req, res) => {
+  const domain = normDomain(req.params.domain);
+  if (!isDomain(domain)) return res.status(400).json({ error: 'invalid_domain' });
+  const helpers = NOOP_HELPERS;
+  try {
+    res.json(await readSiteSsl(helpers, domain));
   } catch (e) {
     res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
   }

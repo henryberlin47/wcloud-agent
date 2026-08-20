@@ -44,7 +44,7 @@ function sanitize(p) {
   return out;
 }
 
-function isDomain(v) {
+export function isDomain(v) {
   return typeof v === 'string' && DOMAIN_RE.test(v);
 }
 function reqDomain(errors, name, v) {
@@ -71,7 +71,7 @@ function reqSpaces(p, errors) {
 // ============================================================
 const deploy = {
   name: 'deploy',
-  // params: { domain, wp_user?, wp_password?, canonical?: "www"|"root"|"none", enableWww? }
+  // params: { domain, wp_user?, wp_password?, canonical?: "www"|"root"|"none", enableWww?, issueSsl? }
   validate(p = {}) {
     p = sanitize(p);
     const errors = [];
@@ -88,8 +88,10 @@ const deploy = {
     let canonical = (p.canonical === 'www' || p.canonical === 'root' || p.canonical === 'none') ? p.canonical : 'none';
     const enableWww = p.enableWww !== false;
     if (canonical === 'www' && !enableWww) canonical = 'root'; // can't redirect to a host we don't serve
+    // Explicit SSL choice from the portal (default: issue, as before).
+    const issueSsl = p.issueSsl !== false;
 
-    return { ok: errors.length === 0, errors, clean: { domain: p.domain, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww } };
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww, issueSsl } };
   },
   async run(job, helpers, p) {
     await runDeploy(job, helpers, p);
@@ -132,16 +134,37 @@ const del = {
 };
 
 // ============================================================
-//  ssl — re-issue Let's Encrypt cert (retry for a failed SSL step)
+//  ssl — mode-driven SSL: off | le-http | custom
 // ============================================================
+// cert/key ride the authenticated body only. redactParams (jobs.js) masks
+// them in every job view; the ops never log them.
+const SSL_MODES = ['off', 'le-http', 'custom'];
 const ssl = {
   name: 'ssl',
-  // params: { domain }
+  // params: { domain, mode: "off"|"le-http"|"custom", cert?, key? }
   validate(p = {}) {
     p = sanitize(p);
     const errors = [];
     reqDomain(errors, 'domain', p.domain);
-    return { ok: errors.length === 0, errors, clean: { domain: p.domain } };
+    const mode = SSL_MODES.includes(p.mode) ? p.mode : null;
+    if (!mode) errors.push(`mode is required (one of: ${SSL_MODES.join(', ')})`);
+
+    let cert = '';
+    let key = '';
+    if (mode === 'custom') {
+      cert = typeof p.cert === 'string' ? p.cert.trim() : '';
+      key = typeof p.key === 'string' ? p.key : '';
+      if (!cert) errors.push('cert is required (PEM fullchain)');
+      if (!key) errors.push('key is required (PEM private key)');
+      if (cert.length > 60_000) errors.push('cert is too large (60KB max)');
+      if (key.length > 60_000) errors.push('key is too large (60KB max)');
+    }
+
+    return {
+      ok: errors.length === 0,
+      errors,
+      clean: { domain: p.domain, mode, ...(mode === 'custom' ? { cert, key } : {}) },
+    };
   },
   async run(job, helpers, p) {
     await runSsl(job, helpers, p);
@@ -211,7 +234,7 @@ const exportOp = {
 // ============================================================
 const importOp = {
   name: 'import',
-  // params: { sourceUrl, domain, sourceDomain?, includeSsl?, sameServer?, localArchive?, encryptKey?, canonical?: "www"|"root"|"none", enableWww? }
+  // params: { sourceUrl, domain, sourceDomain?, includeSsl?, issueSsl?, sameServer?, localArchive?, encryptKey?, canonical?: "www"|"root"|"none", enableWww? }
   validate(p = {}) {
     const out = { ...p };
     if (typeof out.domain === 'string') out.domain = normDomain(out.domain);
@@ -231,6 +254,7 @@ const importOp = {
         domain: out.domain,
         sourceDomain: out.sourceDomain || out.domain,
         includeSsl: out.includeSsl === true,
+        issueSsl: out.issueSsl !== false,
         sameServer: out.sameServer === true,
         localArchive: out.localArchive || null,
         encryptKey: out.encryptKey || '',

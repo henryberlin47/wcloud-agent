@@ -15,7 +15,7 @@ import { logger } from '../lib/log.js';
 // ============================================================
 
 export async function runDeploy(job, helpers, p) {
-  const { log, step, ok, warn } = logger(helpers);
+  const { log, step, ok, warn, skip } = logger(helpers);
   const domain = p.domain;
   const requestedUser = p.wp_user || '';
   const requestedPassword = p.wp_password || '';
@@ -38,18 +38,22 @@ export async function runDeploy(job, helpers, p) {
     ok(`Created ${domain}`);
   }
 
-  // 2) Issue SSL certificate.
-  step('Issue SSL certificate');
-  const ssl = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force']);
-  if (ssl.code === 0) {
-    ok(`SSL installed for ${domain}`);
-    // Reload nginx after cert install.
-    if (await nginxTest(helpers)) {
-      await nginxReload(helpers);
-      ok('nginx reloaded');
-    }
+  // 2) Issue SSL certificate (explicit choice from the portal; default on).
+  if (p.issueSsl === false) {
+    skip('Issue SSL certificate — "No SSL" selected');
   } else {
-    warn(`SSL failed (DNS/propagation?) — run "wo site update ${domain} --le --force" later`);
+    step('Issue SSL certificate');
+    const ssl = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force']);
+    if (ssl.code === 0) {
+      ok(`SSL installed for ${domain}`);
+      // Reload nginx after cert install.
+      if (await nginxTest(helpers)) {
+        await nginxReload(helpers);
+        ok('nginx reloaded');
+      }
+    } else {
+      warn(`SSL failed (DNS/propagation?) — run the SSL op from the site page later`);
+    }
   }
 
   // Apply domain preferences (canonical redirect + www enablement). Handles

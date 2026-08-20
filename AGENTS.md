@@ -45,6 +45,11 @@ as the source of truth for writing code** — the graph is only a map.
 - `GET /api/sites` — `{ server, count, sites: [...] }` via `woSiteList`.
 - `GET /api/sites/:domain/credentials` — DB creds read **live** from `wp-config.php`
   (see §6). 404 = not a readable WP site.
+- `GET /api/sites/:domain/ssl` — live SSL state, parsed **on demand** from the cert
+  on disk (`/etc/letsencrypt/live/<domain>/fullchain.pem`): `{ enabled, source:
+  none|letsencrypt|letsencrypt-manual|custom, auto_renew, issuer, subject, sans[],
+  not_after, days_left, self_signed }`. Nothing is stored — the disk is the source
+  of truth (see §3, ssl).
 - `POST /api/op/:type` — validate + enqueue an operation → `{ jobId, state }`.
 - `POST /api/self-update` — `git fetch origin` + `reset --hard origin/main` + `npm install`, respond `{ ok, updated, old_commit, new_commit, version }`, then restart via a *systemd-run 2s timer* (detached — the timer outlives the process that gets SIGTERM'd). Origin/branch hardcoded: this runs remote code as root, no request body ever reaches a shell.
 - `POST /api/backup-test`, `POST /api/backup-delete` — quick rclone calls against the Spaces creds passed **in the request body** (per user, per job). Creds live in the rclone subprocess `env` for one call only — never written to config, never logged (command lines carry no secrets).
@@ -64,18 +69,40 @@ Each descriptor has:
   against `DOMAIN_RE`. Never let unvalidated input reach a command.
 - `run(job, helpers, clean)` — the work.
 
-Current ops: **deploy** (`wo site create --wp` + SSL), **update** (`wp core update`
-+ `update-db` + php-fpm restart), **delete** (removes site, nginx, certs; requires
-`confirm:true`), **ssl** (`wo site update --le --force`), **purge** (WP Rocket +
-object cache), **resetPassword** (`wp user update --user_pass`), **export** (builds
-the archived site; `buildSiteArchive` in `export.js` is the shared archive builder),
-**import** (restores an archive; `runRestoreFromLocal` in `import.js` is the shared
-restore body — decrypt/extract/DB/SSL/canonical all live there), **backup** (build
-archive via the shared helper + rclone-upload to Spaces) and **restore** (rclone-
-download + the shared restore path; in-place restore first runs the full **delete**
-op). backup/restore take the user's Spaces creds per call in params and run with a
-longer per-op timeout (`AGENT_BACKUP_TIMEOUT_MS`, default 12h). No shells are used
-— args are arrays, so domain values can't inject shell syntax.
+Current ops: **deploy** (`wo site create --wp` + optional SSL, `issueSsl` flag),
+**update** (`wp core update` + `update-db` + php-fpm restart), **delete** (removes
+site, nginx, certs; requires `confirm:true`), **ssl** (mode-driven, below),
+**purge** (WP Rocket + object cache), **resetPassword** (`wp user update --user_pass`),
+**export** (builds the archived site; `buildSiteArchive` in `export.js` is the shared
+archive builder), **import** (restores an archive; `runRestoreFromLocal` in
+`import.js` is the shared restore body — decrypt/extract/DB/SSL/canonical all live
+there), **backup** (build archive via the shared helper + rclone-upload to Spaces)
+and **restore** (rclone-download + the shared restore path; in-place restore first
+runs the full **delete** op). backup/restore take the user's Spaces creds per call
+in params and run with a longer per-op timeout (`AGENT_BACKUP_TIMEOUT_MS`, default
+12h). No shells are used — args are arrays, so domain values can't inject shell
+syntax.
+
+**ssl — mode-driven (`{ domain, mode, cert?, key? }`)**, never "always issue":
+- `off` — removes the port-443 config (per-site `conf/nginx/ssl.conf` and/or a 443
+  `server` block in the main vhost), **keeps the certs on disk**, and only reloads
+  if `nginx -t` passes (backup → edit → `nginx -t` → rollback, the setCanonical
+  contract). No dangling `ssl_certificate` without a `listen 443`.
+- `le-http` — `wo site update <domain> --le --force` (HTTP-01, auto-renews).
+- `custom` — pasted fullchain + key. **Validated before anything is written**: both
+  parse as PEM, the key's public key equals the cert's (public-key compare — covers
+  RSA/EC/Ed25519), and the cert's SAN covers the domain. A bad pair never touches
+  disk. Then `installCertFiles` + `applySslConf` (shared wiring, §5). `cert`/`key`
+  arrive in the authenticated body only, the key is written `600 root:root`, and
+  neither is ever logged or echoed (job views redact both).
+
+**Cert/nginx wiring** — `src/lib/certinstall.js` owns it: all certs (LE, custom,
+manual-DNS) live at `/etc/letsencrypt/live/<domain>/` (`fullchain.pem`, `key.pem`)
+so every consumer stays path-stable; `applySslConf` writes `conf/nginx/ssl.conf`
+(bare directives — WordOps includes `conf/nginx/*.conf` *inside* the server block),
+`nginx -t`, reload, rolling the conf back on failure. `src/lib/certinfo.js` reads
+the live state (issuer → source; a `.wcloud-ssl-manual` marker flags non-renewing
+manual-DNS certs).
 
 **Log format** — ops use `logger(helpers)` (`src/lib/log.js`). Commands are silent
 on success and dump `$ cmd` + last 15 lines only on failure. Output reads like a
@@ -116,6 +143,8 @@ Driven by env the portal's install command injects (`init.sh` writes them to
 - **credentials.js** — `readDbCredentials(helpers, domain)`: reads DB_NAME/USER/
   PASSWORD live via `wp config get`. No cache, no storage. Has a path-traversal
   guard on the domain.
+- **certinfo.js / certinstall.js** — live SSL state + cert/nginx wiring (see §3
+  "ssl"). Disk is the source of truth; nothing per-site is stored.
 - **panelcert.js** — pins the `:22222` WordOps panel to its self-signed cert and
   locks it, so it can't be repointed at a deletable site cert. Called at startup.
 - **log.js** — the step logger used by operations.
@@ -176,7 +205,8 @@ src/config.js          env-driven config + version from package.json
 src/enroll.js          self-registration with the portal (§4)
 src/jobs.js            in-memory job queue + SSE
 src/operations/        one file per op + index.js registry (§3)
-src/lib/               sys.js, credentials.js, panelcert.js, log.js (§5)
+src/lib/               sys.js, credentials.js, panelcert.js, log.js,
+                       certinfo.js, certinstall.js (§5)
 src/templates/         nginx snippets (custom-cache.conf)
 init.sh                one-shot server bootstrap (clone, install, enroll, stream) (§4)
 wcloud.service         systemd unit
