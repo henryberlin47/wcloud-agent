@@ -8,7 +8,7 @@ import {
 import {
   certDir, fullchainPath, keyPath,
   sslConfContent, installCertFiles, applySslConf,
-  removeManualMarker,
+  removeManualMarker, stripSslServerBlocks, mainVhostPath,
 } from '../lib/certinstall.js';
 import { logger } from '../lib/log.js';
 import { startManualDns, verifyManualDns } from '../lib/acmedns.js';
@@ -68,7 +68,7 @@ async function runSslOff(helpers, domain) {
     const c = await fs.readFile(sslConf, 'utf8');
     if (/listen[ \t]+443|ssl_certificate/.test(c)) edits.push({ path: sslConf, action: 'remove' });
   }
-  const main = `/etc/nginx/sites-available/${domain}`;
+  const main = mainVhostPath(domain);
   if (await pathExists(main)) {
     const c = await fs.readFile(main, 'utf8');
     if (/listen[ \t]+443/.test(c)) {
@@ -99,53 +99,6 @@ async function runSslOff(helpers, domain) {
     for (const b of backups.values()) await removePath(b);
     throw new Error('nginx -t FAILED after removing the SSL config — reverted, nothing was reloaded; inspect the vhost manually');
   }
-}
-
-// Remove top-level `server { ... }` blocks that listen on 443 (old WordOps
-// layout: both vhosts in sites-available/<domain>). Brace-matched; anything
-// that doesn't parse as a clean block is left untouched.
-function stripSslServerBlocks(content) {
-  let out = '';
-  let i = 0;
-  while (i < content.length) {
-    const idx = content.indexOf('server', i);
-    if (idx < 0) { out += content.slice(i); break; }
-    const lineStart = content.lastIndexOf('\n', idx - 1) + 1;
-    const atLineStart = content.slice(lineStart, idx).trim() === '';
-    const brace = content.indexOf('{', idx);
-    const cleanBlock =
-      atLineStart &&
-      brace > idx &&
-      /^[ \t]*$/.test(content.slice(idx + 6, brace)) &&
-      braceDepth(content.slice(0, idx)) === 0;
-    if (cleanBlock) {
-      const end = matchingBrace(content, brace);
-      if (end > 0) {
-        const block = content.slice(idx, end + 1);
-        if (!/listen[ \t]+443\b/.test(block)) out += block;
-        i = end + 1;
-        continue;
-      }
-    }
-    out += content.slice(i, idx + 6);
-    i = idx + 6;
-  }
-  return out;
-}
-
-function braceDepth(s) {
-  let d = 0;
-  for (const ch of s) { if (ch === '{') d += 1; else if (ch === '}') d -= 1; }
-  return d;
-}
-
-function matchingBrace(s, openIdx) {
-  let d = 0;
-  for (let i = openIdx; i < s.length; i++) {
-    if (s[i] === '{') d += 1;
-    else if (s[i] === '}') { d -= 1; if (d === 0) return i; }
-  }
-  return -1;
 }
 
 // --- le-http ----------------------------------------------------------------
@@ -247,7 +200,7 @@ async function runSslCustom(helpers, domain, p) {
 // True if the vhost serves www.<domain> (a cert without it would break that
 // version over HTTPS). Probes the same files setCanonical edits.
 async function vhostServesHost(domain, host) {
-  for (const f of [`/etc/nginx/sites-available/${domain}`, `${config.wwwDir}/${domain}/conf/nginx/ssl.conf`]) {
+  for (const f of [mainVhostPath(domain), `${config.wwwDir}/${domain}/conf/nginx/ssl.conf`]) {
     if (await pathExists(f)) {
       const c = await fs.readFile(f, 'utf8');
       if (c.includes(host)) return true;

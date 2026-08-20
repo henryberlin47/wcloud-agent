@@ -57,28 +57,93 @@ export async function installCertFiles(helpers, domain, { fullchain, key }) {
   await run(helpers, 'chown', ['-R', 'root:root', dir]);
 }
 
-// Point the site's nginx at the cert in its cert dir: write conf/nginx/ssl.conf,
-// nginx -t, reload. If nginx -t fails the previous conf is restored first —
+// Remove top-level `server { ... }` blocks that listen on 443 (old WordOps
+// layout: both vhosts in sites-available/<domain>). Brace-matched; anything
+// that doesn't parse as a clean block is left untouched.
+export function stripSslServerBlocks(content) {
+  let out = '';
+  let i = 0;
+  while (i < content.length) {
+    const idx = content.indexOf('server', i);
+    if (idx < 0) { out += content.slice(i); break; }
+    const lineStart = content.lastIndexOf('\n', idx - 1) + 1;
+    const atLineStart = content.slice(lineStart, idx).trim() === '';
+    const brace = content.indexOf('{', idx);
+    const cleanBlock =
+      atLineStart &&
+      brace > idx &&
+      /^[ \t]*$/.test(content.slice(idx + 6, brace)) &&
+      braceDepth(content.slice(0, idx)) === 0;
+    if (cleanBlock) {
+      const end = matchingBrace(content, brace);
+      if (end > 0) {
+        const block = content.slice(idx, end + 1);
+        if (!/listen[ \t]+443\b/.test(block)) out += block;
+        i = end + 1;
+        continue;
+      }
+    }
+    out += content.slice(i, idx + 6);
+    i = idx + 6;
+  }
+  return out;
+}
+
+function braceDepth(s) {
+  let d = 0;
+  for (const ch of s) { if (ch === '{') d += 1; else if (ch === '}') d -= 1; }
+  return d;
+}
+
+function matchingBrace(s, openIdx) {
+  let d = 0;
+  for (let i = openIdx; i < s.length; i++) {
+    if (s[i] === '{') d += 1;
+    else if (s[i] === '}') { d -= 1; if (d === 0) return i; }
+  }
+  return -1;
+}
+
+export const mainVhostPath = (domain) => `/etc/nginx/sites-available/${domain}`;
+
+// Point the site's nginx at the cert in its cert dir. The port-443 config must
+// live ONLY in conf/nginx/ssl.conf: if the main vhost still carries its own
+// 443 `server` block (old WordOps layout), the bare `listen 443` from
+// ssl.conf would be included into that block too and nginx -t fails with
+// "duplicate listen" — so such blocks are stripped in the same step.
+// Everything is ONE backup -> nginx -t -> rollback transaction: on failure
+// each touched file returns to its exact prior state, including absence —
 // a cert change can never leave the box with a broken nginx config.
 export async function applySslConf(helpers, domain) {
   const { ok, err } = logger(helpers);
   const confDir = `${config.wwwDir}/${domain}/conf/nginx`;
   const conf = `${confDir}/ssl.conf`;
-  const backup = `${conf}.wcloud-bak`;
+  const main = mainVhostPath(domain);
 
   await fs.mkdir(confDir, { recursive: true });
-  if (await pathExists(conf)) await fs.copyFile(conf, backup);
-  await fs.writeFile(conf, sslConfContent(domain), { mode: 0o644 });
+
+  const edits = []; // { path, before (null = absent), after }
+  if (await pathExists(main)) {
+    const before = await fs.readFile(main, 'utf8');
+    const after = stripSslServerBlocks(before); // no-op when no 443 block
+    if (after !== before) edits.push({ path: main, before, after });
+  }
+  edits.push({
+    path: conf,
+    before: (await pathExists(conf)) ? await fs.readFile(conf, 'utf8') : null,
+    after: sslConfContent(domain),
+  });
+
+  for (const e of edits) await fs.writeFile(e.path, e.after, { mode: 0o644 });
 
   if (!(await nginxTest(helpers))) {
-    if (await pathExists(backup)) {
-      await fs.copyFile(backup, conf);
-      await removePath(backup);
+    for (const e of edits) {
+      if (e.before === null) await removePath(e.path);
+      else await fs.writeFile(e.path, e.before, { mode: 0o644 });
     }
-    err('nginx -t FAILED with the new ssl.conf — previous config restored');
+    err('nginx -t FAILED with the new SSL config — previous config restored');
     throw new Error('nginx -t failed with the new SSL config — the previous config was restored, nothing was reloaded');
   }
-  await removePath(backup);
   await nginxReload(helpers);
   ok('nginx validated + reloaded with the new SSL config');
 }

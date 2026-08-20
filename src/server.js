@@ -14,6 +14,7 @@ import { enforceAdminPanelCert } from './lib/panelcert.js';
 import { readDbCredentials } from './lib/credentials.js';
 import { readSiteSsl } from './lib/certinfo.js';
 import { readChallenge } from './lib/acmedns.js';
+import { readWpVersion } from './lib/wpinfo.js';
 import { enroll } from './enroll.js';
 import { normDomain, isDomain } from './operations/index.js';
 
@@ -342,6 +343,19 @@ app.get('/api/sites/:domain/credentials', async (req, res) => {
     const creds = await readDbCredentials(helpers, req.params.domain);
     if (!creds) return res.status(404).json({ error: 'not_found' });
     res.json(creds);
+  } catch (e) {
+    res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
+  }
+});
+
+// --- WordPress version for a site (live via wp-cli, nothing stored) -----------
+app.get('/api/sites/:domain/wp', async (req, res) => {
+  const domain = normDomain(req.params.domain);
+  if (!isDomain(domain)) return res.status(400).json({ error: 'invalid_domain' });
+  try {
+    const v = await readWpVersion(NOOP_HELPERS, domain);
+    if (!v) return res.status(404).json({ error: 'not_found' });
+    res.json({ domain, wp_version: v });
   } catch (e) {
     res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
   }

@@ -45,6 +45,8 @@ as the source of truth for writing code** — the graph is only a map.
 - `GET /api/sites` — `{ server, count, sites: [...] }` via `woSiteList`.
 - `GET /api/sites/:domain/credentials` — DB creds read **live** from `wp-config.php`
   (see §6). 404 = not a readable WP site.
+- `GET /api/sites/:domain/wp` — WordPress core version, read **live** via
+  `wp core version` (`src/lib/wpinfo.js`). 404 = not a readable WP install.
 - `GET /api/sites/:domain/ssl` — live SSL state, parsed **on demand** from the cert
   on disk (`/etc/letsencrypt/live/<domain>/fullchain.pem`): `{ enabled, source:
   none|letsencrypt|letsencrypt-manual|custom, auto_renew, issuer, subject, sans[],
@@ -128,9 +130,15 @@ flagged by the `.wcloud-ssl-manual` marker → `source: letsencrypt-manual`,
 manual-DNS) live at `/etc/letsencrypt/live/<domain>/` (`fullchain.pem`, `key.pem`)
 so every consumer stays path-stable; `applySslConf` writes `conf/nginx/ssl.conf`
 (bare directives — WordOps includes `conf/nginx/*.conf` *inside* the server block),
-`nginx -t`, reload, rolling the conf back on failure. `src/lib/certinfo.js` reads
-the live state (issuer → source; a `.wcloud-ssl-manual` marker flags non-renewing
-manual-DNS certs).
+`nginx -t`, reload, rolling back on failure. Port 443 must come from **only**
+ssl.conf: `applySslConf` first strips any 443 `server` block still in the main
+vhost (`stripSslServerBlocks` — old WordOps layout, where both vhosts live in
+`sites-available/<domain>`; left in place, the bare `listen 443` included into
+that block fails `nginx -t` with "duplicate listen"). Main-vhost strip and
+ssl.conf write are ONE transaction: each touched file rolls back to its exact
+prior state, *including absence* (a never-existing ssl.conf is deleted, not
+left behind, on failure). `src/lib/certinfo.js` reads the live state (issuer →
+source; a `.wcloud-ssl-manual` marker flags non-renewing manual-DNS certs).
 
 **Log format** — ops use `logger(helpers)` (`src/lib/log.js`). Commands are silent
 on success and dump `$ cmd` + last 15 lines only on failure. Output reads like a
@@ -174,6 +182,7 @@ Driven by env the portal's install command injects (`init.sh` writes them to
 - **certinfo.js / certinstall.js** — live SSL state + cert/nginx wiring (see §3
   "ssl"). Disk is the source of truth; nothing per-site is stored.
 - **acmedns.js** — the manual DNS-01 two-step flow + its state file (see §3).
+- **wpinfo.js** — live WordPress core version (`wp core version`), nothing stored.
 - **panelcert.js** — pins the `:22222` WordOps panel to its self-signed cert and
   locks it, so it can't be repointed at a deletable site cert. Called at startup.
 - **log.js** — the step logger used by operations.
@@ -235,7 +244,7 @@ src/enroll.js          self-registration with the portal (§4)
 src/jobs.js            in-memory job queue + SSE
 src/operations/        one file per op + index.js registry (§3)
 src/lib/               sys.js, credentials.js, panelcert.js, log.js,
-                       certinfo.js, certinstall.js, acmedns.js (§5)
+                       certinfo.js, certinstall.js, acmedns.js, wpinfo.js (§5)
 src/templates/         nginx snippets (custom-cache.conf)
 init.sh                one-shot server bootstrap (clone, install, enroll, stream) (§4)
 wcloud.service         systemd unit

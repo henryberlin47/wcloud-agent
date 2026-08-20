@@ -276,11 +276,18 @@ export function adjustServerNames(content, base, wwwHost, enableWww) {
   return { out, changed };
 }
 
-// True if the cert's SAN list includes host (quiet probe).
+// True if the cert's SAN list covers host (quiet probe). Exact DNS entry or a
+// one-label wildcard (DNS:*.example.com covers www.example.com — never
+// example.com itself, never deeper subdomains). A substring test would let
+// SAN "example.com.attacker.com" pass for "example.com".
 export async function certCovers(helpers, certPath, host) {
   const r = await run(helpers, 'openssl', ['x509', '-in', certPath, '-noout', '-ext', 'subjectAltName'], { quiet: true, timeout: 15_000 });
   if (r.code !== 0) return false;
-  return r.stdout.includes(`DNS:${host}`);
+  const target = String(host).trim().toLowerCase();
+  const sans = [...r.stdout.matchAll(/DNS:([^,\s]+)/g)].map((m) => m[1].toLowerCase());
+  return sans.some((san) =>
+    san === target ||
+    (san.startsWith('*.') && target.endsWith(`.${san.slice(2)}`) && target.split('.').length === san.split('.').length));
 }
 
 // Apply the user's domain preferences to a live site.
