@@ -37,13 +37,17 @@ export async function ensureRclone(helpers) {
 }
 
 // Env vars that define the `wcloud:` rclone remote for one transfer.
+// rclone only reads a remote-from-env when the remote name in the key is
+// UPPERCASE (RCLONE_CONFIG_<REMOTE>_<OPTION>); a lowercase key is ignored, so
+// rclone falls back to the config file and fails with "didn't find section in
+// config file (wcloud)". The remote is still referenced lowercase (`wcloud:`).
 export function spacesEnv({ endpoint, accessKeyId, secretAccessKey }) {
   return {
-    RCLONE_CONFIG_wcloud_TYPE: 's3',
-    RCLONE_CONFIG_wcloud_PROVIDER: 'DigitalOcean',
-    RCLONE_CONFIG_wcloud_ENDPOINT: endpoint,
-    RCLONE_CONFIG_wcloud_ACCESS_KEY_ID: accessKeyId,
-    RCLONE_CONFIG_wcloud_SECRET_ACCESS_KEY: secretAccessKey,
+    RCLONE_CONFIG_WCLOUD_TYPE: 's3',
+    RCLONE_CONFIG_WCLOUD_PROVIDER: 'DigitalOcean',
+    RCLONE_CONFIG_WCLOUD_ENDPOINT: endpoint,
+    RCLONE_CONFIG_WCLOUD_ACCESS_KEY_ID: accessKeyId,
+    RCLONE_CONFIG_WCLOUD_SECRET_ACCESS_KEY: secretAccessKey,
   };
 }
 
