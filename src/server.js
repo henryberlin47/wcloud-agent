@@ -9,7 +9,7 @@ import { requireAuth } from './auth.js';
 import { getOperation } from './operations/index.js';
 import { serveExport } from './operations/export.js';
 import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './jobs.js';
-import { woSiteList, run, getPhpVersion } from './lib/sys.js';
+import { woSiteList, run, getPhpVersion, readCanonical } from './lib/sys.js';
 import { listTopLevel, putObject, deleteObject, statObject, explainSpacesError } from './lib/spaces.js';
 import { enforceAdminPanelCert } from './lib/panelcert.js';
 import { readDbCredentials } from './lib/credentials.js';
@@ -84,7 +84,7 @@ app.get('/api/info', async (req, res) => {
   const info = {
     server: config.serverName,
     version: config.version,
-    operations: ['deploy', 'update', 'delete', 'ssl', 'sslDnsVerify', 'purge', 'resetPassword', 'export', 'import'],
+    operations: ['deploy', 'update', 'delete', 'ssl', 'sslDnsVerify', 'canonical', 'purge', 'resetPassword', 'export', 'import'],
     maxConcurrentJobs: config.maxConcurrentJobs,
   };
 
@@ -371,6 +371,19 @@ app.get('/api/sites/:domain/ssl', async (req, res) => {
   const helpers = NOOP_HELPERS;
   try {
     res.json(await readSiteSsl(helpers, domain));
+  } catch (e) {
+    res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
+  }
+});
+
+// --- live domain preference (www / preferred address) ------------------------
+// Read from the nginx config on disk, like the SSL state — nothing stored, so
+// the site page shows what is actually configured, not what deploy was told.
+app.get('/api/sites/:domain/canonical', async (req, res) => {
+  const domain = normDomain(req.params.domain);
+  if (!isDomain(domain)) return res.status(400).json({ error: 'invalid_domain' });
+  try {
+    res.json(await readCanonical(NOOP_HELPERS, domain));
   } catch (e) {
     res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
   }

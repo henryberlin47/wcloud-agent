@@ -335,6 +335,37 @@ export async function certCovers(helpers, certPath, host) {
 //   enableWww true/false   → ensure/remove www.<domain> in the vhost's
 //                            server_name (backup + nginx -t + rollback)
 // Reloads nginx at the end when (and only when) something changed.
+// Read the live domain preference, the same way certinfo reads the live cert:
+// the config on disk is the truth, nothing is stored. Feeds the site page so it
+// can show what is actually configured rather than what was chosen at deploy.
+//   canonical: "www" | "root" | "none"   enableWww: is www.<domain> served at all
+export async function readCanonical(helpers, domain) {
+  const wwwHost = `www.${domain}`;
+  const out = { domain, canonical: 'none', enableWww: false, www_host: wwwHost };
+
+  const conf = `${config.wwwDir}/${domain}/conf/nginx/canonical.conf`;
+  if (await pathExists(conf)) {
+    try {
+      const c = await fs.readFile(conf, 'utf8');
+      // written as: if ($host = <other>) { return 301 <scheme>://<canonical>... }
+      const m = c.match(/return\s+301\s+(?:https?|\$scheme):\/\/([^\s/$]+)/i);
+      if (m) out.canonical = m[1].toLowerCase() === wwwHost ? 'www' : 'root';
+    } catch { /* unreadable → treat as no preference */ }
+  }
+
+  for (const f of [`/etc/nginx/sites-available/${domain}`, `${config.wwwDir}/${domain}/conf/nginx/ssl.conf`]) {
+    if (!(await pathExists(f))) continue;
+    try {
+      const c = await fs.readFile(f, 'utf8');
+      for (const m of c.matchAll(/server_name\s+([^;]+);/g)) {
+        if (m[1].trim().split(/\s+/).includes(wwwHost)) { out.enableWww = true; break; }
+      }
+    } catch { /* ignore */ }
+    if (out.enableWww) break;
+  }
+  return out;
+}
+
 export async function setCanonical(helpers, domain, canonical, enableWww = true) {
   const { ok, warn, err } = logger(helpers);
   const wwwHost = `www.${domain}`;

@@ -2,6 +2,7 @@ import { runDelete } from './delete.js';
 import { runUpdate } from './update.js';
 import { runDeploy } from './deploy.js';
 import { runSsl, runSslDnsVerify } from './ssl.js';
+import { runCanonical } from './canonical.js';
 import { runPurge } from './purge.js';
 import { runResetPassword } from './resetPassword.js';
 import { runExport } from './export.js';
@@ -190,6 +191,32 @@ const sslDnsVerify = {
 };
 
 // ============================================================
+//  canonical — www / preferred-domain preference for a live site
+// ============================================================
+// Same shape deploy validates, so the two can never drift: a "www" preference
+// requires www to be served, otherwise it would redirect to a host this server
+// does not answer for.
+const canonicalOp = {
+  name: 'canonical',
+  // params: { domain, canonical: "www"|"root"|"none", enableWww? }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    const canonical = (p.canonical === 'www' || p.canonical === 'root' || p.canonical === 'none') ? p.canonical : null;
+    if (!canonical) errors.push('canonical is required (one of: www, root, none)');
+    let enableWww = p.enableWww !== false;
+    if (canonical === 'www' && !enableWww) {
+      errors.push('www cannot be the preferred address while the www version is turned off');
+    }
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, canonical, enableWww } };
+  },
+  async run(job, helpers, p) {
+    await runCanonical(job, helpers, p);
+  },
+};
+
+// ============================================================
 //  purge — clear a site's WP Rocket + object caches
 // ============================================================
 const purge = {
@@ -359,7 +386,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { deploy, update, delete: del, ssl, sslDnsVerify, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { deploy, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;
