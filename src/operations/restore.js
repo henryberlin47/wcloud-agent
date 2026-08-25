@@ -3,12 +3,12 @@ import { run, woSiteExists, removePath } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import { runRestoreFromLocal } from './import.js';
 import { runDelete } from './delete.js';
-import { ensureRclone, spacesEnv, remotePath, explainSpacesError } from '../lib/spaces.js';
+import { downloadFile, explainSpacesError } from '../lib/spaces.js';
 
 // ============================================================
 //  restore — bring a site back from a Spaces backup
 // ============================================================
-// Downloads the backup with rclone, then runs the SAME restore path the
+// Downloads the backup from Spaces, then runs the SAME restore path the
 // migration import uses (runRestoreFromLocal). In-place restore (site exists)
 // first tears it down with the full delete op — cron, procs, wo site (DB
 // included), files, nginx, certs — so the rebuild starts clean. The portal
@@ -35,12 +35,11 @@ export async function runRestore(job, helpers, p) {
 
   step('Download backup from Spaces');
   try {
-    await ensureRclone(helpers);
-    const dl = await run(helpers, 'rclone', ['copyto', remotePath(p.space, p.key), `${tmpDir}/export.tar.gz.enc`],
-      { env: spacesEnv(p), quiet: true, timeout: 11 * 3600_000 });
-    if (dl.code !== 0) {
-      const why = explainSpacesError(`${dl.stderr}\n${dl.stdout}`, p);
-      err(`rclone download failed: ${why}`);
+    try {
+      await downloadFile(p, p.key, `${tmpDir}/export.tar.gz.enc`);
+    } catch (e) {
+      const why = explainSpacesError(e, p);
+      err(`download failed: ${why}`);
       throw new Error(`Spaces download failed — ${why}`);
     }
     ok('Backup downloaded');

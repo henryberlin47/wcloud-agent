@@ -52,7 +52,7 @@ function reqDomain(errors, name, v) {
 }
 
 // S3/Spaces fields shared by the backup + restore ops. Validated here (the
-// injection boundary); the agent passes them through to rclone's env and never
+// injection boundary); the agent passes them straight to the S3 client and never
 // stores or logs them.
 function reqSpaces(p, errors) {
   for (const f of ['space', 'key', 'endpoint', 'accessKeyId', 'secretAccessKey']) {

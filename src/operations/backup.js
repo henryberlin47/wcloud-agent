@@ -2,15 +2,15 @@ import fs from 'node:fs/promises';
 import { run, woSiteExists, removePath } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import { buildSiteArchive } from './export.js';
-import { ensureRclone, spacesEnv, remotePath, explainSpacesError } from '../lib/spaces.js';
+import { uploadFile, explainSpacesError } from '../lib/spaces.js';
 
 // ============================================================
 //  backup — encrypted site archive uploaded straight to Spaces
 // ============================================================
-// Same archive as the export op (shared buildSiteArchive), but the transport
-// is rclone instead of one-time HTTP serving. The portal's durable job passes
-// the per-user Spaces creds per call; they live in this subprocess's env
-// only and are never logged or persisted here.
+// Same archive as the export op (shared buildSiteArchive), but the transport is
+// a direct S3 upload instead of one-time HTTP serving. The portal's durable job
+// passes the per-user Spaces creds per call; they live in the S3 client for that
+// one transfer and are never logged or persisted here.
 // ============================================================
 
 // params: { domain, includeSsl, encryptKey, space, key, endpoint, accessKeyId, secretAccessKey }
@@ -30,12 +30,11 @@ export async function runBackup(job, helpers, p) {
 
   try {
     step('Upload to Spaces');
-    await ensureRclone(helpers);
-    const up = await run(helpers, 'rclone', ['copyto', archivePath, remotePath(p.space, p.key)],
-      { env: spacesEnv(p), quiet: true, timeout: 11 * 3600_000 });
-    if (up.code !== 0) {
-      const why = explainSpacesError(`${up.stderr}\n${up.stdout}`, p);
-      err(`rclone upload failed: ${why}`);
+    try {
+      await uploadFile(p, p.key, archivePath);
+    } catch (e) {
+      const why = explainSpacesError(e, p);
+      err(`upload failed: ${why}`);
       throw new Error(`Spaces upload failed — ${why}`);
     }
     const stat = await fs.stat(archivePath);

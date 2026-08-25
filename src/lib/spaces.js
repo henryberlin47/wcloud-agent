@@ -1,70 +1,122 @@
-// DigitalOcean Spaces (S3) transfer via rclone. Creds are passed per-call as
-// subprocess env vars only — never written to a config file, never logged (the
-// logger prints command lines, not env). Kept provider-agnostic (plain S3
-// params); only DigitalOcean is offered in the portal UI today.
-import { run } from './sys.js';
+// DigitalOcean Spaces (S3) transfer via the AWS SDK. Creds are passed per call
+// from the authenticated request body, live only in the client object for that
+// one transfer, and are never written to disk or logged. Kept provider-agnostic
+// (plain S3 params); only DigitalOcean is offered in the portal UI today.
+//
+// Replaces a shelled-out `rclone`: no external binary, no runtime self-install
+// (which fetched and ran a remote script as root), no config-file/env-name
+// coupling. lib-storage's Upload does multipart automatically, so archives
+// larger than S3's 5GB single-PUT limit still work.
+import { createReadStream, createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import { S3Client, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command, PutObjectCommand } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 
-let rcloneChecked = false;
+// Spaces endpoints are regional hosts ("nyc3.digitaloceanspaces.com"). The SDK
+// wants a URL; the portal sends a bare host, so tolerate either.
+const toUrl = (endpoint) => (/^https?:\/\//i.test(endpoint) ? endpoint : `https://${endpoint}`);
 
-// `rclone version` exit code, or 127 when the binary is missing. A missing
-// binary makes run() REJECT (spawn ENOENT) instead of returning a code, so
-// "absent" has to be caught here rather than read off a probe result.
-async function rcloneProbe(helpers) {
+// Region is baked into the endpoint for Spaces, but SigV4 still needs a value
+// to sign with, and it must match the endpoint's region or the signature is
+// rejected — so derive it from the host rather than hardcoding "us-east-1".
+const regionFromEndpoint = (endpoint) => {
+  const m = String(endpoint).match(/(?:^|\/\/)([a-z0-9-]+)\.digitaloceanspaces\.com/i);
+  return m ? m[1] : 'us-east-1';
+};
+
+export function s3Client({ endpoint, accessKeyId, secretAccessKey }) {
+  return new S3Client({
+    endpoint: toUrl(endpoint),
+    region: regionFromEndpoint(endpoint),
+    credentials: { accessKeyId, secretAccessKey },
+    forcePathStyle: false, // Spaces uses virtual-hosted-style (<space>.<region>...)
+    maxAttempts: 5,        // transient 5xx/network retries, like rclone's
+  });
+}
+
+// --- transfers ---------------------------------------------------------------
+// Every call takes { space, endpoint, accessKeyId, secretAccessKey } plus a key.
+// Nothing here creates the bucket: the Space is always pre-created by the user,
+// and a Spaces key usually can't create one anyway.
+
+// Stream a local file up. Upload() switches to multipart past the part size, so
+// this handles archives of any size without buffering them in memory.
+export async function uploadFile(p, key, filePath) {
+  const client = s3Client(p);
   try {
-    const r = await run(helpers, 'rclone', ['version'], { quiet: true, timeout: 10_000 });
-    return r.code;
-  } catch {
-    return 127;
+    const up = new Upload({
+      client,
+      params: { Bucket: p.space, Key: key, Body: createReadStream(filePath) },
+      partSize: 64 * 1024 * 1024, // 64MB parts → 5GB max object needs ~80 parts
+      queueSize: 3,               // modest concurrency; these boxes also serve sites
+    });
+    await up.done();
+  } finally {
+    client.destroy();
   }
 }
 
-// Memoized per process: probe once, self-install if absent (agent boxes
-// provisioned before rclone existed don't require a redeploy).
-export async function ensureRclone(helpers) {
-  if (rcloneChecked) return;
-  if ((await rcloneProbe(helpers)) === 0) {
-    rcloneChecked = true;
-    return;
+// Stream an object down to a local path.
+export async function downloadFile(p, key, filePath) {
+  const client = s3Client(p);
+  try {
+    const r = await client.send(new GetObjectCommand({ Bucket: p.space, Key: key }));
+    if (!r.Body) throw new Error('empty response body from Spaces');
+    await pipeline(r.Body, createWriteStream(filePath, { mode: 0o600 }));
+  } finally {
+    client.destroy();
   }
-  helpers.log?.('rclone not found — installing from rclone.org');
-  // Fixed URL, no user data — the shell here is controlled.
-  const inst = await run(helpers, 'sh', ['-c', 'curl --fail --show-error -sSL https://rclone.org/install.sh | bash'],
-    { quiet: true, timeout: 300_000 });
-  if (inst.code !== 0 || (await rcloneProbe(helpers)) !== 0) {
-    throw new Error('rclone unavailable and install failed');
-  }
-  rcloneChecked = true;
 }
 
-// Env vars that define the `wcloud:` rclone remote for one transfer.
-// rclone only reads a remote-from-env when the remote name in the key is
-// UPPERCASE (RCLONE_CONFIG_<REMOTE>_<OPTION>); a lowercase key is ignored, so
-// rclone falls back to the config file and fails with "didn't find section in
-// config file (wcloud)". The remote is still referenced lowercase (`wcloud:`).
-export function spacesEnv({ endpoint, accessKeyId, secretAccessKey }) {
-  return {
-    RCLONE_CONFIG_WCLOUD_TYPE: 's3',
-    RCLONE_CONFIG_WCLOUD_PROVIDER: 'DigitalOcean',
-    RCLONE_CONFIG_WCLOUD_ENDPOINT: endpoint,
-    RCLONE_CONFIG_WCLOUD_ACCESS_KEY_ID: accessKeyId,
-    RCLONE_CONFIG_WCLOUD_SECRET_ACCESS_KEY: secretAccessKey,
-    // Never let rclone create the Space. Before uploading, its S3 backend
-    // HeadBuckets the destination and CREATES it when that check fails — and a
-    // Spaces key normally can't create Spaces, so the whole upload dies with
-    // "CreateBucket ... 403 AccessDenied" even though the Space exists and the
-    // key can write to it. The Space is always pre-created by the user, so skip
-    // the check and go straight to the object write.
-    RCLONE_CONFIG_WCLOUD_NO_CHECK_BUCKET: 'true',
-  };
+export async function putObject(p, key, body) {
+  const client = s3Client(p);
+  try {
+    await client.send(new PutObjectCommand({ Bucket: p.space, Key: key, Body: body }));
+  } finally {
+    client.destroy();
+  }
 }
 
-export const remotePath = (space, key) => `wcloud:${space}/${key}`;
+export async function deleteObject(p, key) {
+  const client = s3Client(p);
+  try {
+    await client.send(new DeleteObjectCommand({ Bucket: p.space, Key: key }));
+  } finally {
+    client.destroy();
+  }
+}
 
-// Turn rclone/S3 noise into something a user can act on. These four cover every
+// Top-level prefixes in the Space — the cheap "can we read?" probe.
+export async function listTopLevel(p) {
+  const client = s3Client(p);
+  try {
+    const r = await client.send(new ListObjectsV2Command({ Bucket: p.space, Delimiter: '/', MaxKeys: 1000 }));
+    return (r.CommonPrefixes || []).map((c) => c.Prefix).filter(Boolean);
+  } finally {
+    client.destroy();
+  }
+}
+
+// --- errors ------------------------------------------------------------------
+// Turn SDK/S3 noise into something a user can act on. These cover every
 // misconfiguration we've actually hit; anything else falls through to the raw
-// tail so nothing is hidden.
+// message so nothing is hidden.
+// Flatten an Error into searchable text. Connection failures arrive as an
+// AggregateError whose own message is just "AggregateError" (Node tries IPv6
+// and IPv4 in parallel and bundles both failures), and the SDK wraps causes —
+// so the real code (ECONNREFUSED/ENOTFOUND) is only in the nested errors.
+function errText(e, depth = 0) {
+  if (e == null || depth > 3) return '';
+  if (typeof e === 'string') return e;
+  const parts = [e.name, e.Code, e.code, e.message, e.$metadata?.httpStatusCode];
+  if (Array.isArray(e.errors)) parts.push(...e.errors.map((x) => errText(x, depth + 1)));
+  if (e.cause) parts.push(errText(e.cause, depth + 1));
+  return parts.filter(Boolean).join(' ');
+}
+
 export function explainSpacesError(raw, { space, endpoint } = {}) {
-  const s = String(raw || '');
+  // Accept an Error, an SDK exception, or an already-flattened string.
+  const s = errText(raw);
   const where = `${space || 'the Space'} at ${endpoint || 'the configured endpoint'}`;
   if (/InvalidAccessKeyId/i.test(s)) {
     return `Access key not recognized — check the Spaces access key (it is not the same as a DigitalOcean API token).`;
@@ -75,11 +127,14 @@ export function explainSpacesError(raw, { space, endpoint } = {}) {
   if (/NoSuchBucket|bucket does not exist|specified bucket does not exist/i.test(s)) {
     return `Space not found: ${where}. Check the Space name, and that its region matches the region selected here.`;
   }
-  if (/AccessDenied/i.test(s)) {
+  if (/NoSuchKey|NotFound/i.test(s)) {
+    return `That backup object no longer exists in ${space || 'the Space'}.`;
+  }
+  if (/AccessDenied|\b403\b/i.test(s)) {
     return `Access denied on ${where}. Usually one of: the Space is in a different region than the one selected here, or the key is scoped to a different Space / lacks write permission.`;
   }
-  if (/no such host|dial tcp|i\/o timeout|connection refused/i.test(s)) {
+  if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|getaddrinfo|socket hang up/i.test(s)) {
     return `Could not reach ${endpoint || 'the endpoint'} — check the region setting and the server's network access.`;
   }
-  return s.trim().slice(-300);
+  return String(s).trim().slice(-300) || 'unknown Spaces error';
 }

@@ -1,7 +1,6 @@
 import express from 'express';
 import { execSync, spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import fsp from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,8 +9,8 @@ import { requireAuth } from './auth.js';
 import { getOperation } from './operations/index.js';
 import { serveExport } from './operations/export.js';
 import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './jobs.js';
-import { woSiteList, run, getPhpVersion, removePath } from './lib/sys.js';
-import { ensureRclone, spacesEnv, remotePath, explainSpacesError } from './lib/spaces.js';
+import { woSiteList, run, getPhpVersion } from './lib/sys.js';
+import { listTopLevel, putObject, deleteObject, explainSpacesError } from './lib/spaces.js';
 import { enforceAdminPanelCert } from './lib/panelcert.js';
 import { readDbCredentials } from './lib/credentials.js';
 import { readSiteSsl } from './lib/certinfo.js';
@@ -429,9 +428,8 @@ app.post('/api/self-update', async (req, res) => {
 });
 
 // --- Spaces validation / deletion (quick calls, not jobs) ------------------
-// Creds ride in the authenticated request body, live in the rclone subprocess
-// env for the duration of one call, and never touch logs (command lines have
-// no secrets) or disk.
+// Creds ride in the authenticated request body, live in the S3 client for the
+// duration of one call, and never touch logs or disk.
 function spacesBodyOk(p) {
   return typeof p === 'object' && p !== null &&
     typeof p.space === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(p.space) &&
@@ -447,37 +445,28 @@ function spacesBodyOk(p) {
 app.post('/api/backup-test', async (req, res) => {
   const p = req.body || {};
   if (!spacesBodyOk(p)) return res.status(400).json({ error: 'validation_failed', errors: ['space, endpoint, accessKeyId, secretAccessKey are required'] });
-  const env = spacesEnv(p);
-  const explain = (r) => explainSpacesError(`${r.stderr || ''}\n${r.stdout || ''}`, p);
-  const probeLocal = `/tmp/wcloud_spaces_probe_${Date.now()}_${randomBytes(4).toString('hex')}`;
   const probeKey = `.wcloud-write-test/${randomBytes(8).toString('hex')}`;
+  let dirs;
   try {
-    await ensureRclone(NOOP_HELPERS);
-
-    const ls = await run(NOOP_HELPERS, 'rclone', ['lsd', remotePath(p.space, '')], { env, quiet: true, timeout: 30_000 });
-    if (ls.code !== 0) {
-      return res.status(502).json({ error: 'spaces_unreachable', stage: 'read', message: explain(ls) });
-    }
-    const dirs = ls.stdout.trim().split('\n').filter(Boolean).length;
-
-    // Write probe — the step that actually proves a backup can upload.
-    await fsp.writeFile(probeLocal, 'wcloud write test\n', { mode: 0o600 });
-    const put = await run(NOOP_HELPERS, 'rclone', ['copyto', probeLocal, remotePath(p.space, probeKey)],
-      { env, quiet: true, timeout: 60_000 });
-    if (put.code !== 0) {
-      return res.status(502).json({ error: 'spaces_not_writable', stage: 'write', message: explain(put) });
-    }
-
-    // Clean up the probe. A failure here doesn't invalidate the test — the write
-    // worked — but say so, since it leaves one stray object behind.
-    const del = await run(NOOP_HELPERS, 'rclone', ['deletefile', remotePath(p.space, probeKey)],
-      { env, quiet: true, timeout: 60_000 });
-    res.json({ ok: true, dirs, writable: true, ...(del.code === 0 ? {} : { note: `wrote OK but could not remove the test object (${probeKey}) — delete it manually` }) });
+    dirs = (await listTopLevel(p)).length;
   } catch (e) {
-    res.status(500).json({ error: 'test_failed', message: e?.message || 'failed' });
-  } finally {
-    await removePath(probeLocal);
+    return res.status(502).json({ error: 'spaces_unreachable', stage: 'read', message: explainSpacesError(e, p) });
   }
+  try {
+    // Write probe — the step that actually proves a backup can upload.
+    await putObject(p, probeKey, 'wcloud write test\n');
+  } catch (e) {
+    return res.status(502).json({ error: 'spaces_not_writable', stage: 'write', message: explainSpacesError(e, p) });
+  }
+  // Clean up the probe. A failure here doesn't invalidate the test — the write
+  // worked — but say so, since it leaves one stray object behind.
+  let note;
+  try {
+    await deleteObject(p, probeKey);
+  } catch {
+    note = `wrote OK but could not remove the test object (${probeKey}) — delete it manually`;
+  }
+  res.json({ ok: true, dirs, writable: true, ...(note ? { note } : {}) });
 });
 
 app.post('/api/backup-delete', async (req, res) => {
@@ -487,15 +476,12 @@ app.post('/api/backup-delete', async (req, res) => {
     return res.status(400).json({ error: 'validation_failed', errors: ['key must be a backups/ object key'] });
   }
   try {
-    await ensureRclone(NOOP_HELPERS);
-    const r = await run(NOOP_HELPERS, 'rclone', ['deletefile', remotePath(p.space, p.key)], { env: spacesEnv(p), quiet: true, timeout: 120_000 });
-    const notFound = /does not exist|no such file/i.test(`${r.stderr}\n${r.stdout}`);
-    if (r.code !== 0 && !notFound) {
-      return res.status(502).json({ error: 'delete_failed', message: (r.stderr || '').trim().slice(-300) });
-    }
-    res.json({ ok: true, deleted: r.code === 0 });
+    // S3 DELETE is idempotent — a missing key succeeds, which is what retention
+    // pruning wants (the row goes away either way).
+    await deleteObject(p, p.key);
+    res.json({ ok: true, deleted: true });
   } catch (e) {
-    res.status(500).json({ error: 'delete_failed', message: e?.message || 'failed' });
+    res.status(502).json({ error: 'delete_failed', message: explainSpacesError(e, p) });
   }
 });
 
