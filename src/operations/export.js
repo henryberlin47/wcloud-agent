@@ -25,7 +25,7 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
   // Make staging dir accessible to www-data (wp-cli runs as www-data).
   // 0700 keeps it private (holds SSL keys), www-data can read/write for DB dump.
   await fs.mkdir(tmpDir, { recursive: true, mode: 0o700 });
-  await run(helpers, 'chown', ['www-data:www-data', tmpDir]);
+  await run(helpers, 'chown', ['www-data:www-data', tmpDir], { timeout: 30000 });
 
   // 1) Dump the database (runs as www-data, needs access to tmpDir).
   step('Dump database');

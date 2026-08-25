@@ -109,7 +109,7 @@ async function runSslOff(helpers, domain) {
 async function runSslLeHttp(helpers, domain) {
   const { step, ok, warn } = logger(helpers);
   step('Issue Let\'s Encrypt certificate (HTTP-01)');
-  const r = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force']);
+  const r = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });
   if (r.code !== 0) {
     throw new Error(`SSL issuance failed for ${domain} — ensure its DNS points to this server and port 80 is reachable`);
   }

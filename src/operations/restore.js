@@ -31,7 +31,7 @@ export async function runRestore(job, helpers, p) {
 
   const tmpDir = `/tmp/wcloud_restore_${Date.now()}`;
   await fs.mkdir(tmpDir, { recursive: true, mode: 0o700 });
-  await run(helpers, 'chown', ['www-data:www-data', tmpDir]);
+  await run(helpers, 'chown', ['www-data:www-data', tmpDir], { timeout: 30000 });
 
   step('Download backup from Spaces');
   try {

@@ -171,7 +171,7 @@ app.get('/api/info', async (req, res) => {
 
     // PHP-FPM service status
     const phpVer = getPhpVersion();
-    const phpStatus = await run(helpers, 'systemctl', ['is-active', phpVer.service], { quiet: true });
+    const phpStatus = await run(helpers, 'systemctl', ['is-active', phpVer.service], { quiet: true, timeout: 10000 });
     info.phpFpm = {
       version: phpVer.version,
       status: phpStatus.stdout.trim() === 'active' ? 'active' : 'inactive',
@@ -185,14 +185,14 @@ app.get('/api/info', async (req, res) => {
     info.mariadbStatus = 'unknown';
     for (const [bin, arg] of [['mariadb', '-V'], ['mysql', '-V'], ['mariadbd', '--version'], ['mysqld', '--version']]) {
       try {
-        const r = await run(helpers, bin, [arg], { quiet: true });
+        const r = await run(helpers, bin, [arg], { quiet: true, timeout: 10000 });
         const out = (r.stdout + r.stderr).replace(/\x1b\[[0-9;]*m/g, '');
         const m = out.match(/(\d+\.\d+\.\d+)-MariaDB/i) || out.match(/Ver\s+(\d+\.\d+)/);
         if (m) { info.mariadb = m[1]; break; }
       } catch {}
     }
     for (const svc of ['mariadb', 'mysql', 'mariadb10.11', 'mariadb10.6']) {
-      const ms = await run(helpers, 'systemctl', ['is-active', svc], { quiet: true });
+      const ms = await run(helpers, 'systemctl', ['is-active', svc], { quiet: true, timeout: 10000 });
       const s = ms.stdout.trim();
       if (s === 'active') { info.mariadbStatus = 'active'; break; }
       if (s) info.mariadbStatus = s;

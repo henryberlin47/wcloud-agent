@@ -18,7 +18,7 @@ export async function runImport(job, helpers, p) {
 
   const tmpDir = `/tmp/wcloud_import_${Date.now()}`;
   await fs.mkdir(tmpDir, { recursive: true, mode: 0o700 });
-  await run(helpers, 'chown', ['www-data:www-data', tmpDir]);
+  await run(helpers, 'chown', ['www-data:www-data', tmpDir], { timeout: 30000 });
   try {
     // 1) Fetch archive to `${tmpDir}/export.tar.gz.enc` (or copy a local one).
     step('Fetch export archive');
@@ -117,7 +117,7 @@ export async function runRestoreFromLocal(job, helpers, {
     step('Create WordPress site');
     const php = getPhpVersion();
     const woArgs = ['site', 'create', domain, '--wp', `--php${php.flag}`];
-    const deployR = await run(helpers, 'wo', woArgs);
+    const deployR = await run(helpers, 'wo', woArgs, { timeout: 300000 });
     if (deployR.code !== 0) {
       throw new Error(`wo site create failed (code ${deployR.code})`);
     }
@@ -268,7 +268,7 @@ export async function runRestoreFromLocal(job, helpers, {
       warn('Copied certs will not auto-renew. After DNS points here, run the SSL op to get acme.sh-managed certs with renewal.');
     } else if (issueSsl) {
       step('Issue SSL certificate');
-      const sslR = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force']);
+      const sslR = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });
       if (sslR.code === 0) {
         ok(`SSL issued for ${domain}`);
       } else {

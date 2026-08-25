@@ -184,7 +184,7 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // --- service wrappers -------------------------------------------------------
 
 export async function systemctl(helpers, action, unit) {
-  return run(helpers, 'systemctl', [action, unit]);
+  return run(helpers, 'systemctl', [action, unit], { timeout: 60000 });
 }
 
 // nginx -t ; returns true if config is valid.

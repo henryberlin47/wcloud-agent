@@ -31,7 +31,7 @@ export async function runDeploy(job, helpers, p) {
     if (requestedUser && requestedPassword) {
       args.push(`--user=${requestedUser}`, `--pass=${requestedPassword}`, `--email=admin@${domain}`);
     }
-    const r = await run(helpers, 'wo', args);
+    const r = await run(helpers, 'wo', args, { timeout: 300000 });
     if (r.code !== 0) {
       throw new Error(`wo site create failed (code ${r.code})`);
     }
@@ -43,7 +43,7 @@ export async function runDeploy(job, helpers, p) {
     skip('Issue SSL certificate — "No SSL" selected');
   } else {
     step('Issue SSL certificate');
-    const ssl = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force']);
+    const ssl = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });
     if (ssl.code === 0) {
       ok(`SSL installed for ${domain}`);
       // Reload nginx after cert install.
