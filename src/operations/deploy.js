@@ -1,7 +1,5 @@
-import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion, setCanonical } from '../lib/sys.js';
+import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion, setCanonical, WO_SITE_TIMEOUT_MS } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
-
-const WO_SITE_TIMEOUT_MS = 300_000;
 
 // ============================================================
 //  deploy — create a vanilla WordPress site on this server

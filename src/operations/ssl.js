@@ -3,7 +3,7 @@ import { randomBytes, X509Certificate, createPrivateKey, createPublicKey } from 
 import config from '../config.js';
 import {
   run, woSiteExists, pathExists, removePath,
-  nginxTest, nginxReload, certCovers,
+  nginxTest, nginxReload, certCovers, WO_SITE_TIMEOUT_MS,
 } from '../lib/sys.js';
 import {
   certDir, fullchainPath, keyPath,
@@ -12,8 +12,6 @@ import {
 } from '../lib/certinstall.js';
 import { logger } from '../lib/log.js';
 import { startManualDns, verifyManualDns } from '../lib/acmedns.js';
-
-const WO_SITE_TIMEOUT_MS = 300_000;
 
 // ============================================================
 //  ssl — mode-driven SSL management for a site

@@ -3,10 +3,9 @@ import config from '../config.js';
 import {
   run, woSiteExists, nginxTest, nginxReload, getPhpVersion,
   wpCli, clearWpCaches, pathExists, removePath, setCanonical,
+  WO_SITE_TIMEOUT_MS,
 } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
-
-const WO_SITE_TIMEOUT_MS = 300_000;
 
 // params: { sourceUrl, domain, sourceDomain?, includeSsl?, issueSsl?, sameServer?, localArchive?, encryptKey?, canonical?, enableWww? }
 export async function runImport(job, helpers, p) {

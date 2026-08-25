@@ -13,6 +13,12 @@ import { logger } from './log.js';
 // domain values can never inject shell syntax.
 // ============================================================
 
+// Hard timeouts for `wo` invocations. Defined here (next to the wo wrappers) so
+// the value and the "timed out after Nms" message it produces can never drift —
+// every caller derives both from the same constant.
+export const WO_SITE_TIMEOUT_MS = 300_000; // site create / update --le
+export const WO_LIST_TIMEOUT_MS = 20_000;  // site list (a read; also the /api/sites hang guard)
+
 /**
  * Run a command to completion, streaming stdout/stderr into the job log.
  * Never uses a shell. Returns { code, stdout, stderr, timedOut } and does NOT throw on
@@ -221,9 +227,9 @@ export async function woSiteExists(helpers, domain) {
 // wo site list ; returns an array of domain strings (one per line).
 // Filters out blank lines and any decorative/header lines wo might print.
 export async function woSiteList(helpers) {
-  const r = await run(helpers, 'wo', ['site', 'list'], { quiet: true, timeout: 20000 });
+  const r = await run(helpers, 'wo', ['site', 'list'], { quiet: true, timeout: WO_LIST_TIMEOUT_MS });
   if (r.code !== 0) {
-    const detail = r.timedOut ? 'timed out after 20000ms' : `code ${r.code}`;
+    const detail = r.timedOut ? `timed out after ${WO_LIST_TIMEOUT_MS}ms` : `code ${r.code}`;
     throw new Error(`wo site list failed (${detail})`);
   }
   return r.stdout
