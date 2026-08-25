@@ -111,7 +111,10 @@ async function runSslLeHttp(helpers, domain) {
   step('Issue Let\'s Encrypt certificate (HTTP-01)');
   const r = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });
   if (r.code !== 0) {
-    throw new Error(`SSL issuance failed for ${domain} — ensure its DNS points to this server and port 80 is reachable`);
+    const detail = r.timedOut
+      ? 'timed out after 300000ms'
+      : `code ${r.code}`;
+    throw new Error(`SSL issuance failed for ${domain} (${detail}) — ensure its DNS points to this server and port 80 is reachable`);
   }
   ok(`Let's Encrypt cert issued for ${domain}`);
 

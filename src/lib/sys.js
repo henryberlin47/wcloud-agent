@@ -72,7 +72,7 @@ export function run(helpers, command, args = [], opts = {}) {
     child.on('close', (code, signal) => {
       if (timer) clearTimeout(timer);
       if (killed) return reject(new Error(`cancelled (signal ${signal || 'n/a'})`));
-       if (timedOut) return resolve({ code: -1, stdout, stderr, timedOut: true });
+  if (timedOut) return resolve({ code: -1, stdout, stderr, timedOut: true });
       const c = code ?? -1;
       // Failure is the only time the raw command + output are worth the noise.
       if (c !== 0 && !quiet && !verbose) {
@@ -188,7 +188,7 @@ export async function systemctl(helpers, action, unit) {
 }
 
 export async function nginxTest(helpers) {
-  const r = await run(helpers, 'nginx', ['-t'], { quiet: true, timeout: 30000 });
+  const r = await run(helpers, 'nginx', ['-t'], { timeout: 30000 });
   return r.code === 0;
 }
 
@@ -221,7 +221,8 @@ export async function woSiteExists(helpers, domain) {
 export async function woSiteList(helpers) {
   const r = await run(helpers, 'wo', ['site', 'list'], { quiet: true, timeout: 20000 });
   if (r.code !== 0) {
-    throw new Error(`wo site list failed (code ${r.code})`);
+    const detail = r.timedOut ? 'timed out after 20000ms' : `code ${r.code}`;
+    throw new Error(`wo site list failed (${detail})`);
   }
   return r.stdout
     .split('\n')

@@ -119,7 +119,8 @@ export async function runRestoreFromLocal(job, helpers, {
     const woArgs = ['site', 'create', domain, '--wp', `--php${php.flag}`];
     const deployR = await run(helpers, 'wo', woArgs, { timeout: 300000 });
     if (deployR.code !== 0) {
-      throw new Error(`wo site create failed (code ${deployR.code})`);
+      const detail = deployR.timedOut ? 'timed out after 300000ms' : `code ${deployR.code}`;
+      throw new Error(`wo site create failed (${detail})`);
     }
     siteCreated = true;
     ok(`Site created: ${domain}`);
