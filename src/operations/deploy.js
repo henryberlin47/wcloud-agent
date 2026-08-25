@@ -16,16 +16,16 @@ import { logger } from '../lib/log.js';
 
 export async function runDeploy(job, helpers, p) {
   const lg = logger(helpers);
-  const { log, step, ok, warn, skip } = lg;
+  const { log, step, ok, warn, skip, done } = lg;
   const domain = p.domain;
   const requestedUser = p.wp_user || '';
   const requestedPassword = p.wp_password || '';
   const isNewSite = !(await woSiteExists(helpers, domain));
 
   // 1) Create WordPress site.
-  step('Create WordPress site');
+  step('Create the WordPress site');
   if (!isNewSite) {
-    warn(`Already exists in WordOps: ${domain} — skipping creation`);
+    warn(`${domain} already exists on this server — leaving it in place and continuing`);
   } else {
     const php = getPhpVersion();
     const args = ['site', 'create', domain, '--wp', `--php${php.flag}`];
@@ -39,34 +39,33 @@ export async function runDeploy(job, helpers, p) {
         : `code ${r.code}`;
       throw new Error(`wo site create failed (${detail})`);
     }
-    ok(`Created ${domain}`);
+    ok(`Site created — ${domain}`);
   }
 
   // 2) Issue SSL certificate (explicit choice from the portal; default on).
   if (p.issueSsl === false) {
-    skip('Issue SSL certificate — "No SSL" selected');
+    skip('Issue the HTTPS certificate — you chose "No SSL"');
   } else {
-    step('Issue SSL certificate');
+    step('Issue the HTTPS certificate');
     const ssl = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: WO_SITE_TIMEOUT_MS });
     if (ssl.code === 0) {
-      ok(`SSL installed for ${domain}`);
+      ok(`HTTPS enabled for ${domain}`);
       // Reload nginx after cert install.
       if (await nginxTest(helpers)) {
         await nginxReload(helpers);
-        ok('nginx reloaded');
+        ok('Web server reloaded');
       }
     } else {
-      const detail = ssl.timedOut
-        ? `timed out after ${WO_SITE_TIMEOUT_MS}ms`
-        : `code ${ssl.code}`;
-      warn(`SSL failed (${detail}) — run the SSL op from the site page later`);
+      warn(ssl.timedOut
+        ? `Certificate request timed out after ${Math.round(WO_SITE_TIMEOUT_MS / 1000)}s. The site is live over HTTP — issue HTTPS from the site page once it settles.`
+        : `Could not issue the certificate yet — this usually means ${domain}'s DNS does not point here, or port 80 is blocked. The site is live over HTTP; enable HTTPS from the site page once DNS is ready.`);
     }
   }
 
   // Apply domain preferences (canonical redirect + www enablement). Handles
   // none/enable-www itself and reloads nginx only if it changed something.
-  step('Apply domain preferences');
+  step('Apply the www / non-www preference');
   await setCanonical(helpers, domain, p.canonical, p.enableWww);
 
-  log(`Deploy completed: ${domain}`);
+  done(`Site ready — https://${domain}`);
 }

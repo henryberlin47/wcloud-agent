@@ -14,7 +14,7 @@ export async function runImport(job, helpers, p) {
   const sourceDomain = p.sourceDomain || domain;
 
   if (await woSiteExists(helpers, domain)) {
-    throw new Error(`Site already exists: ${domain}`);
+    throw new Error(`${domain} already exists on this server. Delete it first, or choose a different domain.`);
   }
 
   const tmpDir = `/tmp/wcloud_import_${Date.now()}`;
@@ -22,12 +22,12 @@ export async function runImport(job, helpers, p) {
   await run(helpers, 'chown', ['www-data:www-data', tmpDir], { timeout: 30000 });
   try {
     // 1) Fetch archive to `${tmpDir}/export.tar.gz.enc` (or copy a local one).
-    step('Fetch export archive');
+    step('Fetch the site archive');
     if (p.sameServer && p.localArchive) {
       await run(helpers, 'cp', [p.localArchive, `${tmpDir}/export.tar.gz.enc`]);
       // Clean up the source archive after copying (same-server migration).
       await removePath(p.localArchive);
-      ok('Local archive copied');
+      ok('Archive copied');
     } else {
       const fetchR = await run(helpers, 'curl', [
         '-sL', '--fail', '--create-dirs',
@@ -36,7 +36,7 @@ export async function runImport(job, helpers, p) {
       ], { timeout: 300_000 });
       if (fetchR.code !== 0) {
         err(`Failed to fetch archive: ${fetchR.stderr.slice(-200)}`);
-        throw new Error('Failed to fetch export archive');
+        throw new Error('Could not download the site archive from the source server.');
       }
       ok('Archive downloaded');
     }
@@ -74,7 +74,7 @@ export async function runRestoreFromLocal(job, helpers, {
   try {
     // Decrypt if encrypted.
     if (encryptKey) {
-      step('Decrypt archive');
+      step('Decrypt the archive');
       const decR = await run(helpers, 'openssl', [
         'enc', '-d', '-aes-256-cbc', '-pbkdf2',
         '-pass', `env:ENC_KEY`,
@@ -82,7 +82,7 @@ export async function runRestoreFromLocal(job, helpers, {
         '-out', `${tmpDir}/export.tar.gz`,
       ], { env: { ENC_KEY: encryptKey } });
       if (decR.code !== 0) {
-        throw new Error('Archive decryption failed');
+        throw new Error('The archive could not be decrypted. This usually means the encryption key for this account has changed since the backup was made.');
       }
       await removePath(`${tmpDir}/export.tar.gz.enc`);
       ok('Archive decrypted');
@@ -91,13 +91,13 @@ export async function runRestoreFromLocal(job, helpers, {
     }
 
     // 2) Extract archive.
-    step('Extract archive');
+    step('Unpack the archive');
     const extractR = await run(helpers, 'tar', ['xzf', `${tmpDir}/export.tar.gz`, '-C', tmpDir]);
     if (extractR.code !== 0) {
-      throw new Error('Archive extraction failed');
+      throw new Error('The archive could not be unpacked — the file may be incomplete or corrupted.');
     }
     await removePath(`${tmpDir}/export.tar.gz`);
-    ok('Archive extracted');
+    ok('Archive unpacked');
 
     // 3) Read source table prefix from archived wp-config.php.
     let sourcePrefix = '';
@@ -117,7 +117,7 @@ export async function runRestoreFromLocal(job, helpers, {
     }
 
     // 4) Create WordPress site via WordOps.
-    step('Create WordPress site');
+    step('Create the WordPress site');
     const php = getPhpVersion();
     const woArgs = ['site', 'create', domain, '--wp', `--php${php.flag}`];
     const deployR = await run(helpers, 'wo', woArgs, { timeout: WO_SITE_TIMEOUT_MS });
@@ -128,11 +128,11 @@ export async function runRestoreFromLocal(job, helpers, {
       throw new Error(`wo site create failed (${detail})`);
     }
     siteCreated = true;
-    ok(`Site created: ${domain}`);
+    ok(`Site created — ${domain}`);
 
     // 5) Fix table prefix BEFORE importing DB.
     if (sourcePrefix) {
-      step('Fix table prefix');
+      step('Match the database table prefix');
       const wpRoot = `${siteDir}/htdocs`;
       const wp = wpCli(helpers, wpRoot);
       const setPrefix = await wp(['config', 'set', 'table_prefix', sourcePrefix, '--type=variable']);
@@ -144,7 +144,7 @@ export async function runRestoreFromLocal(job, helpers, {
     }
 
     // 6) Restore site files (exclude wp-config.php from htdocs copy).
-    step('Restore site files');
+    step('Restore the site files');
     const srcSite = `${tmpDir}/site`;
     if (await pathExists(srcSite)) {
       const srcHtdocs = `${srcSite}/htdocs`;
@@ -176,7 +176,7 @@ export async function runRestoreFromLocal(job, helpers, {
     }
 
     // 7) Restore database.
-    step('Restore database');
+    step('Restore the database');
     const sqlFile = `${tmpDir}/db.sql`;
     if (await pathExists(sqlFile)) {
       // Ensure www-data can read the SQL file.
@@ -271,7 +271,7 @@ export async function runRestoreFromLocal(job, helpers, {
       }
 
       ok('SSL certificates restored');
-      warn('Copied certs will not auto-renew. After DNS points here, run the SSL op to get acme.sh-managed certs with renewal.');
+      warn('The copied certificate will not renew automatically. Once this domain\'s DNS points here, re-issue HTTPS from the site page to get an auto-renewing certificate.');
     } else if (issueSsl) {
       step('Issue SSL certificate');
       const sslR = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });
@@ -295,7 +295,7 @@ export async function runRestoreFromLocal(job, helpers, {
       await nginxReload(helpers);
       ok('nginx reloaded');
     } else {
-      err('nginx -t FAILED — review config');
+      err('The web server configuration is invalid, so it was not reloaded. The site may not serve until this is fixed.');
     }
 
     log(`Restore completed: ${domain}`);

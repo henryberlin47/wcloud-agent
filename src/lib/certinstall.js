@@ -141,9 +141,9 @@ export async function applySslConf(helpers, domain) {
       if (e.before === null) await removePath(e.path);
       else await fs.writeFile(e.path, e.before, { mode: 0o644 });
     }
-    err('nginx -t FAILED with the new SSL config — previous config restored');
-    throw new Error('nginx -t failed with the new SSL config — the previous config was restored, nothing was reloaded');
+    err('The new HTTPS settings would have made the web server configuration invalid — the previous settings were restored.');
+    throw new Error('The new HTTPS settings were rejected by the web server, so the previous settings were restored and nothing was reloaded. The site is unaffected.');
   }
   await nginxReload(helpers);
-  ok('nginx validated + reloaded with the new SSL config');
+  ok('Web server reloaded with the new certificate');
 }

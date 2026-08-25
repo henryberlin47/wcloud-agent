@@ -97,25 +97,25 @@ async function restoreVlist(domain, vlist) {
 export async function startManualDns(helpers, domain) {
   const { step, ok, err } = logger(helpers);
   if (!(await pathExists(ACME))) {
-    throw new Error(`${ACME} not found — this server has no WordOps acme.sh (deploy a site with SSL first)`);
+    throw new Error('This server has no certificate tool installed yet. Issue a Let\'s Encrypt certificate over HTTP once first, then use DNS mode.');
   }
   await clearChallenge(domain); // a fresh start supersedes any stale pending challenge
 
-  step('Request a new ACME order (manual DNS-01)');
+  step('Start DNS verification');
   const r = await run(helpers, ACME, [...ACME_OPTS, '--issue', '--dns', '-d', domain, '--force', MANUAL_FLAG],
     { quiet: true, timeout: 180_000 });
   if (r.code !== CODE_DNS_MANUAL) {
-    err(`acme.sh exited ${r.code} (expected ${CODE_DNS_MANUAL} — "add the TXT records")`);
-    throw new Error(`could not start the DNS-01 challenge (acme.sh exit ${r.code}) — see the log above`);
+    err('The certificate authority did not return the DNS records to add.');
+    throw new Error('Could not start the DNS verification. See the details above, then try again.');
   }
   const records = parseTxtRecords(`${r.stdout}\n${r.stderr}`);
   const vlist = await readVlist(domain);
   if (!records.length || !vlist) {
-    throw new Error('acme.sh entered manual mode but the TXT records / order could not be parsed — see the log above');
+    throw new Error('The DNS records to add could not be read back. See the details above, then try again.');
   }
   const state = { domain, started_at: new Date().toISOString(), txt_records: records, vlist };
   await writeChallenge(domain, state);
-  ok(`challenge started — add ${records.length} TXT record${records.length === 1 ? '' : 's'} at your DNS provider`);
+  ok(`Add the ${records.length} DNS record${records.length === 1 ? '' : 's'} shown in Manage SSL at your DNS provider, then click Verify.`);
   return state;
 }
 
@@ -126,19 +126,19 @@ export async function startManualDns(helpers, domain) {
 const DNS_NOT_VISIBLE = /DNS problem|NXDOMAIN|no DNS|does not match/i;
 
 export async function verifyManualDns(helpers, domain) {
-  const { step, ok, warn, err } = logger(helpers);
-  if (!(await pathExists(ACME))) throw new Error(`${ACME} not found`);
+  const { step, ok, warn, err , done } = logger(helpers);
+  if (!(await pathExists(ACME))) throw new Error('This server has no certificate tool installed.');
   const state = await readChallenge(domain);
-  if (!state) throw new Error('no pending DNS-01 challenge for this site — start one from Manage SSL');
+  if (!state) throw new Error('There is no DNS verification in progress for this site. Start one from Manage SSL.');
 
   // A previous failed verify cleared Le_Vlist — restore it so acme.sh resumes
   // the SAME order (same TXT) instead of starting over.
   if (!(await restoreVlist(domain, state.vlist))) {
     await clearChallenge(domain);
-    throw new Error('the saved ACME order could not be restored — start the challenge again from Manage SSL');
+    throw new Error('The pending verification could not be resumed. Start it again from Manage SSL.');
   }
 
-  step('Verify the TXT records against the CA');
+  step('Check your DNS records');
   const r = await run(helpers, ACME, [...ACME_OPTS, '--renew', '-d', domain, '--ecc', '--force', MANUAL_FLAG],
     { quiet: true, timeout: 300_000 });
   const out = `${r.stdout}\n${r.stderr}`;
@@ -148,23 +148,23 @@ export async function verifyManualDns(helpers, domain) {
     const vlist = await readVlist(domain);
     if (records.length && vlist) {
       await writeChallenge(domain, { ...state, started_at: new Date().toISOString(), txt_records: records, vlist });
-      warn('the saved order had expired — new TXT records were issued (see Manage SSL)');
+      warn('The previous request expired, so new DNS records were issued — add the new ones shown in Manage SSL, then verify again.');
       return { pending: true, new_records: true };
     }
-    throw new Error('acme.sh re-entered manual mode but could not be parsed — start the challenge again');
+    throw new Error('New DNS records were issued but could not be read back. Start the verification again from Manage SSL.');
   }
   if (r.code !== 0) {
     if (DNS_NOT_VISIBLE.test(out)) {
-      warn('the CA cannot see the TXT record yet — it may still be propagating');
+      warn('The certificate authority cannot see your DNS record yet — DNS changes can take a few minutes to spread.');
       // Soft failure: state + the same TXT stay valid, the user retries.
-      throw new Error('DNS record not found by the CA yet — make sure the TXT record is published, then Verify again');
+      throw new Error('Your DNS record is not visible yet. Confirm it is published at your DNS provider, wait a few minutes, then click Verify again.');
     }
-    err(`acme.sh exited ${r.code}`);
+    err('The certificate authority rejected the verification.');
     await clearChallenge(domain); // retrying the same dead order is pointless
-    throw new Error(`certificate verification failed (acme.sh exit ${r.code}) — see the log above, then start the challenge again`);
+    throw new Error('Certificate verification failed. See the details above, then start the verification again from Manage SSL.');
   }
 
-  step('Install the certificate + wire nginx');
+  step('Install the certificate');
   const dir = certDir(domain);
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const inst = await run(helpers, ACME, [
@@ -175,13 +175,13 @@ export async function verifyManualDns(helpers, domain) {
     '--ca-file', `${dir}/ca.pem`,
   ], { quiet: true, timeout: 60_000 });
   if (inst.code !== 0) {
-    throw new Error(`certificate issued but install-cert failed (exit ${inst.code}) — see the log above`);
+    throw new Error('The certificate was issued but could not be installed on this server. See the details above.');
   }
   await run(helpers, 'chmod', ['600', `${dir}/cert.pem`, `${dir}/key.pem`, `${dir}/fullchain.pem`, `${dir}/ca.pem`]);
   await run(helpers, 'chown', ['-R', 'root:root', dir]);
   await writeManualMarker(domain); // this cert will NOT auto-renew
   await applySslConf(helpers, domain);
   await clearChallenge(domain);
-  ok(`certificate issued via manual DNS-01 for ${domain}`);
+  done(`HTTPS enabled for ${domain} via DNS verification`);
   return { pending: false };
 }

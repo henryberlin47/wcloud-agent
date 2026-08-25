@@ -15,7 +15,7 @@ export async function runResetPassword(job, helpers, p) {
   const domain = p.domain;
   const newPassword = p.wp_password;
 
-  step('Locate WordPress admin user');
+  step('Find the administrator account');
   const wpRoot = await resolveWpRoot(domain);
   const wp = wpCli(helpers, wpRoot);
   const userList = await wp(['user', 'list', '--role=administrator', '--field=user_login']);
@@ -24,12 +24,12 @@ export async function runResetPassword(job, helpers, p) {
     err(`No administrator user found at ${wpRoot} (code ${userList.code})`);
     throw new Error(`Could not find a WordPress admin user for ${domain}`);
   }
-  ok(`Found admin user: ${wpUser}`);
+  ok(`Administrator account: ${wpUser}`);
 
-  step('Set new password');
+  step('Set the new password');
   const setPass = await wp(['user', 'update', wpUser, `--user_pass=${newPassword}`]);
   if (setPass.code !== 0) {
     throw new Error(`Failed to set password for ${wpUser} (code ${setPass.code})`);
   }
-  ok(`Password updated for ${wpUser}`);
+  ok(`Password changed for ${wpUser}`);
 }

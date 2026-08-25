@@ -30,7 +30,7 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
   await run(helpers, 'chown', ['www-data:www-data', tmpDir], { timeout: 30000 });
 
   // 1) Dump the database (runs as www-data, needs access to tmpDir).
-  step('Dump database');
+  step('Export the database');
   const wpRoot = `${siteDir}/htdocs`;
   const wp = wpCli(helpers, wpRoot);
   const sqlPath = `${tmpDir}/db.sql`;
@@ -39,10 +39,10 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
     await removePath(tmpDir);
     throw new Error('Database export failed');
   }
-  ok('Database dumped');
+  ok('Database exported');
 
   // 2) Copy site files (as root — root can write to www-data-owned dir).
-  step('Copy site files');
+  step('Copy the site files');
   const destSite = `${tmpDir}/site`;
   await run(helpers, 'cp', ['-a', siteDir, destSite]);
   // Remove cache dirs to shrink archive.
@@ -53,7 +53,7 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
 
   // 3) Copy SSL certs + nginx config if requested.
   if (includeSsl) {
-    step('Copy SSL certificates and nginx config');
+    step('Copy the HTTPS certificates and site configuration');
     const sslLive = `/etc/letsencrypt/live/${domain}`;
     const sslArchive = `/etc/letsencrypt/archive/${domain}`;
     const sslRenewal = `/etc/letsencrypt/renewal/${domain}.conf`;
@@ -74,11 +74,11 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
     if (await pathExists(sslNginxConf)) {
       await run(helpers, 'cp', ['-a', sslNginxConf, `${sslDest}/ssl.conf`]);
     }
-    ok('SSL certificates and config copied');
+    ok('Certificates and configuration copied');
   }
 
   // 4) Create tarball.
-  step('Create archive');
+  step('Compress everything into one archive');
   const tarR = await run(helpers, 'tar', ['czf', archivePath, '-C', tmpDir, '.']);
   if (tarR.code !== 0) {
     await removePath(tmpDir);
@@ -88,7 +88,7 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
 
   // 5) Encrypt archive if key provided.
   if (encryptKey) {
-    step('Encrypt archive');
+    step('Encrypt the archive');
     const encryptedPath = `${archivePath}.enc`;
     const encR = await run(helpers, 'openssl', [
       'enc', '-aes-256-cbc', '-pbkdf2',

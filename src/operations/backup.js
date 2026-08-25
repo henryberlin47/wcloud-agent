@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import { run, woSiteExists, removePath } from '../lib/sys.js';
-import { logger } from '../lib/log.js';
+import { logger, humanSize } from '../lib/log.js';
 import { buildSiteArchive } from './export.js';
 import { uploadFile, explainSpacesError } from '../lib/spaces.js';
 
@@ -18,32 +18,32 @@ export async function runBackup(job, helpers, p) {
   const { log, step, ok, err } = logger(helpers);
 
   if (!(await woSiteExists(helpers, p.domain))) {
-    throw new Error(`Site not found: ${p.domain}`);
+    throw new Error(`${p.domain} is not a site on this server.`);
   }
 
-  step('Build encrypted archive');
+  step('Package the site into an encrypted archive');
   const { path: archivePath } = await buildSiteArchive(helpers, p.domain, {
     includeSsl: p.includeSsl,
     encryptKey: p.encryptKey,
     nested: true, // step 1 above is the section; these are its details
   });
-  ok('Archive built');
+  ok('Archive ready');
 
   try {
-    step('Upload to Spaces');
+    step('Upload the archive to your storage');
     try {
       await uploadFile(p, p.key, archivePath);
     } catch (e) {
       const why = explainSpacesError(e, p);
-      err(`upload failed: ${why}`);
+      err(`Upload failed — ${why}`);
       throw new Error(`Spaces upload failed — ${why}`);
     }
     const stat = await fs.stat(archivePath);
-    ok(`Uploaded (${stat.size} bytes)`);
+    ok(`Uploaded ${humanSize(stat.size)}`);
 
     // Result is read by the portal job (size for the backups row). Never logged.
     job.result = { key: p.key, size: stat.size };
-    log(`Backup complete: ${p.domain}`);
+    done(`Backup complete — ${p.domain} (${humanSize(stat.size)})`);
   } finally {
     await removePath(archivePath);
   }

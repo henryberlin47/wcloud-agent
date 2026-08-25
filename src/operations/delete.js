@@ -27,14 +27,14 @@ export async function runDelete(job, helpers, p, opts = {}) {
   const NGINX_ENABLED = `/etc/nginx/sites-enabled/${domain}`;
 
   // 1) Remove the cron schedule FIRST so nothing new spawns mid-teardown.
-  step('Remove cron schedule');
+  step('Remove the site\'s scheduled tasks');
   await removePath(CRON_FILE);
-  ok(`Removed ${CRON_FILE}`);
+  ok('Scheduled tasks removed');
 
   // 2) Stop this domain's running cron processes (TERM, wait, then KILL).
   //    Match on the domain lock path and the site dir so we catch the flock
   //    holder, the cd'd bash, and its php/wp children — domain-scoped.
-  step('Stop running cron processes');
+  step('Stop the site\'s background tasks');
   const patterns = [`/tmp/${domain}_cron-`, `${SITE_DIR}/`];
   let pids = await findPidsMatching(patterns);
   if (pids.length > 0) {
@@ -43,46 +43,46 @@ export async function runDelete(job, helpers, p, opts = {}) {
     await sleep(3000);
     pids = await findPidsMatching(patterns);
     if (pids.length > 0) {
-      warn(`Force-killing ${pids.length} straggler(s) with SIGKILL`);
+      warn(`${pids.length} background task(s) did not stop on request — forcing them to close`);
       killPids(pids, 'SIGKILL');
     }
-    ok('Running cron processes stopped');
+    ok('Background tasks stopped');
   } else {
     info('No running cron processes found for this domain');
   }
 
   // 3) Clear lock files.
-  step('Clear lock files');
+  step('Clear leftover lock files');
   await removeGlobLocks(domain);
   ok('Lock files cleared');
 
   // 4) Delete the WordOps site. Check existence first so we can tell a real
   //    failure apart from "already gone", and verify it's actually removed.
-  step('Delete the WordOps site');
+  step('Remove the site from this server');
   const existedBefore = await woSiteExists(helpers, domain);
   if (existedBefore) {
     const res = await woSiteDelete(helpers, domain);
     // Verify it's actually gone from WordOps' registry.
     const stillThere = await woSiteExists(helpers, domain);
     if (stillThere) {
-      warn(`wo site delete returned code ${res.code} but ${domain} is STILL in WordOps.`);
+      warn(`${domain} could not be fully removed from the server's site registry.`);
       warn(`Run manually: wo site delete ${domain} --no-prompt --force`);
     } else {
-      ok('WordOps site deleted');
+      ok('Site removed from the server');
     }
   } else {
     info('Not registered in WordOps (or already removed)');
   }
 
   // 5) Remove website files.
-  step('Remove site files, nginx config and certs');
+  step('Delete the site files and certificates');
   await removePath(SITE_DIR);
-  ok(`Removed ${SITE_DIR}`);
+  ok('Site files deleted');
 
   // 6) Remove nginx config (enabled symlink + available file).
   await removePath(NGINX_ENABLED);
   await removePath(NGINX_AVAILABLE);
-  ok('Nginx config removed');
+  ok('Web server configuration removed');
 
   // 7) Remove Let's Encrypt cert material, if present.
   await removePath(`/etc/letsencrypt/live/${domain}`);
@@ -90,7 +90,7 @@ export async function runDelete(job, helpers, p, opts = {}) {
   await removePath(`/etc/letsencrypt/renewal/${domain}.conf`);
   await removePath(`/etc/letsencrypt/renewal/${domain}_ecc`); // acme.sh v3 (ECC default)
   await clearChallenge(domain); // any pending manual DNS-01 challenge
-  ok('Certificate files cleared');
+  ok('HTTPS certificates removed');
 
   // 7b) If the WordOps admin panel (:22222) was pointed at THIS domain's cert
   //     (via `wo secure`), that reference is now dangling and would break
@@ -99,19 +99,19 @@ export async function runDelete(job, helpers, p, opts = {}) {
 
 
   // 8) Validate + reload nginx, restart cron.
-  step('Validate + reload nginx, restart cron');
+  step('Reload the web server');
   if (await nginxTest(helpers)) {
-    ok('nginx -t passed');
+    ok('Web server configuration is valid');
     await nginxReload(helpers);
-    ok('nginx reloaded');
+    ok('Web server reloaded');
   } else {
     // Don't throw — the site is already gone; surface it loudly instead.
-    err('nginx -t FAILED after removal — review config before next reload');
+    err('The web server configuration is invalid after removing this site. Other sites keep running on the old configuration until it is fixed.');
   }
   await systemctl(helpers, 'restart', 'cron');
-  ok('cron restarted');
+  ok('Scheduled-task service restarted');
 
-  log(`Delete completed for ${domain}`);
+  done(`${domain} has been deleted`);
 }
 
 // If the :22222 admin panel's ssl.conf references the just-deleted domain's LE

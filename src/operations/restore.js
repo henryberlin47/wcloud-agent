@@ -24,7 +24,7 @@ export async function runRestore(job, helpers, p) {
   // In-place restore: destructive by design (safety snapshot was taken by the
   // caller). Reuse the delete op wholesale — do not copy its teardown logic.
   if (await woSiteExists(helpers, domain)) {
-    step('Remove existing site (in-place restore)');
+    step('Remove the current site before restoring over it');
     await runDelete(job, helpers, { domain });
     ok(`${domain} removed — restoring from backup`);
   }
@@ -33,13 +33,13 @@ export async function runRestore(job, helpers, p) {
   await fs.mkdir(tmpDir, { recursive: true, mode: 0o700 });
   await run(helpers, 'chown', ['www-data:www-data', tmpDir], { timeout: 30000 });
 
-  step('Download backup from Spaces');
+  step('Download the backup from your storage');
   try {
     try {
       await downloadFile(p, p.key, `${tmpDir}/export.tar.gz.enc`);
     } catch (e) {
       const why = explainSpacesError(e, p);
-      err(`download failed: ${why}`);
+      err(`Download failed — ${why}`);
       throw new Error(`Spaces download failed — ${why}`);
     }
     ok('Backup downloaded');

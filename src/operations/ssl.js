@@ -60,7 +60,7 @@ export async function runSslDnsVerify(job, helpers, p) {
 
 async function runSslOff(helpers, domain) {
   const { step, ok } = logger(helpers);
-  step('Remove SSL (certs stay on disk)');
+  step('Turn off HTTPS');
 
   const edits = []; // { path, action: "remove" | "rewrite", content? }
   const sslConf = `${config.wwwDir}/${domain}/conf/nginx/ssl.conf`;
@@ -78,7 +78,7 @@ async function runSslOff(helpers, domain) {
   }
 
   if (!edits.length) {
-    ok(`No port-443 config found for ${domain} — SSL already off`);
+    ok(`HTTPS was already off for ${domain}`);
     return;
   }
 
@@ -93,11 +93,11 @@ async function runSslOff(helpers, domain) {
   if (await nginxTest(helpers)) {
     for (const b of backups.values()) await removePath(b);
     await nginxReload(helpers);
-    ok(`HTTPS disabled for ${domain} — certs kept on disk`);
+    ok(`HTTPS turned off — ${domain} now serves over HTTP. The certificate is kept, so turning it back on is instant.`);
   } else {
     for (const [path, bak] of backups) await fs.copyFile(bak, path);
     for (const b of backups.values()) await removePath(b);
-    throw new Error('nginx -t FAILED after removing the SSL config — reverted, nothing was reloaded; inspect the vhost manually');
+    throw new Error('Turning HTTPS off would have left the web server with an invalid configuration, so the change was reverted and nothing was reloaded. The site is untouched.');
   }
 }
 
@@ -108,15 +108,17 @@ async function runSslOff(helpers, domain) {
 
 async function runSslLeHttp(helpers, domain) {
   const { step, ok, warn } = logger(helpers);
-  step('Issue Let\'s Encrypt certificate (HTTP-01)');
+  step('Request a Let\'s Encrypt certificate');
   const r = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: WO_SITE_TIMEOUT_MS });
   if (r.code !== 0) {
     const detail = r.timedOut
       ? `timed out after ${WO_SITE_TIMEOUT_MS}ms`
       : `code ${r.code}`;
-    throw new Error(`SSL issuance failed for ${domain} (${detail}) — ensure its DNS points to this server and port 80 is reachable`);
+    throw new Error(r.timedOut
+      ? `The certificate request for ${domain} timed out. Try again in a few minutes.`
+      : `Could not issue a certificate for ${domain}. Check that its DNS points to this server and that port 80 is reachable, then try again.`);
   }
-  ok(`Let's Encrypt cert issued for ${domain}`);
+  ok(`Certificate issued for ${domain}`);
 
   // This cert auto-renews again: drop any manual-DNS marker.
   await removeManualMarker(domain);
@@ -126,19 +128,19 @@ async function runSslLeHttp(helpers, domain) {
     const c = await fs.readFile(conf, 'utf8');
     if (!c.includes(fullchainPath(domain)) || !c.includes(keyPath(domain))) {
       await fs.writeFile(conf, sslConfContent(domain), { mode: 0o644 });
-      warn('ssl.conf was not pointing at the new cert — rewrote it');
+      warn('The site was pointing at an old certificate — updated it');
     }
   } else {
     await fs.mkdir(`${config.wwwDir}/${domain}/conf/nginx`, { recursive: true });
     await fs.writeFile(conf, sslConfContent(domain), { mode: 0o644 });
-    warn('no ssl.conf found — wrote one pointing at the new cert');
+    warn('The site had no HTTPS configuration — created one');
   }
 
   if (await nginxTest(helpers)) {
     await nginxReload(helpers);
-    ok('nginx validated + reloaded');
+    ok('Web server reloaded');
   } else {
-    throw new Error('nginx -t FAILED after SSL issuance — review the config before the next reload');
+    throw new Error('The certificate was issued but the resulting web server configuration is invalid, so it was not reloaded. The site keeps running on its previous configuration.');
   }
 }
 
@@ -147,10 +149,10 @@ async function runSslLeHttp(helpers, domain) {
 // bad pair never reaches disk (a mismatched pair would break nginx box-wide).
 
 async function runSslCustom(helpers, domain, p) {
-  const { step, ok, warn, log } = logger(helpers);
+  const { step, ok, warn, log , done } = logger(helpers);
   const { cert, key } = p;
 
-  step('Validate the pasted certificate + key');
+  step('Check the certificate and key');
   const tmp = `/tmp/wcloud_sslcheck_${Date.now()}_${randomBytes(4).toString('hex')}`;
   await fs.mkdir(tmp, { recursive: true, mode: 0o700 });
   const certFile = `${tmp}/cert.pem`;
@@ -162,42 +164,42 @@ async function runSslCustom(helpers, domain, p) {
     try {
       certSpki = new X509Certificate(cert).publicKey.export({ type: 'spki', format: 'der' });
     } catch {
-      throw new Error('cert is not a valid PEM certificate — nothing was written');
+      throw new Error('That does not look like a valid certificate. Paste the full-chain certificate in PEM format (it starts with "-----BEGIN CERTIFICATE-----"). Nothing was changed.');
     }
     let keySpki;
     try {
       keySpki = createPublicKey(createPrivateKey(key)).export({ type: 'spki', format: 'der' });
     } catch {
-      throw new Error('key is not a valid PEM private key — nothing was written');
+      throw new Error('That does not look like a valid private key. Paste the key in PEM format (it starts with "-----BEGIN PRIVATE KEY-----"). Nothing was changed.');
     }
     if (!certSpki.equals(keySpki)) {
-      throw new Error('cert and key do not match (different public keys) — nothing was written');
+      throw new Error('The certificate and private key do not belong together. Re-copy both from your certificate provider. Nothing was changed.');
     }
-    ok('cert and key are a matching pair');
+    ok('Certificate and key match');
 
     await fs.writeFile(certFile, cert, { mode: 0o600 });
     if (!(await certCovers(helpers, certFile, domain))) {
-      throw new Error(`cert does not cover ${domain} (no matching SAN) — nothing was written`);
+      throw new Error(`This certificate is not valid for ${domain} — it was issued for a different domain. Nothing was changed.`);
     }
-    ok(`cert covers ${domain}`);
+    ok(`Certificate covers ${domain}`);
     const www = `www.${domain}`;
     if (await vhostServesHost(domain, www)) {
       if (!(await certCovers(helpers, certFile, www))) {
-        warn(`cert does not cover ${www} — the www version will not work over HTTPS`);
+        warn(`This certificate does not cover ${www}, so that address will show a security warning over HTTPS.`);
       }
     }
   } finally {
     await removePath(tmp); // key material never lingers on disk
   }
 
-  step('Install certificate + key');
+  step('Install the certificate');
   await installCertFiles(helpers, domain, { fullchain: cert, key });
   ok(`installed 600 root:root in ${certDir(domain)}`);
   await removeManualMarker(domain);
 
-  step('Wire nginx + validate');
+  step('Point the site at the new certificate');
   await applySslConf(helpers, domain);
-  log(`Custom SSL installed for ${domain}`);
+  done(`HTTPS is now using your certificate — ${domain}`);
 }
 
 // True if the vhost serves www.<domain> (a cert without it would break that
