@@ -56,5 +56,6 @@ export async function runRestore(job, helpers, p) {
     encryptKey: p.encryptKey,
     canonical: p.canonical,
     enableWww: p.enableWww,
+    nested: true, // this op already numbered its own steps
   });
 }

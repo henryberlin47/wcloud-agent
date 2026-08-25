@@ -25,6 +25,7 @@ export async function runBackup(job, helpers, p) {
   const { path: archivePath } = await buildSiteArchive(helpers, p.domain, {
     includeSsl: p.includeSsl,
     encryptKey: p.encryptKey,
+    nested: true, // step 1 above is the section; these are its details
   });
   ok('Archive built');
 

@@ -49,6 +49,7 @@ export async function runImport(job, helpers, p) {
     tmpDir, domain, sourceDomain,
     includeSsl: p.includeSsl, issueSsl: p.issueSsl, encryptKey: p.encryptKey,
     canonical: p.canonical, enableWww: p.enableWww,
+    nested: true, // runImport already numbered its own steps
   });
 }
 
@@ -63,8 +64,9 @@ export async function runImport(job, helpers, p) {
 export async function runRestoreFromLocal(job, helpers, {
   tmpDir, domain, sourceDomain,
   includeSsl = false, issueSsl = true, encryptKey = '', canonical = 'none', enableWww = true,
+  nested = false,
 }) {
-  const { log, step, ok, warn, err, skip } = logger(helpers);
+  const { log, step, ok, warn, err, skip } = logger(helpers, { nested });
   const domainChanged = sourceDomain !== domain;
   const siteDir = `${config.wwwDir}/${domain}`;
   let siteCreated = false;

@@ -12,11 +12,13 @@ const exports = new Map();
 // an encryptKey is given. Shared by the export op (served over HTTP) and the
 // backup op (uploaded to Spaces) — one implementation, two transports.
 //
-// params: { domain, includeSsl?: boolean, encryptKey?: string }
+// params: { domain, includeSsl?: boolean, encryptKey?: string, nested?: boolean }
+// nested=true when the caller already numbered a step for this (backup does);
+// its stages then render as indented detail instead of restarting at 1.
 // returns: { path }  (encrypted `<path>.enc` when encryptKey is non-empty)
 // The caller owns the returned path and must remove it when done.
-export async function buildSiteArchive(helpers, domain, { includeSsl = false, encryptKey = '' } = {}) {
-  const { step, ok } = logger(helpers);
+export async function buildSiteArchive(helpers, domain, { includeSsl = false, encryptKey = '', nested = false } = {}) {
+  const { step, ok } = logger(helpers, { nested });
   const stamp = Date.now();
   const tmpDir = `/tmp/wcloud_export_${stamp}`;
   const archivePath = `${tmpDir}.tar.gz`;
