@@ -59,3 +59,27 @@ export function spacesEnv({ endpoint, accessKeyId, secretAccessKey }) {
 }
 
 export const remotePath = (space, key) => `wcloud:${space}/${key}`;
+
+// Turn rclone/S3 noise into something a user can act on. These four cover every
+// misconfiguration we've actually hit; anything else falls through to the raw
+// tail so nothing is hidden.
+export function explainSpacesError(raw, { space, endpoint } = {}) {
+  const s = String(raw || '');
+  const where = `${space || 'the Space'} at ${endpoint || 'the configured endpoint'}`;
+  if (/InvalidAccessKeyId/i.test(s)) {
+    return `Access key not recognized — check the Spaces access key (it is not the same as a DigitalOcean API token).`;
+  }
+  if (/SignatureDoesNotMatch/i.test(s)) {
+    return `Secret key does not match the access key — re-enter the Spaces secret.`;
+  }
+  if (/NoSuchBucket|bucket does not exist|specified bucket does not exist/i.test(s)) {
+    return `Space not found: ${where}. Check the Space name, and that its region matches the region selected here.`;
+  }
+  if (/AccessDenied/i.test(s)) {
+    return `Access denied on ${where}. Usually one of: the Space is in a different region than the one selected here, or the key is scoped to a different Space / lacks write permission.`;
+  }
+  if (/no such host|dial tcp|i\/o timeout|connection refused/i.test(s)) {
+    return `Could not reach ${endpoint || 'the endpoint'} — check the region setting and the server's network access.`;
+  }
+  return s.trim().slice(-300);
+}

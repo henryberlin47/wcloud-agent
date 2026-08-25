@@ -1,6 +1,8 @@
 import express from 'express';
 import { execSync, spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import fsp from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import config, { validateConfig } from './config.js';
@@ -8,8 +10,8 @@ import { requireAuth } from './auth.js';
 import { getOperation } from './operations/index.js';
 import { serveExport } from './operations/export.js';
 import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './jobs.js';
-import { woSiteList, run, getPhpVersion } from './lib/sys.js';
-import { ensureRclone, spacesEnv, remotePath } from './lib/spaces.js';
+import { woSiteList, run, getPhpVersion, removePath } from './lib/sys.js';
+import { ensureRclone, spacesEnv, remotePath, explainSpacesError } from './lib/spaces.js';
 import { enforceAdminPanelCert } from './lib/panelcert.js';
 import { readDbCredentials } from './lib/credentials.js';
 import { readSiteSsl } from './lib/certinfo.js';
@@ -438,19 +440,43 @@ function spacesBodyOk(p) {
     typeof p.secretAccessKey === 'string' && p.secretAccessKey.length > 0;
 }
 
+// Full round-trip: list (read) THEN write + delete a tiny probe object. A
+// read-only check passes on a Space the key cannot write to, so a backup would
+// still fail — but only after building and encrypting the whole archive. This
+// fails in seconds instead, with the reason.
 app.post('/api/backup-test', async (req, res) => {
   const p = req.body || {};
   if (!spacesBodyOk(p)) return res.status(400).json({ error: 'validation_failed', errors: ['space, endpoint, accessKeyId, secretAccessKey are required'] });
+  const env = spacesEnv(p);
+  const explain = (r) => explainSpacesError(`${r.stderr || ''}\n${r.stdout || ''}`, p);
+  const probeLocal = `/tmp/wcloud_spaces_probe_${Date.now()}_${randomBytes(4).toString('hex')}`;
+  const probeKey = `.wcloud-write-test/${randomBytes(8).toString('hex')}`;
   try {
     await ensureRclone(NOOP_HELPERS);
-    const r = await run(NOOP_HELPERS, 'rclone', ['lsd', remotePath(p.space, '')], { env: spacesEnv(p), quiet: true, timeout: 30_000 });
-    if (r.code !== 0) {
-      return res.status(502).json({ error: 'spaces_unreachable', message: (r.stderr || r.stdout || '').trim().slice(-300) });
+
+    const ls = await run(NOOP_HELPERS, 'rclone', ['lsd', remotePath(p.space, '')], { env, quiet: true, timeout: 30_000 });
+    if (ls.code !== 0) {
+      return res.status(502).json({ error: 'spaces_unreachable', stage: 'read', message: explain(ls) });
     }
-    const dirs = r.stdout.trim().split('\n').filter(Boolean).length;
-    res.json({ ok: true, dirs });
+    const dirs = ls.stdout.trim().split('\n').filter(Boolean).length;
+
+    // Write probe — the step that actually proves a backup can upload.
+    await fsp.writeFile(probeLocal, 'wcloud write test\n', { mode: 0o600 });
+    const put = await run(NOOP_HELPERS, 'rclone', ['copyto', probeLocal, remotePath(p.space, probeKey)],
+      { env, quiet: true, timeout: 60_000 });
+    if (put.code !== 0) {
+      return res.status(502).json({ error: 'spaces_not_writable', stage: 'write', message: explain(put) });
+    }
+
+    // Clean up the probe. A failure here doesn't invalidate the test — the write
+    // worked — but say so, since it leaves one stray object behind.
+    const del = await run(NOOP_HELPERS, 'rclone', ['deletefile', remotePath(p.space, probeKey)],
+      { env, quiet: true, timeout: 60_000 });
+    res.json({ ok: true, dirs, writable: true, ...(del.code === 0 ? {} : { note: `wrote OK but could not remove the test object (${probeKey}) — delete it manually` }) });
   } catch (e) {
     res.status(500).json({ error: 'test_failed', message: e?.message || 'failed' });
+  } finally {
+    await removePath(probeLocal);
   }
 });
 

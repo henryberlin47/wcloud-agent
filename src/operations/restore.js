@@ -3,7 +3,7 @@ import { run, woSiteExists, removePath } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import { runRestoreFromLocal } from './import.js';
 import { runDelete } from './delete.js';
-import { ensureRclone, spacesEnv, remotePath } from '../lib/spaces.js';
+import { ensureRclone, spacesEnv, remotePath, explainSpacesError } from '../lib/spaces.js';
 
 // ============================================================
 //  restore — bring a site back from a Spaces backup
@@ -39,8 +39,9 @@ export async function runRestore(job, helpers, p) {
     const dl = await run(helpers, 'rclone', ['copyto', remotePath(p.space, p.key), `${tmpDir}/export.tar.gz.enc`],
       { env: spacesEnv(p), quiet: true, timeout: 11 * 3600_000 });
     if (dl.code !== 0) {
-      err(`rclone download failed: ${(dl.stderr || dl.stdout).trim().slice(-300)}`);
-      throw new Error('Spaces download failed');
+      const why = explainSpacesError(`${dl.stderr}\n${dl.stdout}`, p);
+      err(`rclone download failed: ${why}`);
+      throw new Error(`Spaces download failed — ${why}`);
     }
     ok('Backup downloaded');
   } catch (e) {
