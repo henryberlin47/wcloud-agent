@@ -13,6 +13,8 @@ import {
 import { logger } from '../lib/log.js';
 import { startManualDns, verifyManualDns } from '../lib/acmedns.js';
 
+const WO_SITE_TIMEOUT_MS = 300_000;
+
 // ============================================================
 //  ssl — mode-driven SSL management for a site
 // ============================================================
@@ -109,10 +111,10 @@ async function runSslOff(helpers, domain) {
 async function runSslLeHttp(helpers, domain) {
   const { step, ok, warn } = logger(helpers);
   step('Issue Let\'s Encrypt certificate (HTTP-01)');
-  const r = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });
+  const r = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: WO_SITE_TIMEOUT_MS });
   if (r.code !== 0) {
     const detail = r.timedOut
-      ? 'timed out after 300000ms'
+      ? `timed out after ${WO_SITE_TIMEOUT_MS}ms`
       : `code ${r.code}`;
     throw new Error(`SSL issuance failed for ${domain} (${detail}) — ensure its DNS points to this server and port 80 is reachable`);
   }

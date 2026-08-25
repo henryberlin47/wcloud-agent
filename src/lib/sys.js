@@ -15,19 +15,20 @@ import { logger } from './log.js';
 
 /**
  * Run a command to completion, streaming stdout/stderr into the job log.
- * Never uses a shell. Returns { code, stdout, stderr } and does NOT throw on
+ * Never uses a shell. Returns { code, stdout, stderr, timedOut } and does NOT throw on
  * non-zero exit — callers decide what a failure means.
  *
  * @param {object} helpers  { log, err, onCancel }
  * @param {string} command
  * @param {string[]} args
- * @param {object} [opts]   { cwd, env, stdin, quiet, verbose, asUser }
+ * @param {object} [opts]   { cwd, env, stdin, quiet, verbose, asUser, timeout }
  *   (default)   → silent while it succeeds; on failure the command line and the
  *                 tail of its output are logged, so a broken step stays
  *                 diagnosable without drowning the job log in normal output.
  *   verbose=true→ echo the command and stream every line live
  *   quiet=true  → never log, even on failure (probes/version checks)
  *   asUser      → run via `sudo -u <user> -H` (for wp-cli as www-data)
+ *   timeout     → hard kill after N ms; resolves with code:-1 and timedOut:true
  */
 export function run(helpers, command, args = [], opts = {}) {
   const { cwd, env = {}, stdin, quiet = false, verbose = false, asUser, timeout } = opts;
@@ -72,7 +73,7 @@ export function run(helpers, command, args = [], opts = {}) {
     child.on('close', (code, signal) => {
       if (timer) clearTimeout(timer);
       if (killed) return reject(new Error(`cancelled (signal ${signal || 'n/a'})`));
-  if (timedOut) return resolve({ code: -1, stdout, stderr, timedOut: true });
+      if (timedOut) return resolve({ code: -1, stdout, stderr, timedOut: true });
       const c = code ?? -1;
       // Failure is the only time the raw command + output are worth the noise.
       if (c !== 0 && !quiet && !verbose) {
@@ -187,6 +188,7 @@ export async function systemctl(helpers, action, unit) {
   return run(helpers, 'systemctl', [action, unit], { timeout: 60000 });
 }
 
+// nginx -t ; returns true if config is valid.
 export async function nginxTest(helpers) {
   const r = await run(helpers, 'nginx', ['-t'], { timeout: 30000 });
   return r.code === 0;

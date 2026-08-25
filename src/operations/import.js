@@ -6,6 +6,8 @@ import {
 } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 
+const WO_SITE_TIMEOUT_MS = 300_000;
+
 // params: { sourceUrl, domain, sourceDomain?, includeSsl?, issueSsl?, sameServer?, localArchive?, encryptKey?, canonical?, enableWww? }
 export async function runImport(job, helpers, p) {
   const { step, ok, err } = logger(helpers);
@@ -117,9 +119,11 @@ export async function runRestoreFromLocal(job, helpers, {
     step('Create WordPress site');
     const php = getPhpVersion();
     const woArgs = ['site', 'create', domain, '--wp', `--php${php.flag}`];
-    const deployR = await run(helpers, 'wo', woArgs, { timeout: 300000 });
+    const deployR = await run(helpers, 'wo', woArgs, { timeout: WO_SITE_TIMEOUT_MS });
     if (deployR.code !== 0) {
-      const detail = deployR.timedOut ? 'timed out after 300000ms' : `code ${deployR.code}`;
+      const detail = deployR.timedOut
+        ? `timed out after ${WO_SITE_TIMEOUT_MS}ms`
+        : `code ${deployR.code}`;
       throw new Error(`wo site create failed (${detail})`);
     }
     siteCreated = true;

@@ -49,7 +49,7 @@ export async function runDeploy(job, helpers, p) {
     skip('Issue SSL certificate — "No SSL" selected');
   } else {
     step('Issue SSL certificate');
-    const ssl = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });
+    const ssl = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: WO_SITE_TIMEOUT_MS });
     if (ssl.code === 0) {
       ok(`SSL installed for ${domain}`);
       // Reload nginx after cert install.
