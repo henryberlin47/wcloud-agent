@@ -9,7 +9,7 @@
 // larger than S3's 5GB single-PUT limit still work.
 import { createReadStream, createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
-import { S3Client, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command, PutObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command, PutObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 
 // Spaces endpoints are regional hosts ("nyc3.digitaloceanspaces.com"). The SDK
@@ -72,6 +72,22 @@ export async function putObject(p, key, body) {
   const client = s3Client(p);
   try {
     await client.send(new PutObjectCommand({ Bucket: p.space, Key: key, Body: body }));
+  } finally {
+    client.destroy();
+  }
+}
+
+// Does the object exist, and how big is it? The authoritative answer to "did
+// that backup actually land?" when the agent job that uploaded it is gone
+// (jobs are in-memory, so an agent restart loses the outcome).
+export async function statObject(p, key) {
+  const client = s3Client(p);
+  try {
+    const r = await client.send(new HeadObjectCommand({ Bucket: p.space, Key: key }));
+    return { exists: true, size: r.ContentLength ?? null };
+  } catch (e) {
+    if (e?.name === 'NotFound' || e?.$metadata?.httpStatusCode === 404) return { exists: false, size: null };
+    throw e;
   } finally {
     client.destroy();
   }

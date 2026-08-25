@@ -10,7 +10,7 @@ import { getOperation } from './operations/index.js';
 import { serveExport } from './operations/export.js';
 import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './jobs.js';
 import { woSiteList, run, getPhpVersion } from './lib/sys.js';
-import { listTopLevel, putObject, deleteObject, explainSpacesError } from './lib/spaces.js';
+import { listTopLevel, putObject, deleteObject, statObject, explainSpacesError } from './lib/spaces.js';
 import { enforceAdminPanelCert } from './lib/panelcert.js';
 import { readDbCredentials } from './lib/credentials.js';
 import { readSiteSsl } from './lib/certinfo.js';
@@ -467,6 +467,22 @@ app.post('/api/backup-test', async (req, res) => {
     note = `wrote OK but could not remove the test object (${probeKey}) — delete it manually`;
   }
   res.json({ ok: true, dirs, writable: true, ...(note ? { note } : {}) });
+});
+
+// Does a backup object exist? Agent jobs are in-memory, so an agent restart
+// loses the outcome of an upload that already finished. The object itself is
+// the source of truth — the portal asks here instead of guessing.
+app.post('/api/backup-stat', async (req, res) => {
+  const p = req.body || {};
+  if (!spacesBodyOk(p)) return res.status(400).json({ error: 'validation_failed', errors: ['space, endpoint, accessKeyId, secretAccessKey are required'] });
+  if (typeof p.key !== 'string' || !p.key.startsWith('backups/') || p.key.includes('..')) {
+    return res.status(400).json({ error: 'validation_failed', errors: ['key must be a backups/ object key'] });
+  }
+  try {
+    res.json(await statObject(p, p.key));
+  } catch (e) {
+    res.status(502).json({ error: 'stat_failed', message: explainSpacesError(e, p) });
+  }
 });
 
 app.post('/api/backup-delete', async (req, res) => {
