@@ -48,6 +48,13 @@ export function spacesEnv({ endpoint, accessKeyId, secretAccessKey }) {
     RCLONE_CONFIG_WCLOUD_ENDPOINT: endpoint,
     RCLONE_CONFIG_WCLOUD_ACCESS_KEY_ID: accessKeyId,
     RCLONE_CONFIG_WCLOUD_SECRET_ACCESS_KEY: secretAccessKey,
+    // Never let rclone create the Space. Before uploading, its S3 backend
+    // HeadBuckets the destination and CREATES it when that check fails — and a
+    // Spaces key normally can't create Spaces, so the whole upload dies with
+    // "CreateBucket ... 403 AccessDenied" even though the Space exists and the
+    // key can write to it. The Space is always pre-created by the user, so skip
+    // the check and go straight to the object write.
+    RCLONE_CONFIG_WCLOUD_NO_CHECK_BUCKET: 'true',
   };
 }
 
