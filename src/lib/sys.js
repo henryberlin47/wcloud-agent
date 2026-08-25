@@ -261,6 +261,36 @@ export function wpCli(helpers, srcDir, opts = {}) {
   };
 }
 
+// WordPress stores its address absolutely (home/siteurl). When that disagrees
+// with what nginx serves, the two bounce the browser between them and the site
+// dies with ERR_TOO_MANY_REDIRECTS:
+//   • scheme — HTTPS enabled but home is still http:// (nginx forces https,
+//     WordPress forces http), or HTTPS turned off while home is https://
+//   • host   — nginx redirects www → non-www while home says www (or vice versa)
+// So WP must be re-pinned whenever either changes: canonical host AND SSL
+// on/off. Omitted parts keep their current value.
+export async function pinWpUrls(helpers, domain, { scheme, host } = {}) {
+  const { ok, warn } = logger(helpers);
+  const wp = wpCli(helpers, await resolveWpRoot(domain));
+  const cur = await wp(['option', 'get', 'home'], { quiet: true, timeout: 60_000 });
+  const m = (cur.stdout || '').trim().match(/^(https?):\/\/([^/]+)/i);
+  if (cur.code !== 0 && !m) {
+    warn('Could not read the WordPress address — skipping (is WordPress installed here?)');
+    return false;
+  }
+  const url = `${scheme || m?.[1] || 'http'}://${host || m?.[2] || domain}`;
+  if (m && `${m[1]}://${m[2]}` === url) return true; // already correct
+
+  let allOk = true;
+  for (const key of ['home', 'siteurl']) {
+    const r = await wp(['option', 'update', key, url], { timeout: 60_000 });
+    if (r.code !== 0) allOk = false;
+  }
+  if (allOk) ok(`WordPress address set to ${url}`);
+  else warn(`Could not update the WordPress address to ${url}. If the site shows a redirect loop, set it manually under Settings → General.`);
+  return allOk;
+}
+
 // Add or remove www.<base> on every `server_name ...;` that lists <base>.
 // Returns { out, changed }; files whose server_name doesn't mention the
 // base come back unchanged.
@@ -339,13 +369,7 @@ export async function setCanonical(helpers, domain, canonical, enableWww = true)
 
     // Pin WP home/siteurl to the preferred host (scheme matches cert state)
     // so WP's own links + redirect backstop agree with nginx.
-    const wp = wpCli(helpers, await resolveWpRoot(domain));
-    const scheme = hasSsl ? 'https' : 'http';
-    for (const key of ['home', 'siteurl']) {
-      const r = await wp(['option', 'update', key, `${scheme}://${canonicalHost}`]);
-      if (r.code !== 0) warn(`wp option update ${key} failed (code ${r.code}) — WP links may use the wrong host`);
-    }
-    ok(`WP home/siteurl = ${scheme}://${canonicalHost}`);
+    await pinWpUrls(helpers, domain, { scheme: hasSsl ? 'https' : 'http', host: canonicalHost });
   }
 
   // 2) www enablement — edit the vhost's server_name. This is the one edit

@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises';
-import { run, pathExists } from './sys.js';
+import { run, pathExists, pinWpUrls } from './sys.js';
 import { logger } from './log.js';
 import { certDir, applySslConf, writeManualMarker } from './certinstall.js';
 
@@ -181,6 +181,7 @@ export async function verifyManualDns(helpers, domain) {
   await run(helpers, 'chown', ['-R', 'root:root', dir]);
   await writeManualMarker(domain); // this cert will NOT auto-renew
   await applySslConf(helpers, domain);
+  await pinWpUrls(helpers, domain, { scheme: 'https' });
   await clearChallenge(domain);
   done(`HTTPS enabled for ${domain} via DNS verification`);
   return { pending: false };

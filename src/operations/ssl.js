@@ -3,7 +3,7 @@ import { randomBytes, X509Certificate, createPrivateKey, createPublicKey } from 
 import config from '../config.js';
 import {
   run, woSiteExists, pathExists, removePath,
-  nginxTest, nginxReload, certCovers, WO_SITE_TIMEOUT_MS,
+  nginxTest, nginxReload, certCovers, pinWpUrls, WO_SITE_TIMEOUT_MS,
 } from '../lib/sys.js';
 import {
   certDir, fullchainPath, keyPath,
@@ -93,6 +93,7 @@ async function runSslOff(helpers, domain) {
   if (await nginxTest(helpers)) {
     for (const b of backups.values()) await removePath(b);
     await nginxReload(helpers);
+    await pinWpUrls(helpers, domain, { scheme: 'http' });
     ok(`HTTPS turned off — ${domain} now serves over HTTP. The certificate is kept, so turning it back on is instant.`);
   } else {
     for (const [path, bak] of backups) await fs.copyFile(bak, path);
@@ -142,6 +143,10 @@ async function runSslLeHttp(helpers, domain) {
   } else {
     throw new Error('The certificate was issued but the resulting web server configuration is invalid, so it was not reloaded. The site keeps running on its previous configuration.');
   }
+
+  // WordPress still points at http:// until told otherwise — leaving it would
+  // make nginx and WordPress redirect at each other (ERR_TOO_MANY_REDIRECTS).
+  await pinWpUrls(helpers, domain, { scheme: 'https' });
 }
 
 // --- custom -----------------------------------------------------------------
@@ -199,6 +204,7 @@ async function runSslCustom(helpers, domain, p) {
 
   step('Point the site at the new certificate');
   await applySslConf(helpers, domain);
+  await pinWpUrls(helpers, domain, { scheme: 'https' });
   done(`HTTPS is now using your certificate — ${domain}`);
 }
 
