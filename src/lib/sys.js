@@ -72,7 +72,7 @@ export function run(helpers, command, args = [], opts = {}) {
     child.on('close', (code, signal) => {
       if (timer) clearTimeout(timer);
       if (killed) return reject(new Error(`cancelled (signal ${signal || 'n/a'})`));
-      if (timedOut) return resolve({ code: -1, stdout, stderr });
+       if (timedOut) return resolve({ code: -1, stdout, stderr, timedOut: true });
       const c = code ?? -1;
       // Failure is the only time the raw command + output are worth the noise.
       if (c !== 0 && !quiet && !verbose) {
@@ -187,14 +187,13 @@ export async function systemctl(helpers, action, unit) {
   return run(helpers, 'systemctl', [action, unit], { timeout: 60000 });
 }
 
-// nginx -t ; returns true if config is valid.
 export async function nginxTest(helpers) {
-  const r = await run(helpers, 'nginx', ['-t']);
+  const r = await run(helpers, 'nginx', ['-t'], { quiet: true, timeout: 30000 });
   return r.code === 0;
 }
 
 export async function nginxReload(helpers) {
-  return run(helpers, 'systemctl', ['reload', 'nginx']);
+  return systemctl(helpers, 'reload', 'nginx');
 }
 
 // wo site delete <domain> --no-prompt --force ; returns { ok, code }.
@@ -203,7 +202,7 @@ export async function nginxReload(helpers) {
 // --all is intentionally NOT used: these sites use a remote shared DB, so there
 // is no local WordOps-owned DB to drop.
 export async function woSiteDelete(helpers, domain) {
-  const r = await run(helpers, 'wo', ['site', 'delete', domain, '--no-prompt', '--force'], { stdin: '' });
+  const r = await run(helpers, 'wo', ['site', 'delete', domain, '--no-prompt', '--force'], { stdin: '', timeout: 120000 });
   return { ok: r.code === 0, code: r.code };
 }
 
@@ -220,7 +219,7 @@ export async function woSiteExists(helpers, domain) {
 // wo site list ; returns an array of domain strings (one per line).
 // Filters out blank lines and any decorative/header lines wo might print.
 export async function woSiteList(helpers) {
-  const r = await run(helpers, 'wo', ['site', 'list'], { quiet: true });
+  const r = await run(helpers, 'wo', ['site', 'list'], { quiet: true, timeout: 20000 });
   if (r.code !== 0) {
     throw new Error(`wo site list failed (code ${r.code})`);
   }
@@ -376,7 +375,7 @@ export async function setCanonical(helpers, domain, canonical, enableWww = true)
     const certPath = `/etc/letsencrypt/live/${domain}/fullchain.pem`;
     if ((await pathExists(certPath)) && !(await certCovers(helpers, certPath, wwwHost))) {
       warn(`Cert for ${domain} does not cover ${wwwHost} — re-issuing (needs www DNS to resolve)`);
-      const r = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force']);
+      const r = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });
       if (r.code === 0) { ok(`SSL re-issued to cover ${wwwHost}`); changed = true; }
       else warn(`Cert re-issue failed — is DNS for ${wwwHost} ready? Re-run the SSL op once it is.`);
     }

@@ -299,7 +299,7 @@ export async function runRestoreFromLocal(job, helpers, {
     if (siteCreated) {
       warn('Restore failed — rolling back half-created site');
       try {
-        await run(helpers, 'wo', ['site', 'delete', domain, '--no-prompt', '--force'], { stdin: '' });
+        await run(helpers, 'wo', ['site', 'delete', domain, '--no-prompt', '--force'], { stdin: '', timeout: 120000 });
         ok('Half-created site removed');
       } catch {
         warn(`Failed to clean up ${domain} — delete manually: wo site delete ${domain} --no-prompt --force`);

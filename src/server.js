@@ -140,7 +140,7 @@ app.get('/api/info', async (req, res) => {
     }
 
     // Disk usage for /
-    const df = await run(helpers, 'df', ['-h', '/'], { quiet: true });
+    const df = await run(helpers, 'df', ['-h', '/'], { quiet: true, timeout: 10000 });
     if (df.code === 0) {
       const lines = df.stdout.trim().split('\n');
       if (lines.length > 1) {
@@ -156,14 +156,14 @@ app.get('/api/info', async (req, res) => {
     }
 
     // Nginx version
-    const nginx = await run(helpers, 'nginx', ['-v'], { quiet: true });
+    const nginx = await run(helpers, 'nginx', ['-v'], { quiet: true, timeout: 8000 });
     if (nginx.code === 0 || nginx.stderr.includes('nginx version')) {
       const m = nginx.stderr.match(/nginx\/([\d.]+)/);
       if (m) info.nginx = m[1];
     }
 
     // PHP version
-    const php = await run(helpers, 'php', ['-v'], { quiet: true });
+    const php = await run(helpers, 'php', ['-v'], { quiet: true, timeout: 8000 });
     if (php.code === 0) {
       const m = php.stdout.match(/PHP\s+([\d.]+)/);
       if (m) info.php = m[1];
@@ -208,20 +208,20 @@ app.get('/api/info', async (req, res) => {
     // Redis version + status
     info.redisStatus = 'unknown';
     try {
-      const redis = await run(helpers, 'redis-server', ['--version'], { quiet: true });
+      const redis = await run(helpers, 'redis-server', ['--version'], { quiet: true, timeout: 8000 });
       const redisOut = (redis.stdout + redis.stderr).replace(/\x1b\[[0-9;]*m/g, '');
       const redisVer = redisOut.match(/v=([\d.]+)/) || redisOut.match(/v([\d.]+)/);
       if (redisVer) info.redis = redisVer[1];
     } catch {}
     for (const svc of ['redis-server', 'redis', 'redis7', 'redis6', 'redis5']) {
-      const rs = await run(helpers, 'systemctl', ['is-active', svc], { quiet: true });
+      const rs = await run(helpers, 'systemctl', ['is-active', svc], { quiet: true, timeout: 8000 });
       const s = rs.stdout.trim();
       if (s === 'active') { info.redisStatus = 'active'; break; }
       if (s) info.redisStatus = s;
     }
 
     // Node.js version
-    const node = await run(helpers, 'node', ['--version'], { quiet: true });
+    const node = await run(helpers, 'node', ['--version'], { quiet: true, timeout: 8000 });
     if (node.code === 0) info.node = node.stdout.trim().replace('v', '');
 
   } catch (e) {

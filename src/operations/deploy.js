@@ -1,4 +1,4 @@
-import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion, setCanonical } from '../lib/sys.js';
+import { run, woSiteExists, woSiteDelete, nginxTest, nginxReload, getPhpVersion, setCanonical } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 
 // ============================================================
@@ -33,20 +33,38 @@ export async function runDeploy(job, helpers, p) {
     }
     const r = await run(helpers, 'wo', args, { timeout: 300000 });
     if (r.code !== 0) {
-      throw new Error(`wo site create failed (code ${r.code})`);
+      const detail = r.timedOut ? `timed out after ${process.env.AGENT_DEFAULT_OP_TIMEOUT_MS ?? 300000}ms` : `code ${r.code}`;
+      throw new Error(`wo site create failed (${detail})`);
     }
     ok(`Created ${domain}`);
+
+    // Roll back a half-created site if later steps fail — same pattern as import.js.
+    try {
+      await doSslAndPrefs(helpers, ok, warn, skip, log, domain, p);
+    } catch (e) {
+      warn(`Deploy failed for ${domain} — rolling back half-created site`);
+      await woSiteDelete(helpers, domain);
+      throw e;
+    }
+    log(`Deploy completed: ${domain}`);
+    return;
   }
 
-  // 2) Issue SSL certificate (explicit choice from the portal; default on).
+  // Existing site (re-issue SSL): no rollback needed.
+  await doSslAndPrefs(helpers, ok, warn, skip, log, domain, p);
+  log(`Deploy completed: ${domain}`);
+}
+
+// Issue SSL + apply domain preferences. Extracted to share the code path between
+// the new-site (rollback-wrapped) and existing-site (no rollback) branches.
+async function doSslAndPrefs(helpers, ok, warn, skip, log, domain, p) {
   if (p.issueSsl === false) {
     skip('Issue SSL certificate — "No SSL" selected');
   } else {
-    step('Issue SSL certificate');
+    log('Issue SSL certificate');
     const ssl = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });
     if (ssl.code === 0) {
       ok(`SSL installed for ${domain}`);
-      // Reload nginx after cert install.
       if (await nginxTest(helpers)) {
         await nginxReload(helpers);
         ok('nginx reloaded');
@@ -56,10 +74,6 @@ export async function runDeploy(job, helpers, p) {
     }
   }
 
-  // Apply domain preferences (canonical redirect + www enablement). Handles
-  // none/enable-www itself and reloads nginx only if it changed something.
-  step('Apply domain preferences');
+  log('Apply domain preferences');
   await setCanonical(helpers, domain, p.canonical, p.enableWww);
-
-  log(`Deploy completed: ${domain}`);
 }
