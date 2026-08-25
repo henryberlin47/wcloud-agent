@@ -60,7 +60,7 @@ as the source of truth for writing code** — the graph is only a map.
    restarts. Cleared by the verify step, a hard verify failure, and site delete.
 - `POST /api/op/:type` — validate + enqueue an operation → `{ jobId, state }`.
 - `POST /api/self-update` — `git fetch origin` + `reset --hard origin/main` + `npm install`, respond `{ ok, updated, old_commit, new_commit, version }`, then restart via a *systemd-run 2s timer* (detached — the timer outlives the process that gets SIGTERM'd). Origin/branch hardcoded: this runs remote code as root, no request body ever reaches a shell.
-- `POST /api/backup-test`, `POST /api/backup-delete` — quick rclone calls against the Spaces creds passed **in the request body** (per user, per job). Creds live in the rclone subprocess `env` for one call only — never written to config, never logged (command lines carry no secrets).
+- `POST /api/backup-test`, `POST /api/backup-delete` — quick S3 calls against the Spaces creds passed **in the request body** (per user, per job). Creds live in the S3 client for one call only — never written to config, never logged. `backup-test` is a full round-trip: list (read), then write a tiny probe object and delete it. A read-only check passes on a Space the key can't write to, so the failure would otherwise surface only after a whole archive was built.
 - `GET /api/jobs`, `/api/jobs/:id`, `/logs`, `/stream` (SSE), `POST /:id/cancel` —
   job status/logs/cancel. Jobs are **in-memory** (`src/jobs.js`), serialized
   (`AGENT_MAX_CONCURRENT=1`), forgotten ~1h after finishing.
@@ -85,8 +85,8 @@ site, nginx, certs; requires `confirm:true`), **ssl** (mode-driven, below),
 **export** (builds the archived site; `buildSiteArchive` in `export.js` is the shared
 archive builder), **import** (restores an archive; `runRestoreFromLocal` in
 `import.js` is the shared restore body — decrypt/extract/DB/SSL/canonical all live
-there), **backup** (build archive via the shared helper + rclone-upload to Spaces)
-and **restore** (rclone-download + the shared restore path; in-place restore first
+there), **backup** (build archive via the shared helper + S3-upload to Spaces)
+and **restore** (S3-download + the shared restore path; in-place restore first
 runs the full **delete** op). backup/restore take the user's Spaces creds per call
 in params and run with a longer per-op timeout (`AGENT_BACKUP_TIMEOUT_MS`, default
 12h). No shells are used — args are arrays, so domain values can't inject shell
@@ -182,6 +182,18 @@ Driven by env the portal's install command injects (`init.sh` writes them to
 - **certinfo.js / certinstall.js** — live SSL state + cert/nginx wiring (see §3
   "ssl"). Disk is the source of truth; nothing per-site is stored.
 - **acmedns.js** — the manual DNS-01 two-step flow + its state file (see §3).
+- **spaces.js** — DigitalOcean Spaces (S3) transfers via `@aws-sdk/client-s3`:
+  `uploadFile` (multipart through lib-storage's `Upload`, so archives past S3's
+  5GB single-PUT limit work), `downloadFile`, `putObject`, `deleteObject`,
+  `listTopLevel`. **Nothing here creates the bucket** — the Space is pre-created
+  by the user and a Spaces key usually can't create one; rclone's habit of
+  calling CreateBucket when its HeadBucket failed used to kill every upload with
+  a 403. The signing region is derived from the endpoint host
+  (`nyc3.digitaloceanspaces.com` → `nyc3`), because SigV4 rejects a region that
+  doesn't match the endpoint. `explainSpacesError` maps failures to actionable
+  text and **walks nested errors** — a connection failure arrives as an
+  `AggregateError` whose own message is just `"AggregateError"` (Node races IPv6
+  and IPv4), so the real code lives in `.errors`/`.cause`.
 - **wpinfo.js** — live WordPress core version (`wp core version`), nothing stored.
 - **panelcert.js** — pins the `:22222` WordOps panel to its self-signed cert and
   locks it, so it can't be repointed at a deletable site cert. Called at startup.
