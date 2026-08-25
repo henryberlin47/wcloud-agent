@@ -30,6 +30,10 @@ export async function runImport(job, helpers, p) {
       ok('Archive copied');
     } else {
       const fetchR = await run(helpers, 'curl', [
+        // Pin the protocol on the initial request AND on redirects: -L would
+        // otherwise happily follow an http(s) URL into file:// or a link-local
+        // metadata address.
+        '--proto', '=http,https', '--proto-redir', '=http,https',
         '-sL', '--fail', '--create-dirs',
         '-o', `${tmpDir}/export.tar.gz.enc`,
         p.sourceUrl,

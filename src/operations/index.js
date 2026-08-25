@@ -285,7 +285,23 @@ const importOp = {
     if (typeof out.domain === 'string') out.domain = normDomain(out.domain);
     if (typeof out.sourceDomain === 'string') out.sourceDomain = normDomain(out.sourceDomain);
     const errors = [];
-    if (!out.sourceUrl || typeof out.sourceUrl !== 'string') errors.push('sourceUrl is required');
+    // sourceUrl reaches `curl`. Anything but http(s) turns this into a local-file
+    // read or an internal-network probe, so the scheme is checked here and curl
+    // is additionally pinned to http/https (including across redirects) in
+    // import.js — validate() is the boundary, the flag is the belt.
+    if (!out.sourceUrl || typeof out.sourceUrl !== 'string') {
+      errors.push('sourceUrl is required');
+    } else if (!/^https?:\/\//i.test(out.sourceUrl)) {
+      errors.push('sourceUrl must be an http(s) URL');
+    }
+
+    // localArchive is copied from and then REMOVED — recursively, as root. It is
+    // only ever the agent's own export staging file handed back to us, so pin it
+    // to that shape; an unchecked value here is an arbitrary `rm -rf`.
+    const LOCAL_ARCHIVE_RE = /^\/tmp\/wcloud_export_[0-9]+\.tar\.gz(\.enc)?$/;
+    if (out.localArchive != null && out.localArchive !== '' && !LOCAL_ARCHIVE_RE.test(String(out.localArchive))) {
+      errors.push('localArchive must be an export archive produced by this agent');
+    }
     reqDomain(errors, 'domain', out.domain);
     if (out.sourceDomain && !isDomain(out.sourceDomain)) errors.push('sourceDomain must be a valid domain');
     let canonical = (out.canonical === 'www' || out.canonical === 'root' || out.canonical === 'none') ? out.canonical : 'none';
