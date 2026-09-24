@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { X509Certificate } from 'node:crypto';
 import fs from 'node:fs/promises';
 import fssync from 'node:fs';
 import config from '../config.js';
@@ -342,18 +343,11 @@ export function adjustServerNames(content, base, wwwHost, enableWww) {
   return { out, changed };
 }
 
-// True if the cert's SAN list covers host (quiet probe). Exact DNS entry or a
-// one-label wildcard (DNS:*.example.com covers www.example.com — never
-// example.com itself, never deeper subdomains). A substring test would let
-// SAN "example.com.attacker.com" pass for "example.com".
-export async function certCovers(helpers, certPath, host) {
-  const r = await run(helpers, 'openssl', ['x509', '-in', certPath, '-noout', '-ext', 'subjectAltName'], { quiet: true, timeout: 15_000 });
-  if (r.code !== 0) return false;
-  const target = String(host).trim().toLowerCase();
-  const sans = [...r.stdout.matchAll(/DNS:([^,\s]+)/g)].map((m) => m[1].toLowerCase());
-  return sans.some((san) =>
-    san === target ||
-    (san.startsWith('*.') && target.endsWith(`.${san.slice(2)}`) && target.split('.').length === san.split('.').length));
+// True if the cert file's SANs cover host (exact, or a one-label wildcard) —
+// Node's RFC 6125 matcher, the same one lib/certcheck.js uses. Never throws.
+export async function certCovers(_helpers, certPath, host) {
+  try { return !!new X509Certificate(await fs.readFile(certPath)).checkHost(String(host).trim().toLowerCase()); }
+  catch { return false; }
 }
 
 // Apply the user's domain preferences to a live site.

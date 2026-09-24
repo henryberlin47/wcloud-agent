@@ -77,7 +77,7 @@ Each descriptor has:
   against `DOMAIN_RE`. Never let unvalidated input reach a command.
 - `run(job, helpers, clean)` — the work.
 
-Current ops: **deploy** (`wo site create --wp` + optional SSL, `issueSsl` flag),
+Current ops: **deploy** (`wo site create --wp` + HTTPS: Let's Encrypt via `issueSsl`, or the user's own `cert`+`key` — checked by `lib/certcheck.js` BEFORE the site is created, then installed with `applySslConf({certs})`),
 **update** (`wp core update` + `update-db` + php-fpm restart), **delete** (removes
 site, nginx, certs; requires `confirm:true`), **ssl** (mode-driven, below),
 **sslDnsVerify** (step 2 of manual DNS-01, below),
@@ -196,6 +196,7 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   text and **walks nested errors** — a connection failure arrives as an
   `AggregateError` whose own message is just `"AggregateError"` (Node races IPv6
   and IPv4), so the real code lives in `.errors`/`.cause`.
+- **certcheck.js** — `checkCustomCert(domain, cert, key, {www})`: in-memory (Node crypto) validation of a user certificate — PEM parses, key matches, `checkHost` covers the domain, not expired/not-yet-valid; www-coverage and self-signed are warnings. Shared by the ssl op (custom) and deploy. The portal runs the same rules (`server/utils/certcheck.ts`) for its live form check.
 - **wpinfo.js** — live WordPress core version (`wp core version`), nothing stored.
 - **panelcert.js** — pins the `:22222` WordOps panel to its self-signed cert and
   locks it, so it can't be repointed at a deletable site cert. Called at startup.

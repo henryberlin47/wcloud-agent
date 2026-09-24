@@ -72,11 +72,18 @@ function reqSpaces(p, errors) {
 // ============================================================
 const deploy = {
   name: 'deploy',
-  // params: { domain, wp_user?, wp_password?, canonical?: "www"|"root"|"none", enableWww?, issueSsl? }
+  // params: { domain, wp_user?, wp_password?, canonical?: "www"|"root"|"none", enableWww?, issueSsl?, cert?, key? }
+  // cert + key (PEM) = install the user's own certificate instead of Let's Encrypt.
   validate(p = {}) {
     p = sanitize(p);
     const errors = [];
     reqDomain(errors, 'domain', p.domain);
+
+    const cert = typeof p.cert === 'string' ? p.cert.trim() : '';
+    const key = typeof p.key === 'string' ? p.key : '';
+    if (!!cert !== !!key) errors.push('a custom certificate needs both cert and key');
+    if (cert.length > 60_000) errors.push('cert is too large (60KB max)');
+    if (key.length > 60_000) errors.push('key is too large (60KB max)');
 
     let wpUser = typeof p.wp_user === 'string' ? p.wp_user.trim() : '';
     let wpPassword = typeof p.wp_password === 'string' ? p.wp_password : '';
@@ -89,10 +96,11 @@ const deploy = {
     let canonical = (p.canonical === 'www' || p.canonical === 'root' || p.canonical === 'none') ? p.canonical : 'none';
     const enableWww = p.enableWww !== false;
     if (canonical === 'www' && !enableWww) canonical = 'root'; // can't redirect to a host we don't serve
-    // Explicit SSL choice from the portal (default: issue, as before).
-    const issueSsl = p.issueSsl !== false;
+    // Explicit SSL choice from the portal (default: issue, as before). A custom
+    // certificate replaces Let's Encrypt.
+    const issueSsl = !cert && p.issueSsl !== false;
 
-    return { ok: errors.length === 0, errors, clean: { domain: p.domain, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww, issueSsl } };
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww, issueSsl, ...(cert ? { cert, key } : {}) } };
   },
   async run(job, helpers, p) {
     await runDeploy(job, helpers, p);

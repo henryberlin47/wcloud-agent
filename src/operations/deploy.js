@@ -1,5 +1,7 @@
-import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion, setCanonical, wpSetPassword, resolveWpRoot, WO_SITE_TIMEOUT_MS } from '../lib/sys.js';
+import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion, setCanonical, wpSetPassword, resolveWpRoot, pinWpUrls, WO_SITE_TIMEOUT_MS } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
+import { checkCustomCert } from '../lib/certcheck.js';
+import { applySslConf } from '../lib/certinstall.js';
 
 // ============================================================
 //  deploy — create a vanilla WordPress site on this server
@@ -9,6 +11,8 @@ import { logger } from '../lib/log.js';
 //      + local MySQL; --user/--pass are wo's own flags — see
 //      https://docs.wordops.net/commands/site/#site-create)
 //   2) wo site update <domain> --le --force  (issue/renew SSL)
+//      — or install the user's own certificate (cert + key), checked BEFORE
+//        step 1 so a bad pair never leaves a half-made site behind.
 // DB credentials are NOT recorded here — the portal reads them live from
 // wp-config.php on demand (see lib/credentials.js). The WP admin password can't
 // be read back (WordPress keeps only a bcrypt hash); see resetPassword.js.
@@ -21,6 +25,15 @@ export async function runDeploy(job, helpers, p) {
   const requestedUser = p.wp_user || '';
   const requestedPassword = p.wp_password || '';
   const isNewSite = !(await woSiteExists(helpers, domain));
+  const custom = p.cert && p.key;
+
+  // 0) Own certificate: refuse a bad pair before creating anything.
+  if (custom) {
+    step('Check your certificate');
+    const { warnings } = checkCustomCert(domain, p.cert, p.key, { www: p.enableWww !== false });
+    ok(`Certificate and key match, and cover ${domain}`);
+    for (const w of warnings) warn(w);
+  }
 
   // 1) Create WordPress site.
   step('Create the WordPress site');
@@ -48,8 +61,18 @@ export async function runDeploy(job, helpers, p) {
     }
   }
 
-  // 2) Issue SSL certificate (explicit choice from the portal; default on).
-  if (p.issueSsl === false) {
+  // 2) HTTPS: the user's own certificate, Let's Encrypt, or none.
+  if (custom) {
+    step('Install your certificate');
+    try {
+      // Same transaction as the site page (write, nginx -t, roll back on failure).
+      await applySslConf(helpers, domain, { certs: { fullchain: p.cert, key: p.key } });
+      await pinWpUrls(helpers, domain, { scheme: 'https' });
+      ok(`HTTPS enabled for ${domain} with your certificate`);
+    } catch (e) {
+      warn(`The site is live over HTTP, but the certificate couldn't be enabled: ${e?.message || e} Try again from the site page.`);
+    }
+  } else if (p.issueSsl === false) {
     skip('Issue the HTTPS certificate — you chose "No SSL"');
   } else {
     step('Issue the HTTPS certificate');

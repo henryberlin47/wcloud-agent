@@ -1,9 +1,8 @@
 import fs from 'node:fs/promises';
-import { randomBytes, X509Certificate, createPrivateKey, createPublicKey } from 'node:crypto';
 import config from '../config.js';
 import {
   run, woSiteExists, pathExists, removePath,
-  nginxTest, nginxReload, certCovers, pinWpUrls, WO_SITE_TIMEOUT_MS,
+  nginxTest, nginxReload, pinWpUrls, WO_SITE_TIMEOUT_MS,
 } from '../lib/sys.js';
 import {
   certDir, fullchainPath, keyPath,
@@ -12,6 +11,7 @@ import {
 } from '../lib/certinstall.js';
 import { logger } from '../lib/log.js';
 import { startManualDns, verifyManualDns } from '../lib/acmedns.js';
+import { checkCustomCert } from '../lib/certcheck.js';
 
 // ============================================================
 //  ssl — mode-driven SSL management for a site
@@ -155,44 +155,10 @@ async function runSslCustom(helpers, domain, p) {
   const { cert, key } = p;
 
   step('Check the certificate and key');
-  const tmp = `/tmp/wcloud_sslcheck_${Date.now()}_${randomBytes(4).toString('hex')}`;
-  await fs.mkdir(tmp, { recursive: true, mode: 0o700 });
-  const certFile = `${tmp}/cert.pem`;
-  try {
-    // Node crypto, not openssl: identical behavior on LibreSSL, OpenSSL 1.1.1
-    // and 3.x, and public-key compare covers RSA/EC/Ed25519. The key is
-    // parsed in memory only — it never touches disk before applySslConf.
-    let certSpki;
-    try {
-      certSpki = new X509Certificate(cert).publicKey.export({ type: 'spki', format: 'der' });
-    } catch {
-      throw new Error('That does not look like a valid certificate. Paste the full-chain certificate in PEM format (it starts with "-----BEGIN CERTIFICATE-----"). Nothing was changed.');
-    }
-    let keySpki;
-    try {
-      keySpki = createPublicKey(createPrivateKey(key)).export({ type: 'spki', format: 'der' });
-    } catch {
-      throw new Error('That does not look like a valid private key. Paste the key in PEM format (it starts with "-----BEGIN PRIVATE KEY-----"). Nothing was changed.');
-    }
-    if (!certSpki.equals(keySpki)) {
-      throw new Error('The certificate and private key do not belong together. Re-copy both from your certificate provider. Nothing was changed.');
-    }
-    ok('Certificate and key match');
-
-    await fs.writeFile(certFile, cert, { mode: 0o600 });
-    if (!(await certCovers(helpers, certFile, domain))) {
-      throw new Error(`This certificate is not valid for ${domain} — it was issued for a different domain. Nothing was changed.`);
-    }
-    ok(`Certificate covers ${domain}`);
-    const www = `www.${domain}`;
-    if (await vhostServesHost(domain, www)) {
-      if (!(await certCovers(helpers, certFile, www))) {
-        warn(`This certificate does not cover ${www}, so that address will show a security warning over HTTPS.`);
-      }
-    }
-  } finally {
-    await removePath(tmp); // key material never lingers on disk
-  }
+  // Every check happens BEFORE any file is touched (shared with deploy).
+  const { warnings } = checkCustomCert(domain, cert, key, { www: await vhostServesHost(domain, `www.${domain}`) });
+  ok(`Certificate and key match, and cover ${domain}`);
+  for (const w of warnings) warn(w);
 
   step('Install the certificate and point the site at it');
   // One transaction: if nginx rejects the new pair, the previous cert files
