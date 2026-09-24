@@ -22,6 +22,7 @@ import { readChallenge } from './lib/acme.js';
 import { listSites, readSpec, publicSpec } from './lib/sites.js';
 import { readWpVersion, readDbCredentials } from './lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService } from './lib/stack.js';
+import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { enroll } from './enroll.js';
 
 // --- startup validation -----------------------------------------------------
@@ -360,6 +361,53 @@ app.get('/api/sites/:domain/ssl', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
   }
+});
+
+// --- file manager -----------------------------------------------------------
+// Every operation runs as the SITE's user inside its web root (lib/files.js,
+// fm-worker.js) — never as root. Paths are relative to htdocs.
+const fmFail = (res, r) => res.status(statusFor(r.code)).json({ error: r.code, message: r.message });
+const relPath = (v) => (typeof v === 'string' ? v : '').slice(0, 4096);
+
+app.get('/api/sites/:domain/files', siteParam, async (req, res) => {
+  const r = await settle(await spawnWorker(req.site, 'list', { path: relPath(req.query.path) }));
+  if (!r.ok) return fmFail(res, r);
+  res.json({ path: relPath(req.query.path), entries: r.data });
+});
+
+// Raw bytes (download / open in the editor). stat first, so a missing file is
+// a JSON error rather than an empty 200, and the size can be sent up front.
+app.get('/api/sites/:domain/files/content', siteParam, async (req, res) => {
+  const path = relPath(req.query.path);
+  const st = await settle(await spawnWorker(req.site, 'stat', { path }));
+  if (!st.ok) return fmFail(res, st);
+  if (st.data.type !== 'file') return res.status(400).json({ error: 'EISDIR', message: 'That is a folder, not a file.' });
+  const child = await spawnWorker(req.site, 'read', { path });
+  res.set({ 'Content-Type': 'application/octet-stream', 'Content-Length': String(st.data.size), 'Cache-Control': 'no-store' });
+  child.stdout.pipe(res);
+  res.on('close', () => { if (!res.writableFinished) child.kill('SIGKILL'); });
+});
+
+// Save / upload: the raw request body becomes the file (atomic replace).
+app.put('/api/sites/:domain/files/content', siteParam, async (req, res) => {
+  if (req.is('application/json')) return res.status(415).json({ error: 'unsupported', message: 'Send the file as application/octet-stream.' });
+  const child = await spawnWorker(req.site, 'write', { path: relPath(req.query.path), max: UPLOAD_MAX });
+  child.stdin.on('error', () => {}); // the worker quit early (e.g. too big) — its error says why
+  req.pipe(child.stdin);
+  const r = await settle(child, { timeout: 60 * 60_000 });
+  if (!r.ok) return fmFail(res, r);
+  res.json(r.data);
+});
+
+const FILE_OPS = ['mkdir', 'rename', 'move', 'copy', 'delete'];
+app.post('/api/sites/:domain/files/op', siteParam, async (req, res) => {
+  const b = req.body || {};
+  if (!FILE_OPS.includes(b.op)) return res.status(400).json({ error: 'EINVAL', message: 'Unknown file operation.' });
+  const paths = Array.isArray(b.paths) ? b.paths.filter((x) => typeof x === 'string').slice(0, 1000) : undefined;
+  const args = { path: relPath(b.path), from: relPath(b.from), to: relPath(b.to), ...(paths ? { paths } : {}) };
+  const r = await settle(await spawnWorker(req.site, b.op, args), { timeout: 30 * 60_000 });
+  if (!r.ok) return fmFail(res, r);
+  res.json({ ok: true, ...r.data });
 });
 
 // --- pending manual DNS-01 challenge for a site -------------------------------

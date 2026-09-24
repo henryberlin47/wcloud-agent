@@ -52,6 +52,16 @@ as the source of truth for writing code** — the graph is only a map.
 - `GET /api/sites/:domain` — the site's settings (`publicSpec`: `type`, `php`,
   `enableWww`, `canonical`, `ssl`, `created_at`). 404 = not a site here. All
   `/api/sites/:domain/*` routes resolve the spec first (`siteParam`).
+- **File manager** — `GET /api/sites/:domain/files?path=` (list),
+  `GET …/files/content?path=` (raw bytes), `PUT …/files/content?path=` (raw
+  `application/octet-stream` body → the file, atomic replace, ≤512 MB),
+  `POST …/files/op` (`mkdir` | `rename` | `move` | `copy` | `delete`). Paths are
+  relative to the site's `htdocs`. Every call spawns **`src/fm-worker.js` as the
+  site's user** (uid/gid + clean env, `lib/files.js`) — the agent itself never
+  touches site files for the file manager: it is root, and a site-planted
+  symlink would turn "read this file" into "read any file". The worker also
+  confines paths lexically (`path.resolve` against `/`, so `..` can't climb and
+  `/`, `''`, `.` are exactly the root, which can't be deleted/renamed).
 - `GET /api/sites/:domain/credentials` — DB creds read **live** from `wp-config.php`.
   404 = not a readable WP site.
 - `GET /api/sites/:domain/wp` — WordPress core version, read **live** via
@@ -191,6 +201,8 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   with a **clean env**, never the agent's), and **`timeout`** (kills and resolves
   `{code:-1}` — use it on probes that might hang). Also `userIds(name)`,
   `certCovers`, nginx/systemctl helpers.
+- **files.js** + **../fm-worker.js** — the file manager (§2): spawn the worker
+  as the site user, collect its JSON / stream its output, map error codes.
 - **sites.js** — the site model (§6): spec store (`readSpec`/`listSites`),
   `renderVhost`/`renderPool`, `applySite` (the transaction), `createSite`,
   `deleteSite`, `applySslConf`, `syncWpAddress`.
@@ -320,6 +332,7 @@ src/auth.js            requireAuth: IP allowlist → bearer token
 src/config.js          env-driven config + version from package.json
 src/enroll.js          self-registration with the portal (§4)
 src/jobs.js            in-memory job queue + SSE
+src/fm-worker.js       one file-manager operation, run as the site's user (§2)
 src/operations/        one file per op + index.js registry (§3)
 src/lib/               sys.js, sites.js, stack.js, wp.js, acme.js, certinfo.js,
                        certcheck.js, spaces.js, log.js (§5)
