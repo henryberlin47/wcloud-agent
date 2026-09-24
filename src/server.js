@@ -23,6 +23,7 @@ import { listSites, readSpec, publicSpec } from './lib/sites.js';
 import { readWpVersion, readDbCredentials } from './lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService } from './lib/stack.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
+import { createLoginLink } from './lib/wplogin.js';
 import { enroll } from './enroll.js';
 
 // --- startup validation -----------------------------------------------------
@@ -360,6 +361,18 @@ app.get('/api/sites/:domain/ssl', async (req, res) => {
     res.json(await readSiteSsl(helpers, domain));
   } catch (e) {
     res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
+  }
+});
+
+// --- one-click login to wp-admin (lib/wplogin.js) ----------------------------
+// { url, user, expires_in } — a single-use link valid for 2 minutes. The URL
+// is a credential: it goes back to the portal and nowhere else (never logged).
+app.post('/api/sites/:domain/wp-login', siteParam, async (req, res) => {
+  if (req.site.type !== 'wordpress') return res.status(400).json({ error: 'not_wordpress', message: 'Only WordPress sites have a login.' });
+  try {
+    res.json(await createLoginLink(NOOP_HELPERS, req.site));
+  } catch (e) {
+    res.status(502).json({ error: 'login_failed', message: e?.message || 'failed' });
   }
 });
 

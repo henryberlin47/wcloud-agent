@@ -62,6 +62,13 @@ as the source of truth for writing code** — the graph is only a map.
   symlink would turn "read this file" into "read any file". The worker also
   confines paths lexically (`path.resolve` against `/`, so `..` can't climb and
   `/`, `''`, `.` are exactly the root, which can't be deleted/renamed).
+- `POST /api/sites/:domain/wp-login` — **one-click login** (`lib/wplogin.js`):
+  `{ url, user, expires_in }`, a single-use `wp-login.php?wcloud_login=<token>`
+  link (2 min) for the first administrator. WordPress stores only the token's
+  SHA-256 (a transient); the must-use plugin `mu-plugins/wcloud-login.php`
+  (rewritten on every call, as the site user) deletes it before checking —
+  single use even when invalid — then sets the auth cookie. The minting PHP
+  goes to `wp eval-file -` on stdin, so the token never touches argv.
 - `GET /api/sites/:domain/credentials` — DB creds read **live** from `wp-config.php`.
   404 = not a readable WP site.
 - `GET /api/sites/:domain/wp` — WordPress core version, read **live** via
@@ -201,6 +208,7 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   with a **clean env**, never the agent's), and **`timeout`** (kills and resolves
   `{code:-1}` — use it on probes that might hang). Also `userIds(name)`,
   `certCovers`, nginx/systemctl helpers.
+- **wplogin.js** — one-click wp-admin login links (§2).
 - **files.js** + **../fm-worker.js** — the file manager (§2): spawn the worker
   as the site user, collect its JSON / stream its output, map error codes.
 - **sites.js** — the site model (§6): spec store (`readSpec`/`listSites`),
