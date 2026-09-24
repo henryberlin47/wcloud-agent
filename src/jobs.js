@@ -34,7 +34,12 @@ function makeJob(type, params) {
     logCap: 5000,
     result: null, // ops can set this to return structured data
     _emitter: new EventEmitter(),
-    _cancel: null,
+    // One signal per job: cancel and timeout abort it, and every consumer
+    // listens (run() kills its process group and refuses to start new commands;
+    // S3 transfers abort). A per-command callback slot used to go stale between
+    // commands and during transfers, so cancel/timeout killed nothing.
+    _abort: new AbortController(),
+    _cancelRequested: false,
   };
   job._emitter.setMaxListeners(50);
   jobs.set(id, job);
@@ -136,14 +141,14 @@ async function startJob(job) {
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    if (typeof job._cancel === 'function') job._cancel('timeout');
+    job._abort.abort('timeout');
   }, job._timeout || config.jobTimeoutMs);
   timer.unref?.();
 
   const helpers = {
     log: (line) => appendLog(job, line, 'stdout'),
     err: (line) => appendLog(job, line, 'stderr'),
-    onCancel: (fn) => { job._cancel = fn; },
+    signal: job._abort.signal,
   };
 
   try {
@@ -156,13 +161,15 @@ async function startJob(job) {
   } catch (e) {
     if (timedOut) {
       setState(job, STATE.TIMEOUT, 'operation exceeded time limit');
+    } else if (job._cancelRequested) {
+      appendLog(job, 'Cancelled.', 'stderr');
+      setState(job, STATE.CANCELLED, 'cancelled while running');
     } else {
       appendLog(job, `ERROR: ${e?.message || e}`, 'stderr');
       setState(job, STATE.FAILED, e?.message || 'operation failed');
     }
   } finally {
     clearTimeout(timer);
-    job._cancel = null;
     running -= 1;
     drain();
   }
@@ -176,9 +183,7 @@ export function cancelJob(id) {
     setState(job, STATE.CANCELLED, 'cancelled while queued');
     return { ok: true };
   }
-  if (typeof job._cancel === 'function') {
-    job._cancel('cancelled');
-    return { ok: true };
-  }
-  return { ok: false, reason: 'not_cancellable' };
+  job._cancelRequested = true;
+  job._abort.abort('cancelled');
+  return { ok: true };
 }

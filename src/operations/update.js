@@ -11,7 +11,7 @@ import { logger } from '../lib/log.js';
 // ============================================================
 
 export async function runUpdate(job, helpers, p) {
-  const { log, step, ok, warn, err, done } = logger(helpers);
+  const { step, ok, warn, err, done } = logger(helpers);
   const domain = p.domain;
 
   const wpRoot = await resolveWpRoot(domain);

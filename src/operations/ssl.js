@@ -7,7 +7,7 @@ import {
 } from '../lib/sys.js';
 import {
   certDir, fullchainPath, keyPath,
-  sslConfContent, installCertFiles, applySslConf,
+  sslConfContent, applySslConf,
   removeManualMarker, stripSslServerBlocks, mainVhostPath,
 } from '../lib/certinstall.js';
 import { logger } from '../lib/log.js';
@@ -112,9 +112,6 @@ async function runSslLeHttp(helpers, domain) {
   step('Request a Let\'s Encrypt certificate');
   const r = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: WO_SITE_TIMEOUT_MS });
   if (r.code !== 0) {
-    const detail = r.timedOut
-      ? `timed out after ${WO_SITE_TIMEOUT_MS}ms`
-      : `code ${r.code}`;
     throw new Error(r.timedOut
       ? `The certificate request for ${domain} timed out. Try again in a few minutes.`
       : `Could not issue a certificate for ${domain}. Check that its DNS points to this server and that port 80 is reachable, then try again.`);
@@ -154,7 +151,7 @@ async function runSslLeHttp(helpers, domain) {
 // bad pair never reaches disk (a mismatched pair would break nginx box-wide).
 
 async function runSslCustom(helpers, domain, p) {
-  const { step, ok, warn, log , done } = logger(helpers);
+  const { step, ok, warn, done } = logger(helpers);
   const { cert, key } = p;
 
   step('Check the certificate and key');
@@ -164,7 +161,7 @@ async function runSslCustom(helpers, domain, p) {
   try {
     // Node crypto, not openssl: identical behavior on LibreSSL, OpenSSL 1.1.1
     // and 3.x, and public-key compare covers RSA/EC/Ed25519. The key is
-    // parsed in memory only — it never touches disk before installCertFiles.
+    // parsed in memory only — it never touches disk before applySslConf.
     let certSpki;
     try {
       certSpki = new X509Certificate(cert).publicKey.export({ type: 'spki', format: 'der' });
@@ -197,13 +194,12 @@ async function runSslCustom(helpers, domain, p) {
     await removePath(tmp); // key material never lingers on disk
   }
 
-  step('Install the certificate');
-  await installCertFiles(helpers, domain, { fullchain: cert, key });
-  ok(`installed 600 root:root in ${certDir(domain)}`);
+  step('Install the certificate and point the site at it');
+  // One transaction: if nginx rejects the new pair, the previous cert files
+  // come back along with the config (installed 600 root:root in certDir).
+  await applySslConf(helpers, domain, { certs: { fullchain: cert, key } });
+  ok(`Installed in ${certDir(domain)}`);
   await removeManualMarker(domain);
-
-  step('Point the site at the new certificate');
-  await applySslConf(helpers, domain);
   await pinWpUrls(helpers, domain, { scheme: 'https' });
   done(`HTTPS is now using your certificate — ${domain}`);
 }

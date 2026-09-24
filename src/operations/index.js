@@ -32,7 +32,7 @@ export function normDomain(v) {
     .trim()
     .replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, '') // strip scheme
     .replace(/\/.*$/, '')                          // drop path / trailing slash
-    .replace(/^www\./, '')                         // strip leading www.
+    .replace(/^www\./i, '')                       // strip leading www. (any case — runs before toLowerCase)
     .toLowerCase();
 }
 
@@ -253,11 +253,17 @@ const resetPassword = {
   },
 };
 
+// Archive work (export/import for migrations, backup/restore) can take hours on
+// big sites, so these ops run past the default job timeout. Export/import used
+// to get the 20-minute default, so migrating any large site was killed mid-way.
+const BACKUP_TIMEOUT_MS = parseInt(process.env.AGENT_BACKUP_TIMEOUT_MS || String(12 * 3600 * 1000), 10);
+
 // ============================================================
 //  export — create a portable archive of a site (files + DB + optional SSL)
 // ============================================================
 const exportOp = {
   name: 'export',
+  timeout: BACKUP_TIMEOUT_MS,
   // params: { domain, includeSsl?: boolean, encryptKey?: string }
   validate(p = {}) {
     p = sanitize(p);
@@ -279,6 +285,7 @@ const exportOp = {
 // ============================================================
 const importOp = {
   name: 'import',
+  timeout: BACKUP_TIMEOUT_MS,
   // params: { sourceUrl, domain, sourceDomain?, includeSsl?, issueSsl?, sameServer?, localArchive?, encryptKey?, canonical?: "www"|"root"|"none", enableWww? }
   validate(p = {}) {
     const out = { ...p };
@@ -332,10 +339,6 @@ const importOp = {
 // ============================================================
 //  backup — encrypted site archive uploaded to the user's Spaces
 // ============================================================
-// Backups can take hours on big sites, so this op runs past the default job
-// timeout (AGENT_BACKUP_TIMEOUT_MS).
-const BACKUP_TIMEOUT_MS = parseInt(process.env.AGENT_BACKUP_TIMEOUT_MS || String(12 * 3600 * 1000), 10);
-
 const backup = {
   name: 'backup',
   timeout: BACKUP_TIMEOUT_MS,

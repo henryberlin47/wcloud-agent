@@ -101,8 +101,10 @@ export async function startManualDns(helpers, domain) {
   }
   await clearChallenge(domain); // a fresh start supersedes any stale pending challenge
 
+  // Pin the key type: verify/install below always pass --ecc, so the order must
+  // live in <D>_ecc no matter what this box's acme.sh default keylength is.
   step('Start DNS verification');
-  const r = await run(helpers, ACME, [...ACME_OPTS, '--issue', '--dns', '-d', domain, '--force', MANUAL_FLAG],
+  const r = await run(helpers, ACME, [...ACME_OPTS, '--issue', '--dns', '-d', domain, '--keylength', 'ec-256', '--force', MANUAL_FLAG],
     { quiet: true, timeout: 180_000 });
   if (r.code !== CODE_DNS_MANUAL) {
     err('The certificate authority did not return the DNS records to add.');
@@ -126,7 +128,7 @@ export async function startManualDns(helpers, domain) {
 const DNS_NOT_VISIBLE = /DNS problem|NXDOMAIN|no DNS|does not match/i;
 
 export async function verifyManualDns(helpers, domain) {
-  const { step, ok, warn, err , done } = logger(helpers);
+  const { step, warn, err, done } = logger(helpers);
   if (!(await pathExists(ACME))) throw new Error('This server has no certificate tool installed.');
   const state = await readChallenge(domain);
   if (!state) throw new Error('There is no DNS verification in progress for this site. Start one from Manage SSL.');

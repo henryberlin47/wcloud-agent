@@ -1,4 +1,4 @@
-import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion, setCanonical, WO_SITE_TIMEOUT_MS } from '../lib/sys.js';
+import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion, setCanonical, wpSetPassword, resolveWpRoot, WO_SITE_TIMEOUT_MS } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 
 // ============================================================
@@ -16,7 +16,7 @@ import { logger } from '../lib/log.js';
 
 export async function runDeploy(job, helpers, p) {
   const lg = logger(helpers);
-  const { log, step, ok, warn, skip, done } = lg;
+  const { step, ok, warn, skip, done } = lg;
   const domain = p.domain;
   const requestedUser = p.wp_user || '';
   const requestedPassword = p.wp_password || '';
@@ -29,9 +29,10 @@ export async function runDeploy(job, helpers, p) {
   } else {
     const php = getPhpVersion();
     const args = ['site', 'create', domain, '--wp', `--php${php.flag}`];
-    if (requestedUser && requestedPassword) {
-      args.push(`--user=${requestedUser}`, `--pass=${requestedPassword}`, `--email=admin@${domain}`);
-    }
+    const setCreds = Boolean(requestedUser && requestedPassword);
+    // No --pass: a root process's argv is world-readable. WordOps generates a
+    // throwaway password; the requested one is set below via stdin.
+    if (setCreds) args.push(`--user=${requestedUser}`, `--email=admin@${domain}`);
     const r = await run(helpers, 'wo', args, { timeout: WO_SITE_TIMEOUT_MS });
     if (r.code !== 0) {
       const detail = r.timedOut
@@ -40,6 +41,11 @@ export async function runDeploy(job, helpers, p) {
       throw new Error(`wo site create failed (${detail})`);
     }
     ok(`Site created — ${domain}`);
+    if (setCreds) {
+      const pw = await wpSetPassword(helpers, await resolveWpRoot(domain), requestedUser, requestedPassword);
+      if (pw.code === 0) ok(`Admin password set for ${requestedUser}`);
+      else warn(`The site is up, but setting the admin password failed — use "Reset password" on the site page.`);
+    }
   }
 
   // 2) Issue SSL certificate (explicit choice from the portal; default on).

@@ -1,4 +1,4 @@
-import { wpCli, resolveWpRoot } from '../lib/sys.js';
+import { wpCli, wpSetPassword, resolveWpRoot } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 
 // ============================================================
@@ -27,7 +27,7 @@ export async function runResetPassword(job, helpers, p) {
   ok(`Administrator account: ${wpUser}`);
 
   step('Set the new password');
-  const setPass = await wp(['user', 'update', wpUser, `--user_pass=${newPassword}`]);
+  const setPass = await wpSetPassword(helpers, wpRoot, wpUser, newPassword);
   if (setPass.code !== 0) {
     throw new Error(`Failed to set password for ${wpUser} (code ${setPass.code})`);
   }

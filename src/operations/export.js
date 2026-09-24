@@ -4,9 +4,18 @@ import fsSync from 'node:fs';
 import config from '../config.js';
 import { run, woSiteExists, pathExists, wpCli, removePath } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
+import { makeStagingDir } from './import.js';
 
 // Temporary export archives and their one-time tokens.
 const exports = new Map();
+
+// Archives hold a DB dump, wp-config and possibly TLS keys. Pre-create each one
+// exclusively (O_EXCL: fails on an existing path or planted symlink) as 0600;
+// tar/openssl then write into it and keep that mode. Root's default umask would
+// otherwise leave it world-readable in /tmp until it's served or uploaded.
+async function createPrivateFile(p) {
+  await (await fs.open(p, 'wx', 0o600)).close();
+}
 
 // Build the site archive (DB dump + files + optional SSL), encrypting it when
 // an encryptKey is given. Shared by the export op (served over HTTP) and the
@@ -19,15 +28,10 @@ const exports = new Map();
 // The caller owns the returned path and must remove it when done.
 export async function buildSiteArchive(helpers, domain, { includeSsl = false, encryptKey = '', nested = false } = {}) {
   const { step, ok } = logger(helpers, { nested });
-  const stamp = Date.now();
-  const tmpDir = `/tmp/wcloud_export_${stamp}`;
+  // 0700 staging dir owned by www-data (wp-cli dumps the DB as www-data).
+  const tmpDir = await makeStagingDir(helpers, 'export');
   const archivePath = `${tmpDir}.tar.gz`;
   const siteDir = `${config.wwwDir}/${domain}`;
-
-  // Make staging dir accessible to www-data (wp-cli runs as www-data).
-  // 0700 keeps it private (holds SSL keys), www-data can read/write for DB dump.
-  await fs.mkdir(tmpDir, { recursive: true, mode: 0o700 });
-  await run(helpers, 'chown', ['www-data:www-data', tmpDir], { timeout: 30000 });
 
   // 1) Dump the database (runs as www-data, needs access to tmpDir).
   step('Export the database');
@@ -44,7 +48,13 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
   // 2) Copy site files (as root — root can write to www-data-owned dir).
   step('Copy the site files');
   const destSite = `${tmpDir}/site`;
-  await run(helpers, 'cp', ['-a', siteDir, destSite]);
+  const cpR = await run(helpers, 'cp', ['-a', siteDir, destSite]);
+  if (cpR.code !== 0) {
+    // A partial copy would still archive and upload "successfully" — a
+    // silently incomplete restore point.
+    await removePath(tmpDir);
+    throw new Error('Copying the site files failed — the disk may be full.');
+  }
   // Remove cache dirs to shrink archive.
   for (const cacheDir of ['app/cache', 'wp-content/cache', 'wp-content/uploads/wp-rocket-minify']) {
     await removePath(`${destSite}/${cacheDir}`);
@@ -53,10 +63,11 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
 
   // 3) Copy SSL certs + nginx config if requested.
   if (includeSsl) {
-    step('Copy the HTTPS certificates and site configuration');
+    // Cert material only: restore regenerates ssl.conf itself and never
+    // trusts an archived renewal.conf, so neither is packed.
+    step('Copy the HTTPS certificates');
     const sslLive = `/etc/letsencrypt/live/${domain}`;
     const sslArchive = `/etc/letsencrypt/archive/${domain}`;
-    const sslRenewal = `/etc/letsencrypt/renewal/${domain}.conf`;
     const sslDest = `${tmpDir}/ssl`;
     await fs.mkdir(sslDest, { recursive: true });
 
@@ -66,30 +77,24 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
     if (await pathExists(sslArchive)) {
       await run(helpers, 'cp', ['-a', sslArchive, `${sslDest}/archive`]);
     }
-    if (await pathExists(sslRenewal)) {
-      await run(helpers, 'cp', ['-a', sslRenewal, `${sslDest}/renewal.conf`]);
-    }
-    // Copy the per-site SSL nginx config (portable across servers for same domain).
-    const sslNginxConf = `${siteDir}/conf/nginx/ssl.conf`;
-    if (await pathExists(sslNginxConf)) {
-      await run(helpers, 'cp', ['-a', sslNginxConf, `${sslDest}/ssl.conf`]);
-    }
-    ok('Certificates and configuration copied');
+    ok('Certificates copied');
   }
 
   // 4) Create tarball.
   step('Compress everything into one archive');
+  await createPrivateFile(archivePath);
   const tarR = await run(helpers, 'tar', ['czf', archivePath, '-C', tmpDir, '.']);
+  await removePath(tmpDir);
   if (tarR.code !== 0) {
-    await removePath(tmpDir);
+    await removePath(archivePath);
     throw new Error('Archive creation failed');
   }
-  await removePath(tmpDir);
 
   // 5) Encrypt archive if key provided.
   if (encryptKey) {
     step('Encrypt the archive');
     const encryptedPath = `${archivePath}.enc`;
+    await createPrivateFile(encryptedPath);
     const encR = await run(helpers, 'openssl', [
       'enc', '-aes-256-cbc', '-pbkdf2',
       '-pass', `env:ENC_KEY`,
@@ -98,6 +103,7 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
     ], { env: { ENC_KEY: encryptKey } });
     if (encR.code !== 0) {
       await removePath(archivePath);
+      await removePath(encryptedPath);
       throw new Error('Archive encryption failed');
     }
     await removePath(archivePath);
@@ -126,6 +132,9 @@ export async function runExport(job, helpers, p) {
   const expires = Date.now() + 3600_000;
   exports.set(token, { path: finalPath, expires });
   cleanupExports();
+  // A never-downloaded archive (DB dump + keys) must not outlive its token just
+  // because no later export runs cleanupExports.
+  setTimeout(cleanupExports, 3600_000 + 1000).unref();
 
   const baseUrl = config.advertiseUrl || `http://${config.host}:${config.port}`;
   const fetchUrl = `${baseUrl.replace(/\/+$/, '')}/api/export/${token}`;

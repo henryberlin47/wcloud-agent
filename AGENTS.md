@@ -59,7 +59,7 @@ as the source of truth for writing code** — the graph is only a map.
    restart); it exists so the two-step DNS flow survives page reloads and agent
    restarts. Cleared by the verify step, a hard verify failure, and site delete.
 - `POST /api/op/:type` — validate + enqueue an operation → `{ jobId, state }`.
-- `POST /api/self-update` — `git fetch origin` + `reset --hard origin/main` + `npm install`, respond `{ ok, updated, old_commit, new_commit, version }`, then restart via a *systemd-run 2s timer* (detached — the timer outlives the process that gets SIGTERM'd). Origin/branch hardcoded: this runs remote code as root, no request body ever reaches a shell.
+- `POST /api/self-update` — refuses (409) while any job is queued/running (the restart would cut it off) or another update runs; `git fetch origin` + `reset --hard origin/main` + `npm install` — an npm failure resets back to the previous commit (new code + old deps would crash-loop on the next restart); respond `{ ok, updated, old_commit, new_commit, version }`, then restart via a *systemd-run 2s timer* (detached — the timer outlives the process that gets SIGTERM'd). Origin/branch hardcoded: this runs remote code as root, no request body ever reaches a shell.
 - `POST /api/backup-test`, `POST /api/backup-delete` — quick S3 calls against the Spaces creds passed **in the request body** (per user, per job). Creds live in the S3 client for one call only — never written to config, never logged. `backup-test` is a full round-trip: list (read), then write a tiny probe object and delete it. A read-only check passes on a Space the key can't write to, so the failure would otherwise surface only after a whole archive was built.
 - `GET /api/jobs`, `/api/jobs/:id`, `/logs`, `/stream` (SSE), `POST /:id/cancel` —
   job status/logs/cancel. Jobs are **in-memory** (`src/jobs.js`), serialized
@@ -108,7 +108,9 @@ syntax.
 - `custom` — pasted fullchain + key. **Validated before anything is written**: both
   parse as PEM, the key's public key equals the cert's (public-key compare — covers
   RSA/EC/Ed25519), and the cert's SAN covers the domain. A bad pair never touches
-  disk. Then `installCertFiles` + `applySslConf` (shared wiring, §5). `cert`/`key`
+  disk. Then `applySslConf(helpers, domain, { certs })` — the cert pair joins the
+  same backup → nginx -t → rollback transaction, so a chain nginx rejects restores
+  the previous working cert (shared wiring, §5). `cert`/`key`
   arrive in the authenticated body only, the key is written `600 root:root`, and
   neither is ever logged or echoed (job views redact both).
 
@@ -243,6 +245,23 @@ loopback; set to the box's IP to accept portal calls), `AGENT_PORT` (8787),
 - **Jobs + install progress are in-memory**; an agent restart forgets jobs. The
   portal is the durable record and reconciles.
 - **Concurrency is 1 on purpose** — deploys touch nginx/php-fpm; parallel runs race.
+- **Cancel/timeout = one AbortSignal per job** (`helpers.signal`). `run()` refuses to
+  start once aborted and kills the child's whole **process group** (spawned
+  `detached`; TERM then KILL) — signalling only the direct child left `sudo -u`'s
+  real process running. S3 transfers take `{ signal }` (Upload.abort() also
+  aborts the multipart server-side). Cancel ends as CANCELLED, timeout as TIMEOUT.
+- **Secrets never ride argv.** WP passwords go through `wpSetPassword` (wp-cli
+  `--prompt=user_pass` on stdin); argv is world-readable via /proc and sudo logs
+  it. `run()` also masks `--*pass*=` values in its failure dump.
+- **Restore never trusts the archive.** Only real directories are copied out
+  (`lstat` — a symlinked `site/htdocs` would copy e.g. /root into the web root);
+  `ssl.conf` is regenerated via `applySslConf`, `renewal.conf` is never restored;
+  tar extracts `--no-same-owner`. In-place restore downloads, decrypts and
+  `gzip -t`s the archive BEFORE deleting the live site.
+- **Staging is private.** `makeStagingDir` (`mkdtemp`, 0700); archives are
+  pre-created `O_EXCL` 0600 so a DB dump/keys are never world-readable in /tmp.
+- **Archive ops (export/import/backup/restore) share AGENT_BACKUP_TIMEOUT_MS** (12h)
+  — export/import used to get the 20-minute default and large migrations died.
 
 ---
 

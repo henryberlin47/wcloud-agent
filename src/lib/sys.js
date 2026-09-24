@@ -24,7 +24,7 @@ export const WO_LIST_TIMEOUT_MS = 20_000;  // site list (a read; also the /api/s
  * Never uses a shell. Returns { code, stdout, stderr, timedOut } and does NOT throw on
  * non-zero exit — callers decide what a failure means.
  *
- * @param {object} helpers  { log, err, onCancel }
+ * @param {object} helpers  { log, err, signal }  (signal: the job's AbortSignal)
  * @param {string} command
  * @param {string[]} args
  * @param {object} [opts]   { cwd, env, stdin, quiet, verbose, asUser, timeout }
@@ -38,7 +38,7 @@ export const WO_LIST_TIMEOUT_MS = 20_000;  // site list (a read; also the /api/s
  */
 export function run(helpers, command, args = [], opts = {}) {
   const { cwd, env = {}, stdin, quiet = false, verbose = false, asUser, timeout } = opts;
-  const { log, err, onCancel } = helpers;
+  const { log, err, signal: jobSignal } = helpers;
 
   let cmd = command;
   let cmdArgs = args;
@@ -46,28 +46,43 @@ export function run(helpers, command, args = [], opts = {}) {
     cmd = 'sudo';
     cmdArgs = ['-u', asUser, '-H', command, ...args];
   }
+  // Never echo a secret flag value into the job log (it's served to the portal).
+  const shown = () => `$ ${cmd} ${cmdArgs.map((a) => String(a).replace(/^(--[\w-]*pass[\w-]*=).+/i, '$1***')).join(' ')}`;
 
   return new Promise((resolve, reject) => {
-    if (verbose) log(`$ ${cmd} ${cmdArgs.join(' ')}`);
-    const child = spawn(cmd, cmdArgs, { cwd, env: { ...process.env, ...env }, shell: false });
+    // Cancelled/timed out between commands: don't start the next one.
+    if (jobSignal?.aborted) return reject(new Error(`cancelled (${jobSignal.reason ?? 'aborted'})`));
+
+    if (verbose) log(shown());
+    // detached → the child leads its own process group, so a kill reaches every
+    // descendant. Signalling only the direct child left `sudo -u` wrappers' real
+    // process (php wp …) running: sudo can relay SIGTERM but never SIGKILL.
+    const child = spawn(cmd, cmdArgs, { cwd, env: { ...process.env, ...env }, shell: false, detached: true });
 
     let stdout = '';
     let stderr = '';
     let killed = false;
     let timedOut = false;
 
+    // TERM the whole group (sudo relays it), then KILL whatever ignored it.
+    const killTree = () => {
+      const sig = (s) => { try { process.kill(-child.pid, s); } catch {} };
+      sig('SIGTERM');
+      setTimeout(() => sig('SIGKILL'), 5000).unref?.();
+    };
+
     // Optional hard timeout so a probe that hangs (e.g. an interactive tool with
     // no tty) can't stall the caller forever. Resolves with code -1, not reject.
     const timer = timeout
-      ? setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch {} }, timeout)
+      ? setTimeout(() => { timedOut = true; killTree(); }, timeout)
       : null;
 
-    onCancel?.((reason) => {
+    const onAbort = () => {
       killed = true;
-      err?.(`[cancel:${reason}] SIGTERM → pid ${child.pid}`);
-      try { child.kill('SIGTERM'); } catch {}
-      setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 5000).unref?.();
-    });
+      err?.(`[${jobSignal.reason ?? 'cancel'}] stopping pid ${child.pid} and its children`);
+      killTree();
+    };
+    jobSignal?.addEventListener('abort', onAbort, { once: true });
 
     lineReader(child.stdout, (line) => { stdout += line + '\n'; if (verbose) log?.(line); });
     lineReader(child.stderr, (line) => { stderr += line + '\n'; if (verbose) err?.(line); });
@@ -75,15 +90,21 @@ export function run(helpers, command, args = [], opts = {}) {
     if (stdin != null) child.stdin.write(stdin);
     child.stdin.end();
 
-    child.on('error', (e) => { if (timer) clearTimeout(timer); reject(new Error(`spawn failed for ${cmd}: ${e.message}`)); });
+    const settle = () => { if (timer) clearTimeout(timer); jobSignal?.removeEventListener('abort', onAbort); };
+    // A killed process whose pipes are still held open (a straggler outside the
+    // group) would delay 'close' indefinitely; once it has exited, stop waiting.
+    child.on('exit', () => {
+      if (killed || timedOut) { child.stdout?.destroy(); child.stderr?.destroy(); }
+    });
+    child.on('error', (e) => { settle(); reject(new Error(`spawn failed for ${cmd}: ${e.message}`)); });
     child.on('close', (code, signal) => {
-      if (timer) clearTimeout(timer);
+      settle();
       if (killed) return reject(new Error(`cancelled (signal ${signal || 'n/a'})`));
       if (timedOut) return resolve({ code: -1, stdout, stderr, timedOut: true });
       const c = code ?? -1;
       // Failure is the only time the raw command + output are worth the noise.
       if (c !== 0 && !quiet && !verbose) {
-        err?.(`$ ${cmd} ${cmdArgs.join(' ')}`);
+        err?.(shown());
         for (const line of tailLines(`${stdout}${stderr}`, 15)) err?.(`    ${line}`);
       }
       resolve({ code: c, stdout, stderr });
@@ -247,6 +268,13 @@ export async function woSiteList(helpers) {
 //   const wp = wpCli(helpers, '/var/www/example.com');
 //   await wp(['core', 'update']);
 // Override the WP root with opts.wpPath (e.g. for old Acorn: { wpPath: 'web/wp' }).
+// Set a WP user's password without it ever reaching argv — argv is readable by
+// every local user via /proc (incl. any site's PHP) and sudo logs it to
+// auth.log. wp-cli's --prompt reads the field from stdin instead.
+export function wpSetPassword(helpers, wpRoot, user, password) {
+  return wpCli(helpers, wpRoot)(['user', 'update', user, '--prompt=user_pass'], { stdin: `${password}\n` });
+}
+
 export function wpCli(helpers, srcDir, opts = {}) {
   const { wpPath } = opts;
   return (args, extra = {}) => {

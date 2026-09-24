@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises';
-import { run, woSiteExists, removePath } from '../lib/sys.js';
+import { woSiteExists, removePath } from '../lib/sys.js';
 import { logger, humanSize } from '../lib/log.js';
 import { buildSiteArchive } from './export.js';
 import { uploadFile, explainSpacesError } from '../lib/spaces.js';
@@ -15,7 +15,7 @@ import { uploadFile, explainSpacesError } from '../lib/spaces.js';
 
 // params: { domain, includeSsl, encryptKey, space, key, endpoint, accessKeyId, secretAccessKey }
 export async function runBackup(job, helpers, p) {
-  const { log, step, ok, err } = logger(helpers);
+  const { step, ok, err, done } = logger(helpers);
 
   if (!(await woSiteExists(helpers, p.domain))) {
     throw new Error(`${p.domain} is not a site on this server.`);
@@ -32,8 +32,9 @@ export async function runBackup(job, helpers, p) {
   try {
     step('Upload the archive to your storage');
     try {
-      await uploadFile(p, p.key, archivePath);
+      await uploadFile(p, p.key, archivePath, { signal: helpers.signal });
     } catch (e) {
+      if (helpers.signal?.aborted) throw e; // cancel/timeout, not a Spaces problem
       const why = explainSpacesError(e, p);
       err(`Upload failed — ${why}`);
       throw new Error(`Spaces upload failed — ${why}`);

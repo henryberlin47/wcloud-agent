@@ -41,28 +41,36 @@ export function s3Client({ endpoint, accessKeyId, secretAccessKey }) {
 
 // Stream a local file up. Upload() switches to multipart past the part size, so
 // this handles archives of any size without buffering them in memory.
-export async function uploadFile(p, key, filePath) {
+// `signal` is the job's AbortSignal: cancel/timeout abort the transfer instead
+// of letting it hold the single job slot until it ends on its own (and
+// Upload.abort() also aborts the multipart upload server-side, so no orphaned
+// parts keep billing the user's Space).
+export async function uploadFile(p, key, filePath, { signal } = {}) {
+  signal?.throwIfAborted();
   const client = s3Client(p);
+  const up = new Upload({
+    client,
+    params: { Bucket: p.space, Key: key, Body: createReadStream(filePath) },
+    partSize: 64 * 1024 * 1024, // 64MB parts → 5GB max object needs ~80 parts
+    queueSize: 3,               // modest concurrency; these boxes also serve sites
+  });
+  const onAbort = () => { up.abort().catch(() => {}); };
+  signal?.addEventListener('abort', onAbort, { once: true });
   try {
-    const up = new Upload({
-      client,
-      params: { Bucket: p.space, Key: key, Body: createReadStream(filePath) },
-      partSize: 64 * 1024 * 1024, // 64MB parts → 5GB max object needs ~80 parts
-      queueSize: 3,               // modest concurrency; these boxes also serve sites
-    });
     await up.done();
   } finally {
+    signal?.removeEventListener('abort', onAbort);
     client.destroy();
   }
 }
 
 // Stream an object down to a local path.
-export async function downloadFile(p, key, filePath) {
+export async function downloadFile(p, key, filePath, { signal } = {}) {
   const client = s3Client(p);
   try {
-    const r = await client.send(new GetObjectCommand({ Bucket: p.space, Key: key }));
+    const r = await client.send(new GetObjectCommand({ Bucket: p.space, Key: key }), { abortSignal: signal });
     if (!r.Body) throw new Error('empty response body from Spaces');
-    await pipeline(r.Body, createWriteStream(filePath, { mode: 0o600 }));
+    await pipeline(r.Body, createWriteStream(filePath, { mode: 0o600 }), { signal });
   } finally {
     client.destroy();
   }

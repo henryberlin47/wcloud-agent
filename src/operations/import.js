@@ -6,6 +6,58 @@ import {
   WO_SITE_TIMEOUT_MS,
 } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
+import { applySslConf } from '../lib/certinstall.js';
+
+// Unpredictable, atomically-created 0700 staging dir (mkdtemp never reuses an
+// existing path). www-data gets it because wp-cli's db import/export runs as
+// www-data. ponytail: www-data (any site's PHP) could still tamper with the tree
+// mid-run; a root-only dir + a single www-data-owned SQL file closes that.
+export async function makeStagingDir(helpers, prefix) {
+  const dir = await fs.mkdtemp(`/tmp/wcloud_${prefix}_`);
+  await run(helpers, 'chown', ['www-data:www-data', dir], { timeout: 30000 });
+  return dir;
+}
+
+// A crafted archive can make a top-level entry (site, site/htdocs, ssl/live) a
+// symlink, and `cp -a src/. dest` DEREFERENCES the source root — copying an
+// arbitrary host dir (e.g. /root) into the web root, then chowning it to
+// www-data. Only ever copy out of real directories. (Symlinks *inside* a tree
+// are copied as links, not followed — WordOps' own logs/*.log links are fine.)
+async function isRealDir(p) {
+  try { return (await fs.lstat(p)).isDirectory(); } catch { return false; }
+}
+
+async function mustRun(helpers, cmd, args, what) {
+  const r = await run(helpers, cmd, args);
+  if (r.code !== 0) throw new Error(`${what} failed — the disk may be full or the archive incomplete.`);
+  return r;
+}
+
+// Turn `${tmpDir}/export.tar.gz.enc` into a plaintext `${tmpDir}/export.tar.gz`
+// (decrypting when a key is given). Idempotent, so restore can do it up front —
+// proving the key works BEFORE it deletes the live site — and the shared restore
+// path then skips it.
+export async function prepareArchive(helpers, tmpDir, encryptKey, { step, ok }) {
+  const enc = `${tmpDir}/export.tar.gz.enc`;
+  const plain = `${tmpDir}/export.tar.gz`;
+  if (!(await pathExists(enc))) return;
+  if (encryptKey) {
+    step('Decrypt the archive');
+    const decR = await run(helpers, 'openssl', [
+      'enc', '-d', '-aes-256-cbc', '-pbkdf2',
+      '-pass', `env:ENC_KEY`,
+      '-in', enc,
+      '-out', plain,
+    ], { env: { ENC_KEY: encryptKey } });
+    if (decR.code !== 0) {
+      throw new Error('The archive could not be decrypted. This usually means the encryption key for this account has changed since the backup was made.');
+    }
+    await removePath(enc);
+    ok('Archive decrypted');
+  } else {
+    await mustRun(helpers, 'mv', [enc, plain], 'Preparing the archive');
+  }
+}
 
 // params: { sourceUrl, domain, sourceDomain?, includeSsl?, issueSsl?, sameServer?, localArchive?, encryptKey?, canonical?, enableWww? }
 export async function runImport(job, helpers, p) {
@@ -17,14 +69,12 @@ export async function runImport(job, helpers, p) {
     throw new Error(`${domain} already exists on this server. Delete it first, or choose a different domain.`);
   }
 
-  const tmpDir = `/tmp/wcloud_import_${Date.now()}`;
-  await fs.mkdir(tmpDir, { recursive: true, mode: 0o700 });
-  await run(helpers, 'chown', ['www-data:www-data', tmpDir], { timeout: 30000 });
+  const tmpDir = await makeStagingDir(helpers, 'import');
   try {
     // 1) Fetch archive to `${tmpDir}/export.tar.gz.enc` (or copy a local one).
     step('Fetch the site archive');
     if (p.sameServer && p.localArchive) {
-      await run(helpers, 'cp', [p.localArchive, `${tmpDir}/export.tar.gz.enc`]);
+      await mustRun(helpers, 'cp', ['--', p.localArchive, `${tmpDir}/export.tar.gz.enc`], 'Copying the archive');
       // Clean up the source archive after copying (same-server migration).
       await removePath(p.localArchive);
       ok('Archive copied');
@@ -76,27 +126,12 @@ export async function runRestoreFromLocal(job, helpers, {
   let siteCreated = false;
 
   try {
-    // Decrypt if encrypted.
-    if (encryptKey) {
-      step('Decrypt the archive');
-      const decR = await run(helpers, 'openssl', [
-        'enc', '-d', '-aes-256-cbc', '-pbkdf2',
-        '-pass', `env:ENC_KEY`,
-        '-in', `${tmpDir}/export.tar.gz.enc`,
-        '-out', `${tmpDir}/export.tar.gz`,
-      ], { env: { ENC_KEY: encryptKey } });
-      if (decR.code !== 0) {
-        throw new Error('The archive could not be decrypted. This usually means the encryption key for this account has changed since the backup was made.');
-      }
-      await removePath(`${tmpDir}/export.tar.gz.enc`);
-      ok('Archive decrypted');
-    } else {
-      await run(helpers, 'mv', [`${tmpDir}/export.tar.gz.enc`, `${tmpDir}/export.tar.gz`]);
-    }
+    await prepareArchive(helpers, tmpDir, encryptKey, { step, ok });
 
-    // 2) Extract archive.
+    // 2) Extract archive. --no-same-owner: entries land root-owned regardless of
+    // the uids recorded in a (possibly foreign) archive.
     step('Unpack the archive');
-    const extractR = await run(helpers, 'tar', ['xzf', `${tmpDir}/export.tar.gz`, '-C', tmpDir]);
+    const extractR = await run(helpers, 'tar', ['xzf', `${tmpDir}/export.tar.gz`, '--no-same-owner', '-C', tmpDir]);
     if (extractR.code !== 0) {
       throw new Error('The archive could not be unpacked — the file may be incomplete or corrupted.');
     }
@@ -150,30 +185,22 @@ export async function runRestoreFromLocal(job, helpers, {
     // 6) Restore site files (exclude wp-config.php from htdocs copy).
     step('Restore the site files');
     const srcSite = `${tmpDir}/site`;
-    if (await pathExists(srcSite)) {
+    if (await isRealDir(srcSite)) {
       const srcHtdocs = `${srcSite}/htdocs`;
       const destHtdocs = `${siteDir}/htdocs`;
 
-      if (await pathExists(srcHtdocs)) {
-        // Copy wp-content subdirs (plugins, themes, uploads).
-        for (const sub of ['wp-content/uploads', 'wp-content/plugins', 'wp-content/themes', 'wp-content/mu-plugins']) {
-          const srcSub = `${srcHtdocs}/${sub}`;
-          const destSub = `${destHtdocs}/${sub}`;
-          if (await pathExists(srcSub)) {
-            await run(helpers, 'cp', ['-a', srcSub, destSub]);
-          }
-        }
-        // Copy other WP files, excluding wp-config.php (target keeps its own).
-        await run(helpers, 'cp', ['-a', `${srcHtdocs}/.` , destHtdocs]);
-        // Remove any wp-config.php that leaked into htdocs (non-standard source layout).
-        await removePath(`${destHtdocs}/wp-config.php`);
-      } else {
-        await run(helpers, 'cp', ['-a', `${srcSite}/.`, destHtdocs]);
-        await removePath(`${destHtdocs}/wp-config.php`);
-      }
+      // One overlay copy of the whole tree (wp-content included). A per-subdir
+      // `cp -a src/plugins dest/plugins` used to run first: dest already exists
+      // on a fresh WordOps site, so it nested (plugins/plugins/…) and copied
+      // uploads twice.
+      const from = (await isRealDir(srcHtdocs)) ? srcHtdocs : srcSite;
+      await mustRun(helpers, 'cp', ['-a', `${from}/.`, destHtdocs], 'Copying the site files');
+      // The target keeps its own wp-config.php (non-standard sources leak one in).
+      await removePath(`${destHtdocs}/wp-config.php`);
 
-      // Fix file ownership — source UID may differ from target.
-      await run(helpers, 'chown', ['-R', 'www-data:www-data', destHtdocs]);
+      // Fix file ownership — source UID may differ from target. (-R does not
+      // follow symlinks, so a link in the tree can't redirect the chown.)
+      await mustRun(helpers, 'chown', ['-R', 'www-data:www-data', destHtdocs], 'Setting file ownership');
       ok('Site files restored');
     } else {
       warn('No site files found in archive');
@@ -234,24 +261,21 @@ export async function runRestoreFromLocal(job, helpers, {
       step('Restore SSL certificates');
       const sslLive = `${tmpDir}/ssl/live`;
       const sslArchiveDir = `${tmpDir}/ssl/archive`;
-      const sslRenewal = `${tmpDir}/ssl/renewal.conf`;
-      const sslConf = `${tmpDir}/ssl/ssl.conf`;
 
       const destLive = `/etc/letsencrypt/live/${domain}`;
       const destArchive = `/etc/letsencrypt/archive/${domain}`;
-      const destRenewal = `/etc/letsencrypt/renewal/${domain}.conf`;
 
-      if (await pathExists(sslLive)) {
+      // Only cert material comes from the archive. The archive's renewal.conf
+      // (certbot-format, can carry root-run hook commands) and ssl.conf (raw
+      // nginx directives included into the server block) are NOT restored —
+      // ssl.conf is regenerated below by the transactional applySslConf.
+      if (await isRealDir(sslLive)) {
         await fs.mkdir(destLive, { recursive: true });
-        await run(helpers, 'cp', ['-a', `${sslLive}/.`, destLive]);
+        await mustRun(helpers, 'cp', ['-a', `${sslLive}/.`, destLive], 'Copying the certificates');
       }
-      if (await pathExists(sslArchiveDir)) {
+      if (await isRealDir(sslArchiveDir)) {
         await fs.mkdir(destArchive, { recursive: true });
-        await run(helpers, 'cp', ['-a', `${sslArchiveDir}/.`, destArchive]);
-      }
-      if (await pathExists(sslRenewal)) {
-        await fs.mkdir(`/etc/letsencrypt/renewal`, { recursive: true });
-        await run(helpers, 'cp', ['--', sslRenewal, destRenewal]);
+        await mustRun(helpers, 'cp', ['-a', `${sslArchiveDir}/.`, destArchive], 'Copying the certificates');
       }
 
       // Set correct permissions: dirs 700 (traversable), files 600.
@@ -266,16 +290,15 @@ export async function runRestoreFromLocal(job, helpers, {
         await run(helpers, 'find', [destArchive, '-type', 'f', '-exec', 'chmod', '600', '{}', ';']);
       }
 
-      // Wire the SSL nginx config (pointing at copied cert paths).
-      if (await pathExists(sslConf)) {
-        const destConf = `${siteDir}/conf/nginx/ssl.conf`;
-        await fs.mkdir(`${siteDir}/conf/nginx`, { recursive: true });
-        await run(helpers, 'cp', ['--', sslConf, destConf]);
-        ok('SSL nginx config restored');
+      // Wire HTTPS to the copied cert (backup → nginx -t → rollback). A bad or
+      // missing cert must not cost the restored site: warn and serve HTTP.
+      try {
+        await applySslConf(helpers, domain);
+        ok('SSL certificates restored');
+        warn('The copied certificate will not renew automatically. Once this domain\'s DNS points here, re-issue HTTPS from the site page to get an auto-renewing certificate.');
+      } catch {
+        warn('The archived certificate could not be enabled — the site is restored on HTTP. Issue HTTPS from the site page.');
       }
-
-      ok('SSL certificates restored');
-      warn('The copied certificate will not renew automatically. Once this domain\'s DNS points here, re-issue HTTPS from the site page to get an auto-renewing certificate.');
     } else if (issueSsl) {
       step('Issue SSL certificate');
       const sslR = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });

@@ -101,13 +101,20 @@ run() {
 # then dies with "Could not get lock ... held by process N (unattended-upgr)".
 # Stop those timers/services so they can't re-grab the lock during provisioning,
 # then wait for any in-flight run to release it. Call before every apt step.
+# Lock holders via fuser (psmisc); minimal images may lack it, so fall back to
+# the apt/dpkg process names rather than silently treating the lock as free.
+apt_busy() {
+  if command -v fuser >/dev/null 2>&1; then
+    fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1
+  else
+    pgrep -x '(apt|apt-get|dpkg|unattended-upgr)' >/dev/null 2>&1
+  fi
+}
 apt_wait() {
   systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
   systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service >/dev/null 2>&1 || true
   local waited=0
-  # `fuser` returns non-zero (or 127 if absent) when the lock is free → loop ends.
-  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
-     || fuser /var/lib/apt/lists/lock     >/dev/null 2>&1; do
+  while apt_busy; do
     if [ "$waited" -ge 300 ]; then
       warn "dpkg/apt lock still held after 5m — proceeding anyway."
       break
@@ -170,11 +177,16 @@ if [ -n "$PROVISION_ID" ] && [ -n "${ENROLL_URL:-}" ] && [ -n "${ENROLL_TOKEN:-}
   PORTAL_ORIGIN=$(printf '%s' "$ENROLL_URL" | sed -E 's#/api/enroll/?$##')
   PROVISION_NAME=$(hostname 2>/dev/null || echo server)
 
+  # The enroll token goes in a header FILE (mktemp → 0600), never on curl's
+  # argv where any local user could read it from `ps` for its 60-minute life.
+  AUTH_HDR=$(mktemp)
+  printf 'Authorization: Bearer %s\n' "$ENROLL_TOKEN" > "$AUTH_HDR"
+
   # Real milestone poster (replaces the early no-op stub).
   provision_event() { # $1=status $2=step $3=step_no $4=step_total
     [ -n "$PORTAL_ORIGIN" ] || return 0
     curl -4 -fsS -m 8 -X POST "$PORTAL_ORIGIN/api/provision/$PROVISION_ID/log" \
-      -H "Authorization: Bearer $ENROLL_TOKEN" -H "X-Name: $PROVISION_NAME" \
+      -H @"$AUTH_HDR" -H "X-Name: $PROVISION_NAME" \
       ${1:+-H "X-Status: $1"} ${2:+-H "X-Step: $2"} ${3:+-H "X-Step-No: $3"} ${4:+-H "X-Step-Total: $4"} \
       >/dev/null 2>&1 || true
   }
@@ -188,10 +200,12 @@ if [ -n "$PROVISION_ID" ] && [ -n "${ENROLL_URL:-}" ] && [ -n "${ENROLL_TOKEN:-}
     while true; do
       sz=$(wc -c < "$PROVISION_LOG" 2>/dev/null || echo 0)
       if [ "${sz:-0}" -gt "$off" ]; then
-        if tail -c +$((off + 1)) "$PROVISION_LOG" 2>/dev/null \
+        # Send exactly bytes (off, sz] — the file keeps growing while we read,
+        # and sending past sz then advancing to sz would re-send that tail.
+        if tail -c +$((off + 1)) "$PROVISION_LOG" 2>/dev/null | head -c $((sz - off)) \
              | sed "s/${ESC}\[[0-9;?]*[A-Za-z]//g" | tr -d '\r' \
              | curl -4 -fsS -m 8 -X POST "$PORTAL_ORIGIN/api/provision/$PROVISION_ID/log" \
-                 -H "Authorization: Bearer $ENROLL_TOKEN" -H 'Content-Type: text/plain' \
+                 -H @"$AUTH_HDR" -H 'Content-Type: text/plain' \
                  --data-binary @- >/dev/null 2>&1; then
           off=$sz
         fi
@@ -202,8 +216,9 @@ if [ -n "$PROVISION_ID" ] && [ -n "${ENROLL_URL:-}" ] && [ -n "${ENROLL_TOKEN:-}
 
   # Mirror stdout+stderr into that file (console still shows everything).
   exec > >(tee -a "$PROVISION_LOG") 2>&1
-  # On exit: let the final chunk flush, then stop the uploader.
-  trap 'sleep 4; [ -n "$UPLOADER_PID" ] && kill "$UPLOADER_PID" 2>/dev/null; :' EXIT
+  # On exit: let the final chunk flush, stop the uploader, and remove the local
+  # log copy + header file (install output and the enroll token).
+  trap 'sleep 4; [ -n "$UPLOADER_PID" ] && kill "$UPLOADER_PID" 2>/dev/null; rm -f "$PROVISION_LOG" "$AUTH_HDR"; :' EXIT
   provision_event running "Starting install" 0 "$STEP_TOTAL"
 fi
 
@@ -221,7 +236,9 @@ step "Fetching agent source"
 REPO="${REPO:-https://github.com/henryberlin47/wcloud-agent.git}"
 if ! command -v git >/dev/null 2>&1; then
   info "Installing git..."
-  apt-get update -qq && apt-get install -y -qq git || die "Could not install git (needed to fetch the agent)."
+  apt_wait # first apt call of the run — a fresh box's unattended-upgrades holds the lock
+  apt-get update -qq </dev/null && apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold git </dev/null \
+    || die "Could not install git (needed to fetch the agent)."
 fi
 if [ -d /opt/wcloud/.git ]; then
   info "Updating existing agent checkout..."
@@ -249,7 +266,9 @@ if command -v wo >/dev/null 2>&1; then
   ok "WordOps already installed ($(wo --version 2>/dev/null | head -n1 || echo present)) — skipping."
 else
   info "Downloading WordOps installer (wops.cc)..."
-  if wget -4 -qO /tmp/wo-install wops.cc && bash /tmp/wo-install </dev/null; then
+  # https explicitly: a bare `wops.cc` makes wget start with plain http (then
+  # follow the 301) — an unauthenticated hop that could swap the root installer.
+  if wget -4 -qO /tmp/wo-install https://wops.cc && bash /tmp/wo-install </dev/null; then
     ok "WordOps installed."
   else
     rm -f /tmp/wo-install
@@ -273,7 +292,10 @@ step "Installing WordOps stack"
 # installed" — treat it as fatal and surface WordOps' own log (the portal's
 # provision stream can't see the box, so its "check the log" is otherwise useless).
 apt_wait
-if wo stack install; then
+# </dev/null on every child that might read stdin: under `curl | bash`, bash
+# reads THIS script from stdin as it goes, so a prompting child would swallow
+# the rest of the script (or hang) instead of getting EOF.
+if wo stack install </dev/null; then
   ok "Base stack installed."
 else
   err "wo stack install failed — last lines of /var/log/wo/wordops.log:"
@@ -285,7 +307,7 @@ fi
 step "Installing Redis stack"
 # Redis is the object cache — non-essential, so a redis-only failure warns rather
 # than aborts, but we still surface its log tail so it's diagnosable.
-if wo stack install --redis; then
+if wo stack install --redis </dev/null; then
   ok "Redis stack installed."
 else
   warn "wo stack install --redis returned non-zero — last lines of /var/log/wo/wordops.log:"
@@ -297,7 +319,17 @@ fi
 step "Securing default Nginx vhost"
 
 info "Writing default catch-all vhost..."
-cat >/etc/nginx/sites-available/default <<'EOF'
+# Same contract as the agent's nginx edits: back up, write, `nginx -t`, and
+# restore on failure — a broken default vhost would make every later `nginx -t`
+# (so every SSL/canonical op) fail on this box.
+DEFAULT_VHOST=/etc/nginx/sites-available/default
+DEFAULT_BAK=""
+if [ -f "$DEFAULT_VHOST" ]; then
+  DEFAULT_BAK="$DEFAULT_VHOST.wcloud-bak"
+  cp -p "$DEFAULT_VHOST" "$DEFAULT_BAK"
+fi
+DEFAULT_LINKED=0
+cat >"$DEFAULT_VHOST" <<'EOF'
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -344,7 +376,7 @@ EOF
 
 # Ensure the vhost is actually enabled (WordOps normally symlinks it, but be safe).
 if [ ! -e /etc/nginx/sites-enabled/default ]; then
-  ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+  ln -s "$DEFAULT_VHOST" /etc/nginx/sites-enabled/default && DEFAULT_LINKED=1
 fi
 
 info "Preparing ACME challenge directory..."
@@ -354,6 +386,7 @@ chmod -R 755 /var/www/html/.well-known
 
 info "Testing Nginx configuration..."
 if nginx -t; then
+  [ -n "$DEFAULT_BAK" ] && rm -f "$DEFAULT_BAK"
   if systemctl reload nginx; then
     ok "Default catch-all installed (unknown domains -> 403, ACME allowed)."
   else
@@ -361,8 +394,10 @@ if nginx -t; then
     WARNINGS+=("nginx reload failed after installing default vhost.")
   fi
 else
-  warn "nginx -t failed — default vhost NOT reloaded. Fix config manually."
-  WARNINGS+=("nginx -t failed for the default catch-all vhost.")
+  if [ -n "$DEFAULT_BAK" ]; then mv -f "$DEFAULT_BAK" "$DEFAULT_VHOST"; else rm -f "$DEFAULT_VHOST"; fi
+  [ "$DEFAULT_LINKED" = 1 ] && rm -f /etc/nginx/sites-enabled/default
+  warn "nginx -t failed — the previous default vhost was restored and nothing was reloaded."
+  WARNINGS+=("nginx -t failed for the default catch-all vhost (reverted; unknown domains are not blocked).")
 fi
 
 # ============================================================
@@ -437,9 +472,10 @@ if command -v node >/dev/null 2>&1; then
   ok "Node.js already installed ($(node --version 2>/dev/null))"
 else
   info "Node.js not found — installing Node.js 22.x LTS via NodeSource..."
+  apt_wait
   if curl -4 -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh \
-     && bash /tmp/nodesource_setup.sh \
-     && apt-get install -y nodejs; then
+     && bash /tmp/nodesource_setup.sh </dev/null \
+     && apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold nodejs </dev/null; then
     rm -f /tmp/nodesource_setup.sh
     ok "Node.js installed ($(node --version 2>/dev/null))"
   else
@@ -462,9 +498,25 @@ step "Generating agent configuration"
 AGENT_CONFIG="/opt/wcloud/.env"
 
 if [ -f "$AGENT_CONFIG" ] && [ "${FORCE_REGEN_ENV:-0}" != "1" ]; then
-  ok "Agent configuration already exists at $AGENT_CONFIG — skipping."
+  ok "Agent configuration already exists at $AGENT_CONFIG — keeping its token."
   info "Re-run with FORCE_REGEN_ENV=1 to regenerate."
+  # A re-run from the portal carries a fresh enroll token + provision id. Write
+  # them and drop the .enrolled marker so the restarted agent re-enrolls with
+  # THIS run's id — otherwise it skips enrollment (or retries with the expired
+  # old token) and this run's provisioning card never completes. Re-enrolling is
+  # an idempotent upsert on the portal side.
+  if [ -n "${ENROLL_TOKEN:-}" ]; then
+    # Replace the key, or append it (a .env from before enrollment lacks it).
+    set_env() { grep -q "^$1=" "$AGENT_CONFIG" && sed -i "s|^$1=.*|$1=$2|" "$AGENT_CONFIG" || echo "$1=$2" >> "$AGENT_CONFIG"; }
+    [ -n "${ENROLL_URL:-}" ]   && set_env PORTAL_ENROLL_URL "$ENROLL_URL"
+    set_env ENROLL_TOKEN "$ENROLL_TOKEN"
+    [ -n "${PROVISION_ID:-}" ] && set_env PROVISION_ID "$PROVISION_ID"
+    rm -f /opt/wcloud/.enrolled
+    ok "Enrollment refreshed for this run"
+  fi
 else
+  # A regenerated AGENT_TOKEN is useless to the portal until it re-enrolls.
+  rm -f /opt/wcloud/.enrolled
   [ -f /opt/wcloud/.env.example ] \
     || die "/opt/wcloud/.env.example not found — is the agent repo deployed to /opt/wcloud?"
 
@@ -527,7 +579,8 @@ else
   done
 
   ok "Agent configuration created at $AGENT_CONFIG"
-  info "Generated token: $AGENT_TOKEN"
+  # Never print AGENT_TOKEN: all stdout is streamed into the portal's provision
+  # log (stored in Mongo). The agent delivers it to the portal via enrollment.
   info "Server IP: $SERVER_IP"
   info "Control panel IP: $PORTAL_IP"
 fi

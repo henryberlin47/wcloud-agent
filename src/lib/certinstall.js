@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import config from '../config.js';
-import { run, pathExists, removePath, nginxTest, nginxReload } from './sys.js';
+import { pathExists, removePath, nginxTest, nginxReload } from './sys.js';
 import { logger } from './log.js';
 
 // ============================================================
@@ -44,17 +44,6 @@ export async function writeManualMarker(domain) {
 
 export async function removeManualMarker(domain) {
   await removePath(manualMarkerPath(domain));
-}
-
-// Write fullchain + private key into the site's cert dir (700 dir, 600 files,
-// root:root). Callers must have validated the pair BEFORE this point.
-export async function installCertFiles(helpers, domain, { fullchain, key }) {
-  const dir = certDir(domain);
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const norm = (s) => (s.endsWith('\n') ? s : s + '\n');
-  await fs.writeFile(`${dir}/fullchain.pem`, norm(fullchain), { mode: 0o600 });
-  await fs.writeFile(`${dir}/key.pem`, norm(key), { mode: 0o600 });
-  await run(helpers, 'chown', ['-R', 'root:root', dir]);
 }
 
 // Remove top-level `server { ... }` blocks that listen on 443 (old WordOps
@@ -114,33 +103,56 @@ export const mainVhostPath = (domain) => `/etc/nginx/sites-available/${domain}`;
 // Everything is ONE backup -> nginx -t -> rollback transaction: on failure
 // each touched file returns to its exact prior state, including absence —
 // a cert change can never leave the box with a broken nginx config.
-export async function applySslConf(helpers, domain) {
+//
+// `certs` ({ fullchain, key }, pre-validated by the caller) joins the same
+// transaction: the pair is written 600 root:root into the cert dir, and a
+// chain that passes validation but fails `nginx -t` (e.g. a truncated
+// intermediate) restores the previous working cert instead of destroying it.
+export async function applySslConf(helpers, domain, { certs } = {}) {
   const { ok, err } = logger(helpers);
   const confDir = `${config.wwwDir}/${domain}/conf/nginx`;
   const conf = `${confDir}/ssl.conf`;
   const main = mainVhostPath(domain);
+  const read = async (p) => ((await pathExists(p)) ? fs.readFile(p, 'utf8') : null);
 
   await fs.mkdir(confDir, { recursive: true });
 
-  const edits = []; // { path, before (null = absent), after }
+  const edits = []; // { path, before (null = absent), after, mode }
+  if (certs) {
+    await fs.mkdir(certDir(domain), { recursive: true, mode: 0o700 });
+    const norm = (s) => (s.endsWith('\n') ? s : s + '\n');
+    for (const [p, v] of [[fullchainPath(domain), certs.fullchain], [keyPath(domain), certs.key]]) {
+      edits.push({ path: p, before: await read(p), after: norm(v), mode: 0o600 });
+    }
+  }
   if (await pathExists(main)) {
     const before = await fs.readFile(main, 'utf8');
     const after = stripSslServerBlocks(before); // no-op when no 443 block
-    if (after !== before) edits.push({ path: main, before, after });
+    if (after !== before) edits.push({ path: main, before, after, mode: 0o644 });
   }
-  edits.push({
-    path: conf,
-    before: (await pathExists(conf)) ? await fs.readFile(conf, 'utf8') : null,
-    after: sslConfContent(domain),
-  });
+  edits.push({ path: conf, before: await read(conf), after: sslConfContent(domain), mode: 0o644 });
 
-  for (const e of edits) await fs.writeFile(e.path, e.after, { mode: 0o644 });
-
-  if (!(await nginxTest(helpers))) {
+  const put = async (e, content) => {
+    await fs.writeFile(e.path, content, { mode: e.mode });
+    await fs.chmod(e.path, e.mode); // writeFile's mode only applies on create
+  };
+  const rollback = async () => {
     for (const e of edits) {
       if (e.before === null) await removePath(e.path);
-      else await fs.writeFile(e.path, e.before, { mode: 0o644 });
+      else await put(e, e.before);
     }
+  };
+
+  let valid = false;
+  try {
+    for (const e of edits) await put(e, e.after);
+    valid = await nginxTest(helpers);
+  } catch (e) {
+    await rollback(); // a write that throws midway must not leave half an edit
+    throw e;
+  }
+  if (!valid) {
+    await rollback();
     err('The new HTTPS settings would have made the web server configuration invalid — the previous settings were restored.');
     throw new Error('The new HTTPS settings were rejected by the web server, so the previous settings were restored and nothing was reloaded. The site is unaffected.');
   }

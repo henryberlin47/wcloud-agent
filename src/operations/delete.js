@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import config from '../config.js';
 import {
-  run, pathExists, removePath, findPidsMatching, killPids, sleep,
+  pathExists, removePath, findPidsMatching, killPids, sleep,
   nginxTest, nginxReload, systemctl, woSiteDelete, woSiteExists,
 } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
@@ -18,7 +18,7 @@ import { clearChallenge } from '../lib/acmedns.js';
 
 // params: { domain }   (confirm:true is enforced in validate())
 export async function runDelete(job, helpers, p, opts = {}) {
-  const { log, step, info, ok, warn, err } = logger(helpers, opts);
+  const { step, info, ok, warn, err, done } = logger(helpers, opts);
   const domain = p.domain;
 
   const SITE_DIR = `${config.wwwDir}/${domain}`;
@@ -61,7 +61,7 @@ export async function runDelete(job, helpers, p, opts = {}) {
   step('Remove the site from this server');
   const existedBefore = await woSiteExists(helpers, domain);
   if (existedBefore) {
-    const res = await woSiteDelete(helpers, domain);
+    await woSiteDelete(helpers, domain);
     // Verify it's actually gone from WordOps' registry.
     const stillThere = await woSiteExists(helpers, domain);
     if (stillThere) {

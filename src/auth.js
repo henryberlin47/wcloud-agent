@@ -14,10 +14,13 @@ function safeEqual(a, b) {
 }
 
 // Resolve the client IP, honouring X-Forwarded-For only when explicitly trusted.
+// Take the RIGHTMOST hop: proxies append the address they saw, so the leftmost
+// entries are whatever the client sent (`X-Forwarded-For: <portal IP>` would
+// otherwise walk straight past the allowlist). Assumes one trusted proxy hop.
 export function clientIp(req) {
   if (config.trustProxy) {
     const xff = req.headers['x-forwarded-for'];
-    if (xff) return String(xff).split(',')[0].trim();
+    if (xff) return String(xff).split(',').pop().trim();
   }
   // req.socket.remoteAddress may be IPv6-mapped IPv4 (::ffff:1.2.3.4)
   let ip = req.socket?.remoteAddress || '';

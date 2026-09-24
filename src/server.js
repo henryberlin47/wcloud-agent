@@ -51,9 +51,6 @@ enforceAdminPanelCert().catch((e) => console.error('[agent] panel-cert enforce f
 const app = express();
 app.disable('x-powered-by');
 if (config.trustProxy) app.set('trust proxy', true);
-// 256kb: a pasted custom cert+key pair (up to 60KB each, see the ssl op) plus
-// JSON overhead must fit in the authenticated body.
-app.use(express.json({ limit: '256kb' }));
 
 // --- health (unauthenticated, minimal) --------------------------------------
 // Useful for the panel to see the server is up before auth. Reveals nothing.
@@ -77,8 +74,13 @@ app.get('/api/export/:token', async (req, res) => {
 
 // Everything below requires auth + passes the IP allowlist.
 app.use(requireAuth);
+// Parse bodies only AFTER auth: unauthenticated callers must not make us parse
+// 256kb payloads (or reach the error handler with malformed JSON). 256kb: a
+// pasted custom cert+key pair (up to 60KB each, see the ssl op) plus JSON
+// overhead must fit in the authenticated body.
+app.use(express.json({ limit: '256kb' }));
 
-const NOOP_HELPERS = { log: () => {}, err: () => {}, onCancel: () => {} };
+const NOOP_HELPERS = { log: () => {}, err: () => {} };
 
 // The git checkout this server.js runs from (src/..). On managed servers that's
 // /opt/wcloud; derived from the file location so it also works elsewhere.
@@ -419,25 +421,44 @@ app.get('/api/sites/:domain/ssl-challenge', async (req, res) => {
 // in this process, so it fires after the response has flushed even though the
 // restart SIGTERMs us. Runs as root, so the origin/branch are hardcoded —
 // nothing from the request body ever reaches a shell.
+let selfUpdating = false;
 app.post('/api/self-update', async (req, res) => {
-  const helpers = NOOP_HELPERS;
-  const git = (args, timeout = 120000) =>
-    run(helpers, 'git', args, { cwd: REPO_ROOT, quiet: true, timeout });
-  const tail = (r) => (r.stderr || r.stdout || '').trim().split('\n').slice(-3).join(' | ');
+  // The restart stops everything in the unit — a restore/delete/import would be
+  // cut off mid-way (wo, mysql, tar killed). ponytail: a job enqueued during the
+  // git/npm window can still be cut; recheck before restart if that ever bites.
+  if (listJobs().some((j) => j.state === 'queued' || j.state === 'running')) {
+    return res.status(409).json({ ok: false, error: 'An operation is running on this server — update once it finishes.' });
+  }
+  if (selfUpdating) return res.status(409).json({ ok: false, error: 'An update is already in progress.' });
+  selfUpdating = true;
+  try {
+    const helpers = NOOP_HELPERS;
+    const git = (args, timeout = 120000) =>
+      run(helpers, 'git', args, { cwd: REPO_ROOT, quiet: true, timeout });
+    const tail = (r) => (r.stderr || r.stdout || '').trim().split('\n').slice(-3).join(' | ');
 
-  const before = await git(['rev-parse', '--short', 'HEAD'], 10000);
-  if (before.code !== 0) return res.status(500).json({ ok: false, error: `not a git checkout: ${tail(before)}` });
-  const fetchR = await git(['fetch', 'origin']);
-  if (fetchR.code !== 0) return res.status(500).json({ ok: false, error: `git fetch failed: ${tail(fetchR)}` });
-  const reset = await git(['reset', '--hard', 'origin/main']);
-  if (reset.code !== 0) return res.status(500).json({ ok: false, error: `git reset failed: ${tail(reset)}` });
-  const after = (await git(['rev-parse', '--short', 'HEAD'], 10000)).stdout.trim();
-  const inst = await run(helpers, 'npm', ['install', '--omit=dev', '--no-audit', '--no-fund'],
-    { cwd: REPO_ROOT, quiet: true, timeout: 300000 });
-  if (inst.code !== 0) return res.status(500).json({ ok: false, error: `npm install failed: ${tail(inst)}` });
+    const before = await git(['rev-parse', 'HEAD'], 10000);
+    if (before.code !== 0) return res.status(500).json({ ok: false, error: `not a git checkout: ${tail(before)}` });
+    const beforeSha = before.stdout.trim();
+    const fetchR = await git(['fetch', 'origin']);
+    if (fetchR.code !== 0) return res.status(500).json({ ok: false, error: `git fetch failed: ${tail(fetchR)}` });
+    const reset = await git(['reset', '--hard', 'origin/main']);
+    if (reset.code !== 0) return res.status(500).json({ ok: false, error: `git reset failed: ${tail(reset)}` });
+    const after = (await git(['rev-parse', '--short', 'HEAD'], 10000)).stdout.trim();
+    const inst = await run(helpers, 'npm', ['install', '--omit=dev', '--no-audit', '--no-fund'],
+      { cwd: REPO_ROOT, quiet: true, timeout: 300000 });
+    if (inst.code !== 0) {
+      // New code + old deps would crash-loop on the next restart/reboot — and a
+      // down agent can't be self-updated again. Put the old code back.
+      await git(['reset', '--hard', beforeSha]);
+      return res.status(500).json({ ok: false, error: `npm install failed (update rolled back): ${tail(inst)}` });
+    }
 
-  const version = JSON.parse(readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8')).version;
-  res.json({ ok: true, updated: before.stdout.trim() !== after, old_commit: before.stdout.trim(), new_commit: after, version });
+    const version = JSON.parse(readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8')).version;
+    res.json({ ok: true, updated: !beforeSha.startsWith(after), old_commit: beforeSha.slice(0, 7), new_commit: after, version });
+  } finally {
+    selfUpdating = false;
+  }
   // Detached: the transient unit (and its 2s delay) lives under systemd, not us.
   try {
     spawn('systemd-run', ['--on-active=2', 'systemctl', 'restart', 'wcloud'], { detached: true, stdio: 'ignore' }).unref();
