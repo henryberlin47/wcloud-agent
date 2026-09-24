@@ -1,5 +1,8 @@
-import { wpCli, resolveWpRoot, systemctl, nginxTest, nginxReload, getPhpVersion } from '../lib/sys.js';
+import { systemctl } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
+import { requireSpec } from '../lib/sites.js';
+import { wpCli } from '../lib/wp.js';
+import { fpmService } from '../lib/stack.js';
 
 // ============================================================
 //  update — update WordPress core on an existing site
@@ -7,21 +10,22 @@ import { logger } from '../lib/log.js';
 // Three steps:
 //   1) wp core update                    (upgrade WP files)
 //   2) wp core update-db                (run DB migrations if needed)
-//   3) restart php-fpm + reload nginx   (clear OPcache, apply new config)
+//   3) reload the site's PHP-FPM        (clears OPcache)
 // ============================================================
 
 export async function runUpdate(job, helpers, p) {
   const { step, ok, warn, err, done } = logger(helpers);
   const domain = p.domain;
 
-  const wpRoot = await resolveWpRoot(domain);
+  const s = await requireSpec(domain);
+  if (s.type !== 'wordpress') throw new Error(`${domain} is a static site — there's no WordPress to update.`);
 
   // Verify WordPress installation exists before attempting update
   step('Check the WordPress installation');
-  const wp = wpCli(helpers, wpRoot);
+  const wp = await wpCli(helpers, s);
   const versionCheck = await wp(['core', 'version']);
   if (versionCheck.code !== 0) {
-    err(`WordPress not found or not properly installed at ${wpRoot}`);
+    err('WordPress is not installed correctly on this site');
     throw new Error(`WordPress installation invalid for ${domain}`);
   }
   ok('WordPress installation looks healthy');
@@ -45,17 +49,10 @@ export async function runUpdate(job, helpers, p) {
     ok('Database schema updated');
   }
 
-  // 3) Restart php-fpm + reload nginx.
-  step('Restart the site so changes take effect');
-  const php = getPhpVersion();
-  await systemctl(helpers, 'restart', php.service);
-  if (await nginxTest(helpers)) {
-    await nginxReload(helpers);
-    ok('Web server reloaded');
-  } else {
-    err('The web server configuration is invalid, so it was not reloaded. The site keeps running on its previous configuration.');
-    throw new Error(`nginx validation failed for ${domain}`);
-  }
+  // 3) Fresh code must not be served from OPcache. Reload is graceful.
+  step('Reload PHP so the new code is used');
+  await systemctl(helpers, 'reload', fpmService(s.php));
+  ok(`PHP ${s.php} reloaded`);
 
   done(`WordPress is up to date — ${domain}`);
 }

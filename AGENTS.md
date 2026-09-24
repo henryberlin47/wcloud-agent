@@ -11,7 +11,11 @@
 The per-server half of **wcloud** (a WordPress multi-site manager). The control
 panel (`wcloud-portal`, a separate repo) never touches servers directly — it calls
 this **agent** over HTTP with a bearer token. The agent is the only thing that runs
-privileged commands (`wo`, nginx, systemctl, wp-cli). See `wcloud-portal/AGENTS.md`
+privileged commands (nginx, php-fpm, MariaDB, systemctl, wp-cli, acme.sh). It
+**owns the web stack**: `init.sh` installs it, and every per-site piece (system
+user, PHP-FPM pool, nginx vhost, database, Redis login, certificate) is created
+and rendered by the agent from one spec file per site (§6). There is no WordOps
+or other panel underneath. See `wcloud-portal/AGENTS.md`
 for the portal side and the full two-repo picture.
 
 A small Express app. Returns a **job ID** immediately for operations and streams
@@ -40,11 +44,16 @@ as the source of truth for writing code** — the graph is only a map.
   the allowlist must contain the portal's *egress* IP or every `/api/*` call 403s
   while `/healthz` still succeeds (looks "online" but details fail).
 - `GET /api/info` — system info (memory, disk, CPU load, software stack, OS/kernel,
-  uptime) + `version` + supported operations. Gathered by shelling out; each probe
+  uptime) + `version` + supported operations. `php` is every installed version
+  with its FPM status; `phpOffered`/`phpDefault` say what a site can pick. Gathered by shelling out; each probe
   can carry a `timeout` (see §5) so a hanging tool can't stall the whole response.
-- `GET /api/sites` — `{ server, count, sites: [...] }` via `woSiteList`.
-- `GET /api/sites/:domain/credentials` — DB creds read **live** from `wp-config.php`
-  (see §6). 404 = not a readable WP site.
+- `GET /api/sites` — `{ server, count, sites: [domain], details: [publicSpec] }`,
+  read from the site specs (`/etc/wcloud/sites/*.json`).
+- `GET /api/sites/:domain` — the site's settings (`publicSpec`: `type`, `php`,
+  `enableWww`, `canonical`, `ssl`, `created_at`). 404 = not a site here. All
+  `/api/sites/:domain/*` routes resolve the spec first (`siteParam`).
+- `GET /api/sites/:domain/credentials` — DB creds read **live** from `wp-config.php`.
+  404 = not a readable WP site.
 - `GET /api/sites/:domain/wp` — WordPress core version, read **live** via
   `wp core version` (`src/lib/wpinfo.js`). 404 = not a readable WP install.
 - `GET /api/sites/:domain/ssl` — live SSL state, parsed **on demand** from the cert
@@ -77,9 +86,10 @@ Each descriptor has:
   against `DOMAIN_RE`. Never let unvalidated input reach a command.
 - `run(job, helpers, clean)` — the work.
 
-Current ops: **deploy** (`wo site create --wp` + HTTPS: Let's Encrypt via `issueSsl`, or the user's own `cert`+`key` — checked by `lib/certcheck.js` BEFORE the site is created, then installed with `applySslConf({certs})`),
-**update** (`wp core update` + `update-db` + php-fpm restart), **delete** (removes
-site, nginx, certs; requires `confirm:true`), **ssl** (mode-driven, below),
+Current ops: **deploy** (`type` wordpress|static + `php` → `sites.createSite`, then HTTPS: Let's Encrypt via `issueSsl` (`acme.issueHttp`), or the user's own `cert`+`key` — checked by `lib/certcheck.js` BEFORE the site is created, then installed with `applySslConf({certs})`),
+**php** (switch a site's PHP version: installs it on demand, moves the pool),
+**update** (`wp core update` + `update-db` + php-fpm reload), **delete** (custom
+cron/procs/locks, then `sites.deleteSite`; requires `confirm:true`), **ssl** (mode-driven, below),
 **sslDnsVerify** (step 2 of manual DNS-01, below),
 **purge** (WP Rocket + object cache), **resetPassword** (`wp user update --user_pass`),
 **export** (builds the archived site; `buildSiteArchive` in `export.js` is the shared
@@ -93,11 +103,13 @@ in params and run with a longer per-op timeout (`AGENT_BACKUP_TIMEOUT_MS`, defau
 syntax.
 
 **ssl — mode-driven (`{ domain, mode, cert?, key? }`)**, never "always issue":
-- `off` — removes the port-443 config (per-site `conf/nginx/ssl.conf` and/or a 443
-  `server` block in the main vhost), **keeps the certs on disk**, and only reloads
-  if `nginx -t` passes (backup → edit → `nginx -t` → rollback, the setCanonical
-  contract). No dangling `ssl_certificate` without a `listen 443`.
-- `le-http` — `wo site update <domain> --le --force` (HTTP-01, auto-renews).
+- `off` — `spec.ssl = false` and re-apply: the vhost is rendered without the 443
+  server, **the certs stay on disk** (turning HTTPS back on is instant).
+- `le-http` — `acme.issueHttp`: acme.sh HTTP-01 via the shared webroot
+  `/var/www/html` (every vhost serves `/.well-known/acme-challenge/` from it, even
+  when redirecting to HTTPS), `--install-cert` with a `--reloadcmd` so acme.sh's
+  cron renews in place. www is included when served; if www fails (no DNS yet)
+  it retries for the bare domain.
 - `le-dns-manual` — **step 1 of the two-step manual DNS-01 flow** (provider-
   independent, for domains behind Cloudflare/proxies where HTTP-01 can't reach
   the origin): `acme.sh --issue --dns -d D --force --yes-I-know...` prints the TXT
@@ -114,7 +126,7 @@ syntax.
   arrive in the authenticated body only, the key is written `600 root:root`, and
   neither is ever logged or echoed (job views redact both).
 
-**Manual DNS-01 state machine** — `src/lib/acmedns.js` owns it. acme.sh clears
+**Manual DNS-01 state machine** — `src/lib/acme.js` owns it. acme.sh clears
 `Le_Vlist` (the saved ACME order) after *every* verification attempt, and a lost
 vlist means a new order = a new TXT the user must re-add. So the agent captures
 the vlist at step 1 and **restores it into the domain conf before every verify**
@@ -128,19 +140,12 @@ retries); any other failure → hard fail, state cleared. The resulting cert is
 flagged by the `.wcloud-ssl-manual` marker → `source: letsencrypt-manual`,
 `auto_renew: false` in the live status.
 
-**Cert/nginx wiring** — `src/lib/certinstall.js` owns it: all certs (LE, custom,
-manual-DNS) live at `/etc/letsencrypt/live/<domain>/` (`fullchain.pem`, `key.pem`)
-so every consumer stays path-stable; `applySslConf` writes `conf/nginx/ssl.conf`
-(bare directives — WordOps includes `conf/nginx/*.conf` *inside* the server block),
-`nginx -t`, reload, rolling back on failure. Port 443 must come from **only**
-ssl.conf: `applySslConf` first strips any 443 `server` block still in the main
-vhost (`stripSslServerBlocks` — old WordOps layout, where both vhosts live in
-`sites-available/<domain>`; left in place, the bare `listen 443` included into
-that block fails `nginx -t` with "duplicate listen"). Main-vhost strip and
-ssl.conf write are ONE transaction: each touched file rolls back to its exact
-prior state, *including absence* (a never-existing ssl.conf is deleted, not
-left behind, on failure). `src/lib/certinfo.js` reads the live state (issuer →
-source; a `.wcloud-ssl-manual` marker flags non-renewing manual-DNS certs).
+**Cert/nginx wiring** — all certs (LE, custom, manual-DNS) live at
+`/etc/letsencrypt/live/<domain>/` (`fullchain.pem`, `key.pem`, `sites.certDir`).
+`sites.applySslConf(helpers, domain, {certs?})` = `applySite` with `ssl: true`
+(+ the cert pair joins the same transaction, §6). `src/lib/certinfo.js` reads
+the live state: `enabled` = the spec's `ssl` flag, `source` from the issuer (a
+`.wcloud-ssl-manual` marker flags non-renewing manual-DNS certs).
 
 **Log format** — ops use `logger(helpers)` (`src/lib/log.js`). Commands are silent
 on success and dump `$ cmd` + last 15 lines only on failure. Output reads like a
@@ -158,12 +163,20 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   hostname, version, provision_id }` to the portal's `/api/enroll` (a few retries,
   best-effort — never blocks serving). Writes `.enrolled` on success so it enrolls
   once. To re-provision: delete `/opt/wcloud/.enrolled`.
-- `init.sh` — the one-shot bootstrap the install command runs. It: clones/pulls the
-  repo to `/opt/wcloud`; installs WordOps + Node + the agent; **seeds a git
-  identity** (WordOps' `wo` prompts for one and would hang non-interactively —
-  see §8); writes `.env` (token, host, allowlist from `ALLOWED_IPS`, enroll vars);
+- `init.sh` — the one-shot bootstrap the install command runs (Ubuntu 22.04 /
+  24.04 only — checked in preflight). It: clones/pulls the repo to `/opt/wcloud`;
+  installs the stack — distro nginx / MariaDB / Redis, PHP `DEFAULT_PHP` from
+  the ondrej/php PPA (other versions are installed on demand by the agent),
+  WP-CLI, acme.sh at `/etc/letsencrypt` with Let's Encrypt as default CA and its
+  renewal cron; writes our own `nginx.conf` + a catch-all default vhost (unknown
+  hosts get 444; self-signed cert for TLS), sizes MariaDB's buffer pool to RAM,
+  turns Redis' passwordless default user off (ACL file + a root-only admin
+  password in `/etc/wcloud/redis-admin.pass`, `databases 1024`); then Node + the
+  agent. Writes `.env` (token, host, allowlist from `ALLOWED_IPS`, enroll vars)
   and **streams its own stdout** to the portal's `/api/provision/:pid/log` (ANSI
   stripped) with per-step milestones. Each run mints its own `PROVISION_ID`.
+  Safe to re-run on a live server (config is backed up / kept, nginx changes are
+  `nginx -t`-gated).
 
 `config.version` is read from `package.json` at startup and surfaced in
 `/healthz`, `/api/info`, and the enroll payload.
@@ -174,16 +187,23 @@ Driven by env the portal's install command injects (`init.sh` writes them to
 
 - **sys.js** — the OS-touching core. `run(helpers, cmd, args, opts)` spawns without
   a shell, returns `{ code, stdout, stderr }`, never throws on non-zero. `opts`:
-  `cwd, env, stdin, quiet, verbose, asUser` (`sudo -u <user> -H`), and **`timeout`**
-  (SIGKILLs and resolves `{code:-1}` — use it on probes that might hang). Also
-  `wpCli(helpers, srcDir)` (runs `php /usr/local/bin/wp` as `www-data`),
-  `resolveWpRoot(domain)`, `woSiteList`, `woSiteExists`, nginx helpers.
-- **credentials.js** — `readDbCredentials(helpers, domain)`: reads DB_NAME/USER/
-  PASSWORD live via `wp config get`. No cache, no storage. Has a path-traversal
-  guard on the domain.
-- **certinfo.js / certinstall.js** — live SSL state + cert/nginx wiring (see §3
-  "ssl"). Disk is the source of truth; nothing per-site is stored.
-- **acmedns.js** — the manual DNS-01 two-step flow + its state file (see §3).
+  `cwd, env, stdin, quiet, verbose, as` (`{uid, gid, home}` — run as a site user
+  with a **clean env**, never the agent's), and **`timeout`** (kills and resolves
+  `{code:-1}` — use it on probes that might hang). Also `userIds(name)`,
+  `certCovers`, nginx/systemctl helpers.
+- **sites.js** — the site model (§6): spec store (`readSpec`/`listSites`),
+  `renderVhost`/`renderPool`, `applySite` (the transaction), `createSite`,
+  `deleteSite`, `applySslConf`, `syncWpAddress`.
+- **stack.js** — shared services: `PHP_VERSIONS`/`DEFAULT_PHP`, `ensurePhp`
+  (apt install on demand), MariaDB `createDatabase`/`dropDatabase` (SQL on
+  stdin), Redis `createRedisUser`/`dropRedisUser`.
+- **wp.js** — WordPress on a site: `wpCli(helpers, spec)` (as the site user, with
+  the site's PHP), `setupWordPress` (DB, Redis login, generated `wp-config.php`,
+  core download + install), `pinWpUrls`, `clearWpCaches`, `readWpVersion`,
+  `readDbCredentials` (live via `wp config get`; nothing stored).
+- **acme.js** — Let's Encrypt via acme.sh: `issueHttp` (auto-renewing HTTP-01)
+  and the manual DNS-01 two-step flow + its state file (see §3).
+- **certinfo.js** — live SSL state (see §3 "ssl").
 - **spaces.js** — DigitalOcean Spaces (S3) transfers via `@aws-sdk/client-s3`:
   `uploadFile` (multipart through lib-storage's `Upload`, so archives past S3's
   5GB single-PUT limit work), `downloadFile`, `putObject`, `deleteObject`,
@@ -197,22 +217,47 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   `AggregateError` whose own message is just `"AggregateError"` (Node races IPv6
   and IPv4), so the real code lives in `.errors`/`.cause`.
 - **certcheck.js** — `checkCustomCert(domain, cert, key, {www})`: in-memory (Node crypto) validation of a user certificate — PEM parses, key matches, `checkHost` covers the domain, not expired/not-yet-valid; www-coverage and self-signed are warnings. Shared by the ssl op (custom) and deploy. The portal runs the same rules (`server/utils/certcheck.ts`) for its live form check.
-- **wpinfo.js** — live WordPress core version (`wp core version`), nothing stored.
-- **panelcert.js** — pins the `:22222` WordOps panel to its self-signed cert and
-  locks it, so it can't be repointed at a deletable site cert. Called at startup.
 - **log.js** — the step logger used by operations.
 
 ---
 
-## 6. `resolveWpRoot` — WordOps layout (easy to get wrong)
+## 6. The site model (`src/lib/sites.js`) — read before touching a site
 
-WordOps puts the WordPress **core** in `<domain>/htdocs/` but keeps `wp-config.php`
-**one level above** it. wp-cli's `--path` / cwd must point at the *core*
-(`wp-load.php`), and wp-cli finds the config by walking up on its own. Detecting the
-root by `wp-config.php` wrongly picks the parent dir → wp-cli reports "not a
-WordPress installation". `resolveWpRoot` therefore probes **`wp-load.php`**, not
-`wp-config.php`. All wp-cli ops (update, purge, resetPassword, credentials) depend
-on this.
+**`/etc/wcloud/sites/<domain>.json` is the source of truth** (root 0600):
+`{ domain, type, php, user, enableWww, canonical, ssl, redisDb, created_at }`.
+The nginx vhost (`/etc/nginx/sites-enabled/<d>.conf`) and PHP-FPM pool
+(`/etc/php/<v>/fpm/pool.d/<d>.conf`) are **rendered** from it — never edited in
+place, never parsed back. Every change goes through **`applySite(helpers, spec,
+{certs?, prevPhp?})`**: stage spec + rendered files (+ cert pair), write, `nginx
+-t` + `php-fpm<v> -t`, and on failure restore every file to its exact prior
+state (including absence); services reload only for files that changed. Fix a
+template → re-apply → every site gets it.
+
+Per-site isolation (the point of owning the stack):
+- Own **Linux user** (`example_com`; hashed variant if too long/taken), own
+  **PHP-FPM pool** running as it (`pm = ondemand` — idle sites cost no memory),
+  socket `/run/php/wcloud-<d>.sock` owned `www-data` 0660 (only nginx connects).
+- Layout: `/var/www/<d>` root **0711** (the site can't rename what's inside);
+  `htdocs/` `<user>:www-data` **2750** (nginx reads through the group, other
+  sites can't enter); `wp-config.php` `<user>` 0600, one level above htdocs;
+  `tmp/` 0700 (uploads, sessions, wp-cli cache); `conf/nginx/*.conf` **root-owned**
+  custom rules included in the vhost (a site must never write nginx config —
+  nginx's master runs as root). PHP errors → `/var/log/wcloud/<d>.php.log`
+  (rotated), nginx logs → `/var/log/nginx/<d>.*.log` (root-owned dirs: no
+  symlink tricks against root).
+- Own **database + DB user** (named like the Linux user, random password).
+- Own **Redis login + database** (`redisDb`, 1..1023): may only `SELECT` its own
+  db and touch `<user>:*` keys; `@dangerous` denied except `FLUSHDB` and `INFO`,
+  which the Redis Object Cache plugin needs. `wp-config.php` carries the
+  `WP_REDIS_*` constants, so activating the plugin just works.
+- wp-cli always runs **as the site user with the site's PHP** (`wp.wpCli`).
+
+Site types: `wordpress` (PHP) and `static` (htdocs only, no pool/DB). A new type
+(node, …) = a body in `renderVhost` + its setup in `createSite`. `createSite`
+removes everything it made if any step fails (it calls `deleteSite`, which is
+idempotent). PHP versions are installed on demand (`stack.ensurePhp`); the
+package's `www` pool is replaced by an inert placeholder (it would run as
+www-data, the group that can read every site).
 
 ---
 
@@ -230,34 +275,35 @@ loopback; set to the box's IP to accept portal calls), `AGENT_PORT` (8787),
 
 ## 8. Gotchas / things already learned
 
-- **`wo` hangs without a git identity.** WordOps prompts for a git name/email on
-  first run and on every `wo` invocation until one is set; under systemd/non-tty
-  that blocks forever — which silently hung `/api/info`. `server.js` seeds a git
-  identity at startup, and `init.sh` seeds one before installing WordOps. Keep both.
-- **`run` needs a `timeout` on probes.** A child with no tty (like a prompting tool)
-  can block. `/api/info`'s `wo --version` uses `timeout`.
+- **`run` needs a `timeout` on probes.** A child with no tty can block.
 - **IP allowlist is checked before the token, `/healthz` bypasses it.** A wrong
   allowlist looks like "online but every detail 403s". The allowlist value is the
   portal's *egress* IP (behind Cloudflare ≠ the domain's DNS).
-- **`wo` colorizes output** — strip ANSI before matching (`woSiteList`).
-- **Delete uses `wo site list`, not `wo site info`** for existence (`woSiteExists`):
-  `info` returns nonzero once files are gone though the registry row survives, which
-  made deletes silently skip. Delete passes `--force` to clear orphaned rows.
+- **Never edit a rendered file** (vhost, pool) — change the spec and `applySite`.
+  Hand edits are overwritten on the next change; custom nginx rules belong in
+  `/var/www/<d>/conf/nginx/*.conf`.
+- **A site-user process must never get the agent's env** (AGENT_TOKEN would be
+  readable via /proc by the site) — `run({as})` builds a clean env.
+- **Anything a site can write is untrusted to root**: SQL dumps are handed over
+  through the site's own `tmp/` (wp-cli runs as the site), cache files are
+  deleted as the site user, staging dirs are root-only.
 - **Jobs + install progress are in-memory**; an agent restart forgets jobs. The
   portal is the durable record and reconciles.
 - **Concurrency is 1 on purpose** — deploys touch nginx/php-fpm; parallel runs race.
 - **Cancel/timeout = one AbortSignal per job** (`helpers.signal`). `run()` refuses to
   start once aborted and kills the child's whole **process group** (spawned
-  `detached`; TERM then KILL) — signalling only the direct child left `sudo -u`'s
-  real process running. S3 transfers take `{ signal }` (Upload.abort() also
+  `detached`; TERM then KILL), so grandchildren (php wp …) die too. S3 transfers take `{ signal }` (Upload.abort() also
   aborts the multipart server-side). Cancel ends as CANCELLED, timeout as TIMEOUT.
-- **Secrets never ride argv.** WP passwords go through `wpSetPassword` (wp-cli
-  `--prompt=user_pass` on stdin); argv is world-readable via /proc and sudo logs
-  it. `run()` also masks `--*pass*=` values in its failure dump.
+- **Secrets never ride argv.** WP passwords go through wp-cli `--prompt=…` on
+  stdin; DB/Redis setup is SQL/commands on stdin with the admin password in env;
+  argv is world-readable via /proc. `run()` also masks `--*pass*=` values in its
+  failure dump.
 - **Restore never trusts the archive.** Only real directories are copied out
   (`lstat` — a symlinked `site/htdocs` would copy e.g. /root into the web root);
-  `ssl.conf` is regenerated via `applySslConf`, `renewal.conf` is never restored;
-  tar extracts `--no-same-owner`. In-place restore downloads, decrypts and
+  only `htdocs` + DB + cert files are used (never its nginx conf or a
+  `renewal.conf`); the table prefix must be a plain identifier; type/PHP from
+  `wcloud-site.json` are checked against the allowed lists; tar extracts
+  `--no-same-owner`. In-place restore downloads, decrypts and
   `gzip -t`s the archive BEFORE deleting the live site.
 - **Staging is private.** `makeStagingDir` (`mkdtemp`, 0700); archives are
   pre-created `O_EXCL` 0600 so a DB dump/keys are never world-readable in /tmp.
@@ -275,10 +321,9 @@ src/config.js          env-driven config + version from package.json
 src/enroll.js          self-registration with the portal (§4)
 src/jobs.js            in-memory job queue + SSE
 src/operations/        one file per op + index.js registry (§3)
-src/lib/               sys.js, credentials.js, panelcert.js, log.js,
-                       certinfo.js, certinstall.js, acmedns.js, wpinfo.js (§5)
-src/templates/         nginx snippets (custom-cache.conf)
-init.sh                one-shot server bootstrap (clone, install, enroll, stream) (§4)
+src/lib/               sys.js, sites.js, stack.js, wp.js, acme.js, certinfo.js,
+                       certcheck.js, spaces.js, log.js (§5)
+init.sh                one-shot server bootstrap: stack, agent, enroll, stream (§4)
 wcloud.service         systemd unit
 .env.example           documented env template
 ```
@@ -310,6 +355,6 @@ You are an expert software engineer and technical architect. You write clean, pr
 - Show the minimal diff that fixes the issue.
 
 ## Tech stack awareness
-- Henry runs Vietnamese sports streaming sites on WordOps VPS + Cloudflare + k3s.
+- Henry runs Vietnamese sports streaming sites on VPS (wcloud-managed stack) + Cloudflare + k3s.
 - Primary languages: JavaScript/TypeScript, Node.js, Python.
 - Prefer: pnpm over npm, async/await over callbacks, TypeScript over plain JS.

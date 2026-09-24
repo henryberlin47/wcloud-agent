@@ -1,4 +1,5 @@
-import { run, woSiteExists, removePath } from '../lib/sys.js';
+import { run, removePath } from '../lib/sys.js';
+import { readSpec } from '../lib/sites.js';
 import { logger } from '../lib/log.js';
 import { runRestoreFromLocal, makeStagingDir, prepareArchive } from './import.js';
 import { runDelete } from './delete.js';
@@ -9,8 +10,8 @@ import { downloadFile, explainSpacesError } from '../lib/spaces.js';
 // ============================================================
 // Downloads the backup from Spaces, then runs the SAME restore path the
 // migration import uses (runRestoreFromLocal). In-place restore (site exists)
-// tears it down with the full delete op — cron, procs, wo site (DB included),
-// files, nginx, certs — so the rebuild starts clean. Everything that can fail
+// tears it down with the full delete op — cron, procs, database, files,
+// nginx, PHP pool, certs — so the rebuild starts clean. Everything that can fail
 // for reasons unrelated to the site (download, wrong key, corrupt archive)
 // happens BEFORE that delete, so those failures leave the live site untouched.
 // The portal job also takes a safety backup before enqueueing this op.
@@ -40,7 +41,7 @@ export async function runRestore(job, helpers, p) {
     // In-place restore: destructive by design. Verify the whole gzip stream
     // first (CRC over every byte) so a truncated/corrupt backup can't take
     // the live site down with it. Reuse the delete op wholesale.
-    if (await woSiteExists(helpers, domain)) {
+    if (await readSpec(domain)) {
       step('Verify the backup before replacing the current site');
       const t = await run(helpers, 'gzip', ['-t', `${tmpDir}/export.tar.gz`]);
       if (t.code !== 0) throw new Error('The backup archive is corrupted — the current site was left untouched.');

@@ -1,4 +1,5 @@
-import { wpCli, wpSetPassword, resolveWpRoot } from '../lib/sys.js';
+import { requireSpec } from '../lib/sites.js';
+import { wpCli, wpSetPassword } from '../lib/wp.js';
 import { logger } from '../lib/log.js';
 
 // ============================================================
@@ -16,18 +17,19 @@ export async function runResetPassword(job, helpers, p) {
   const newPassword = p.wp_password;
 
   step('Find the administrator account');
-  const wpRoot = await resolveWpRoot(domain);
-  const wp = wpCli(helpers, wpRoot);
+  const s = await requireSpec(domain);
+  if (s.type !== 'wordpress') throw new Error(`${domain} is a static site — it has no WordPress login.`);
+  const wp = await wpCli(helpers, s);
   const userList = await wp(['user', 'list', '--role=administrator', '--field=user_login']);
   const wpUser = userList.code === 0 ? (userList.stdout.trim().split('\n')[0] || '').trim() : '';
   if (!wpUser) {
-    err(`No administrator user found at ${wpRoot} (code ${userList.code})`);
+    err('No administrator account was found on this site');
     throw new Error(`Could not find a WordPress admin user for ${domain}`);
   }
   ok(`Administrator account: ${wpUser}`);
 
   step('Set the new password');
-  const setPass = await wpSetPassword(helpers, wpRoot, wpUser, newPassword);
+  const setPass = await wpSetPassword(helpers, s, wpUser, newPassword);
   if (setPass.code !== 0) {
     throw new Error(`Failed to set password for ${wpUser} (code ${setPass.code})`);
   }

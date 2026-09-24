@@ -9,6 +9,9 @@ import { runExport } from './export.js';
 import { runImport } from './import.js';
 import { runBackup } from './backup.js';
 import { runRestore } from './restore.js';
+import { runPhp } from './php.js';
+import { SITE_TYPES } from '../lib/sites.js';
+import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
 
 // ============================================================
 //  Operation registry
@@ -72,12 +75,16 @@ function reqSpaces(p, errors) {
 // ============================================================
 const deploy = {
   name: 'deploy',
-  // params: { domain, wp_user?, wp_password?, canonical?: "www"|"root"|"none", enableWww?, issueSsl?, cert?, key? }
+  // params: { domain, type?: "wordpress"|"static", php?, wp_user?, wp_password?, canonical?: "www"|"root"|"none", enableWww?, issueSsl?, cert?, key? }
   // cert + key (PEM) = install the user's own certificate instead of Let's Encrypt.
   validate(p = {}) {
     p = sanitize(p);
     const errors = [];
     reqDomain(errors, 'domain', p.domain);
+    const type = p.type == null ? 'wordpress' : p.type;
+    if (!SITE_TYPES.includes(type)) errors.push(`type must be one of: ${SITE_TYPES.join(', ')}`);
+    const php = p.php == null || p.php === '' ? DEFAULT_PHP : p.php;
+    if (!PHP_VERSIONS.includes(php)) errors.push(`php must be one of: ${PHP_VERSIONS.join(', ')}`);
 
     const cert = typeof p.cert === 'string' ? p.cert.trim() : '';
     const key = typeof p.key === 'string' ? p.key : '';
@@ -90,7 +97,7 @@ const deploy = {
     if (wpUser.length > 60) errors.push('wp_user must be 60 characters or fewer');
     if (wpPassword.length > 200) errors.push('wp_password must be 200 characters or fewer');
     // Optional pair: a lone value without its partner is dropped rather than
-    // erroring — wo needs both --user and --pass together to be meaningful.
+    // erroring — a username without its password (or vice versa) means nothing.
     if (!wpUser || !wpPassword) { wpUser = ''; wpPassword = ''; }
 
     let canonical = (p.canonical === 'www' || p.canonical === 'root' || p.canonical === 'none') ? p.canonical : 'none';
@@ -100,10 +107,28 @@ const deploy = {
     // certificate replaces Let's Encrypt.
     const issueSsl = !cert && p.issueSsl !== false;
 
-    return { ok: errors.length === 0, errors, clean: { domain: p.domain, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww, issueSsl, ...(cert ? { cert, key } : {}) } };
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, type, php, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww, issueSsl, ...(cert ? { cert, key } : {}) } };
   },
   async run(job, helpers, p) {
     await runDeploy(job, helpers, p);
+  },
+};
+
+// ============================================================
+//  php — switch a site to another PHP version
+// ============================================================
+const phpOp = {
+  name: 'php',
+  // params: { domain, php }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    if (!PHP_VERSIONS.includes(p.php)) errors.push(`php must be one of: ${PHP_VERSIONS.join(', ')}`);
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, php: p.php } };
+  },
+  async run(job, helpers, p) {
+    await runPhp(job, helpers, p);
   },
 };
 
@@ -313,7 +338,7 @@ const importOp = {
     // localArchive is copied from and then REMOVED — recursively, as root. It is
     // only ever the agent's own export staging file handed back to us, so pin it
     // to that shape; an unchecked value here is an arbitrary `rm -rf`.
-    const LOCAL_ARCHIVE_RE = /^\/tmp\/wcloud_export_[0-9]+\.tar\.gz(\.enc)?$/;
+    const LOCAL_ARCHIVE_RE = /^\/tmp\/wcloud_export_[A-Za-z0-9]{6}\.tar\.gz(\.enc)?$/; // mkdtemp's 6-char suffix
     if (out.localArchive != null && out.localArchive !== '' && !LOCAL_ARCHIVE_RE.test(String(out.localArchive))) {
       errors.push('localArchive must be an export archive produced by this agent');
     }
@@ -413,7 +438,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { deploy, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { deploy, php: phpOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

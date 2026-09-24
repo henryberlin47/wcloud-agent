@@ -1,5 +1,6 @@
 import { run, pathExists } from './sys.js';
-import { fullchainPath, manualMarkerPath } from './certinstall.js';
+import { fullchainPath, readSpec } from './sites.js';
+import { manualMarkerPath } from './acme.js';
 
 // ============================================================
 //  certinfo.js — read live certificate state
@@ -8,7 +9,7 @@ import { fullchainPath, manualMarkerPath } from './certinstall.js';
 // stored per-site, everything is parsed on demand with openssl.
 //
 // source:      none | letsencrypt | letsencrypt-manual | custom
-// auto_renew:  true only for letsencrypt (a WordOps-issued HTTP-01 cert).
+// auto_renew:  true only for letsencrypt (HTTP-01 via acme.sh, renewed by its cron).
 //              custom + manual-DNS certs lapse silently — the portal shows why.
 
 // Parse subject/issuer/SAN/expiry from a PEM cert (quiet probe).
@@ -52,7 +53,8 @@ export async function readSiteSsl(helpers, domain) {
   const source = isLe ? (manual ? 'letsencrypt-manual' : 'letsencrypt') : 'custom';
   return {
     ...base,
-    enabled: true,
+    // HTTPS turned off keeps the cert on disk (turning it back on is instant).
+    enabled: !!(await readSpec(domain))?.ssl,
     source,
     auto_renew: source === 'letsencrypt',
     issuer: info.issuer,

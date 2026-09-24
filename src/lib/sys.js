@@ -1,24 +1,15 @@
 import { spawn } from 'node:child_process';
 import { X509Certificate } from 'node:crypto';
 import fs from 'node:fs/promises';
-import fssync from 'node:fs';
-import config from '../config.js';
-import { logger } from './log.js';
 
 // ============================================================
 //  sys.js — shared system helpers for native operation logic
 // ============================================================
 // Everything an operation needs to touch the OS: run commands (streaming into
 // the job log), remove files/dirs, kill processes, and thin wrappers around
-// systemctl / nginx / wo. No shells are used (args are arrays), so interpolated
+// systemctl / nginx. No shells are used (args are arrays), so interpolated
 // domain values can never inject shell syntax.
 // ============================================================
-
-// Hard timeouts for `wo` invocations. Defined here (next to the wo wrappers) so
-// the value and the "timed out after Nms" message it produces can never drift —
-// every caller derives both from the same constant.
-export const WO_SITE_TIMEOUT_MS = 300_000; // site create / update --le
-export const WO_LIST_TIMEOUT_MS = 20_000;  // site list (a read; also the /api/sites hang guard)
 
 /**
  * Run a command to completion, streaming stdout/stderr into the job log.
@@ -28,25 +19,26 @@ export const WO_LIST_TIMEOUT_MS = 20_000;  // site list (a read; also the /api/s
  * @param {object} helpers  { log, err, signal }  (signal: the job's AbortSignal)
  * @param {string} command
  * @param {string[]} args
- * @param {object} [opts]   { cwd, env, stdin, quiet, verbose, asUser, timeout }
+ * @param {object} [opts]   { cwd, env, stdin, quiet, verbose, as, timeout }
  *   (default)   → silent while it succeeds; on failure the command line and the
  *                 tail of its output are logged, so a broken step stays
  *                 diagnosable without drowning the job log in normal output.
  *   verbose=true→ echo the command and stream every line live
  *   quiet=true  → never log, even on failure (probes/version checks)
- *   asUser      → run via `sudo -u <user> -H` (for wp-cli as www-data)
+ *   as          → { uid, gid, home }: run as that user (a site's wp-cli). The
+ *                 child gets a clean env — never the agent's, which holds
+ *                 AGENT_TOKEN and would be readable by the site via /proc.
  *   timeout     → hard kill after N ms; resolves with code:-1 and timedOut:true
  */
 export function run(helpers, command, args = [], opts = {}) {
-  const { cwd, env = {}, stdin, quiet = false, verbose = false, asUser, timeout } = opts;
+  const { cwd, env = {}, stdin, quiet = false, verbose = false, as, timeout } = opts;
   const { log, err, signal: jobSignal } = helpers;
 
-  let cmd = command;
-  let cmdArgs = args;
-  if (asUser) {
-    cmd = 'sudo';
-    cmdArgs = ['-u', asUser, '-H', command, ...args];
-  }
+  const cmd = command;
+  const cmdArgs = args;
+  const childEnv = as
+    ? { PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', HOME: as.home, LANG: 'C.UTF-8', ...env }
+    : { ...process.env, ...env };
   // Never echo a secret flag value into the job log (it's served to the portal).
   const shown = () => `$ ${cmd} ${cmdArgs.map((a) => String(a).replace(/^(--[\w-]*pass[\w-]*=).+/i, '$1***')).join(' ')}`;
 
@@ -56,16 +48,18 @@ export function run(helpers, command, args = [], opts = {}) {
 
     if (verbose) log(shown());
     // detached → the child leads its own process group, so a kill reaches every
-    // descendant. Signalling only the direct child left `sudo -u` wrappers' real
-    // process (php wp …) running: sudo can relay SIGTERM but never SIGKILL.
-    const child = spawn(cmd, cmdArgs, { cwd, env: { ...process.env, ...env }, shell: false, detached: true });
+    // descendant (php wp … and anything it spawned).
+    const child = spawn(cmd, cmdArgs, {
+      cwd, env: childEnv, shell: false, detached: true,
+      ...(as ? { uid: as.uid, gid: as.gid } : {}), // libuv also drops root's supplementary groups
+    });
 
     let stdout = '';
     let stderr = '';
     let killed = false;
     let timedOut = false;
 
-    // TERM the whole group (sudo relays it), then KILL whatever ignored it.
+    // TERM the whole group, then KILL whatever ignored it.
     const killTree = () => {
       const sig = (s) => { try { process.kill(-child.pid, s); } catch {} };
       sig('SIGTERM');
@@ -143,37 +137,12 @@ export async function removePath(p) {
   await fs.rm(p, { recursive: true, force: true });
 }
 
-// wp-cli's --path must point at the WordPress CORE (where wp-load.php lives), not
-// at wp-config.php. WordOps puts the core in <domain>/htdocs but keeps
-// wp-config.php one level ABOVE it, so detecting by wp-config would wrongly pick
-// the parent dir (wp-cli then reports "not a WordPress installation"). Detect the
-// core via wp-load.php; wp-cli finds the config by walking up from there.
-export async function resolveWpRoot(domain) {
-  const base = `${config.wwwDir}/${domain}`;
-  if (await pathExists(`${base}/htdocs/wp-load.php`)) return `${base}/htdocs`;
-  if (await pathExists(`${base}/wp-load.php`)) return base;
-  return `${base}/htdocs`; // WordOps default; let wp-cli report the real error
-}
-
-// Detect installed PHP version from /etc/php directories
-export function getPhpVersion() {
-  try {
-    const dirs = fssync.readdirSync('/etc/php');
-    const versions = dirs.filter(d => /^\d+\.\d+$/.test(d));
-    if (!versions.length) throw new Error('no php dirs');
-    // sort numerically major.minor
-    versions.sort((a, b) => {
-      const [aMaj, aMin] = a.split('.').map(Number);
-      const [bMaj, bMin] = b.split('.').map(Number);
-      return (aMaj - bMaj) || (aMin - bMin);
-    });
-    const version = versions[versions.length - 1];
-    const flag = version.replace('.', '');
-    const service = `php${version}-fpm`;
-    return { version, flag, service };
-  } catch {
-    return { version: '8.3', flag: '83', service: 'php8.3-fpm' };
-  }
+// uid/gid/home of a local user, straight from /etc/passwd (no shell-out).
+export async function userIds(name) {
+  const line = (await fs.readFile('/etc/passwd', 'utf8')).split('\n').find((l) => l.startsWith(`${name}:`));
+  if (!line) throw new Error(`The site's system user (${name}) is missing on this server.`);
+  const [, , uid, gid, , home] = line.split(':');
+  return { uid: Number(uid), gid: Number(gid), home };
 }
 
 // --- process management -----------------------------------------------------
@@ -226,278 +195,9 @@ export async function nginxReload(helpers) {
   return systemctl(helpers, 'reload', 'nginx');
 }
 
-// wo site delete <domain> --no-prompt --force ; returns { ok, code }.
-// --force removes the WordOps record even when files/DB are already gone (the
-// agent deletes the site dir first, so paths won't exist by this point).
-// --all is intentionally NOT used: these sites use a remote shared DB, so there
-// is no local WordOps-owned DB to drop.
-export async function woSiteDelete(helpers, domain) {
-  const r = await run(helpers, 'wo', ['site', 'delete', domain, '--no-prompt', '--force'], { stdin: '', timeout: 120000 });
-  return { ok: r.code === 0, code: r.code };
-}
-
-// True if the site is in WordOps' registry. Checks `wo site list` (the same
-// source `wo site list` shows the user), NOT `wo site info` — info returns
-// nonzero once a site's files/nginx config are gone, even while the registry
-// row survives, which made delete skip the row and leave it un-deletable.
-export async function woSiteExists(helpers, domain) {
-  const sites = await woSiteList(helpers).catch(() => null);
-  if (sites === null) return false; // couldn't read the registry — don't guess
-  return sites.includes(domain);
-}
-
-// wo site list ; returns an array of domain strings (one per line).
-// Filters out blank lines and any decorative/header lines wo might print.
-export async function woSiteList(helpers) {
-  const r = await run(helpers, 'wo', ['site', 'list'], { quiet: true, timeout: WO_LIST_TIMEOUT_MS });
-  if (r.code !== 0) {
-    const detail = r.timedOut ? `timed out after ${WO_LIST_TIMEOUT_MS}ms` : `code ${r.code}`;
-    throw new Error(`wo site list failed (${detail})`);
-  }
-  return r.stdout
-    .split('\n')
-    // wo colorizes its output; strip ANSI so exact domain matching works.
-    // eslint-disable-next-line no-control-regex
-    .map((s) => s.replace(/\x1b\[[0-9;]*m/g, '').trim())
-    // keep only plausible domain lines (contain a dot, no spaces)
-    .filter((s) => s && !s.includes(' ') && s.includes('.'));
-}
-
-// --- wp-cli -----------------------------------------------------------------
-
-// Build a wp-cli runner bound to a site's app dir. All wp calls run as www-data.
-//   const wp = wpCli(helpers, '/var/www/example.com');
-//   await wp(['core', 'update']);
-// Override the WP root with opts.wpPath (e.g. for old Acorn: { wpPath: 'web/wp' }).
-// Set a WP user's password without it ever reaching argv — argv is readable by
-// every local user via /proc (incl. any site's PHP) and sudo logs it to
-// auth.log. wp-cli's --prompt reads the field from stdin instead.
-export function wpSetPassword(helpers, wpRoot, user, password) {
-  return wpCli(helpers, wpRoot)(['user', 'update', user, '--prompt=user_pass'], { stdin: `${password}\n` });
-}
-
-export function wpCli(helpers, srcDir, opts = {}) {
-  const { wpPath } = opts;
-  return (args, extra = {}) => {
-    const cliArgs = ['/usr/local/bin/wp', ...args];
-    if (wpPath) cliArgs.push('--path=' + wpPath);
-    return run(helpers, '/usr/bin/php', cliArgs, {
-      cwd: srcDir,
-      asUser: 'www-data',
-      ...opts,
-      ...extra,
-    });
-  };
-}
-
-// WordPress stores its address absolutely (home/siteurl). When that disagrees
-// with what nginx serves, the two bounce the browser between them and the site
-// dies with ERR_TOO_MANY_REDIRECTS:
-//   • scheme — HTTPS enabled but home is still http:// (nginx forces https,
-//     WordPress forces http), or HTTPS turned off while home is https://
-//   • host   — nginx redirects www → non-www while home says www (or vice versa)
-// So WP must be re-pinned whenever either changes: canonical host AND SSL
-// on/off. Omitted parts keep their current value.
-export async function pinWpUrls(helpers, domain, { scheme, host } = {}) {
-  const { ok, warn } = logger(helpers);
-  const wp = wpCli(helpers, await resolveWpRoot(domain));
-  const cur = await wp(['option', 'get', 'home'], { quiet: true, timeout: 60_000 });
-  const m = (cur.stdout || '').trim().match(/^(https?):\/\/([^/]+)/i);
-  if (cur.code !== 0 && !m) {
-    warn('Could not read the WordPress address — skipping (is WordPress installed here?)');
-    return false;
-  }
-  const url = `${scheme || m?.[1] || 'http'}://${host || m?.[2] || domain}`;
-  if (m && `${m[1]}://${m[2]}` === url) return true; // already correct
-
-  let allOk = true;
-  for (const key of ['home', 'siteurl']) {
-    const r = await wp(['option', 'update', key, url], { timeout: 60_000 });
-    if (r.code !== 0) allOk = false;
-  }
-  if (allOk) ok(`WordPress address set to ${url}`);
-  else warn(`Could not update the WordPress address to ${url}. If the site shows a redirect loop, set it manually under Settings → General.`);
-  return allOk;
-}
-
-// Add or remove www.<base> on every `server_name ...;` that lists <base>.
-// Returns { out, changed }; files whose server_name doesn't mention the
-// base come back unchanged.
-export function adjustServerNames(content, base, wwwHost, enableWww) {
-  let changed = false;
-  const out = content.replace(/server_name\s+([^;]+);/g, (m, hosts) => {
-    const list = hosts.trim().split(/\s+/);
-    if (!list.includes(base) && !list.includes(wwwHost)) return m;
-    if (enableWww && !list.includes(wwwHost)) {
-      changed = true;
-      return `server_name ${[...list, wwwHost].join(' ')};`;
-    }
-    if (!enableWww && list.includes(wwwHost)) {
-      const next = list.filter((h) => h !== wwwHost);
-      if (!next.length) return m; // never leave an empty server_name
-      changed = true;
-      return `server_name ${next.join(' ')};`;
-    }
-    return m;
-  });
-  return { out, changed };
-}
-
 // True if the cert file's SANs cover host (exact, or a one-label wildcard) —
 // Node's RFC 6125 matcher, the same one lib/certcheck.js uses. Never throws.
-export async function certCovers(_helpers, certPath, host) {
+export async function certCovers(certPath, host) {
   try { return !!new X509Certificate(await fs.readFile(certPath)).checkHost(String(host).trim().toLowerCase()); }
   catch { return false; }
-}
-
-// Apply the user's domain preferences to a live site.
-//   canonical "www"|"root" → 301 the other variant (conf/nginx/canonical.conf)
-//                            + pin WP home/siteurl to the preferred host
-//   canonical "none"       → delete any prior redirect, leave WP as-is
-//   enableWww true/false   → ensure/remove www.<domain> in the vhost's
-//                            server_name (backup + nginx -t + rollback)
-// Reloads nginx at the end when (and only when) something changed.
-// Read the live domain preference, the same way certinfo reads the live cert:
-// the config on disk is the truth, nothing is stored. Feeds the site page so it
-// can show what is actually configured rather than what was chosen at deploy.
-//   canonical: "www" | "root" | "none"   enableWww: is www.<domain> served at all
-export async function readCanonical(helpers, domain) {
-  const wwwHost = `www.${domain}`;
-  const out = { domain, canonical: 'none', enableWww: false, www_host: wwwHost };
-
-  const conf = `${config.wwwDir}/${domain}/conf/nginx/canonical.conf`;
-  if (await pathExists(conf)) {
-    try {
-      const c = await fs.readFile(conf, 'utf8');
-      // written as: if ($host = <other>) { return 301 <scheme>://<canonical>... }
-      const m = c.match(/return\s+301\s+(?:https?|\$scheme):\/\/([^\s/$]+)/i);
-      if (m) out.canonical = m[1].toLowerCase() === wwwHost ? 'www' : 'root';
-    } catch { /* unreadable → treat as no preference */ }
-  }
-
-  for (const f of [`/etc/nginx/sites-available/${domain}`, `${config.wwwDir}/${domain}/conf/nginx/ssl.conf`]) {
-    if (!(await pathExists(f))) continue;
-    try {
-      const c = await fs.readFile(f, 'utf8');
-      for (const m of c.matchAll(/server_name\s+([^;]+);/g)) {
-        if (m[1].trim().split(/\s+/).includes(wwwHost)) { out.enableWww = true; break; }
-      }
-    } catch { /* ignore */ }
-    if (out.enableWww) break;
-  }
-  return out;
-}
-
-export async function setCanonical(helpers, domain, canonical, enableWww = true) {
-  const { ok, warn, err } = logger(helpers);
-  const wwwHost = `www.${domain}`;
-  const confPath = `${config.wwwDir}/${domain}/conf/nginx/canonical.conf`;
-  let changed = false;
-
-  // 1) Redirect snippet / WP options.
-  if (canonical === 'none') {
-    if (await pathExists(confPath)) {
-      await removePath(confPath);
-      ok(`Removed preferred-domain redirect for ${domain}`);
-      changed = true;
-    } else {
-      ok('No preferred domain — both versions served, no redirect');
-    }
-  } else {
-    const canonicalHost = canonical === 'www' ? wwwHost : domain;
-    const otherHost = canonical === 'www' ? domain : wwwHost;
-    const certPath = `/etc/letsencrypt/live/${domain}/fullchain.pem`;
-    const hasSsl = await pathExists(certPath);
-    if (!hasSsl) warn(`No SSL cert for ${domain} yet — redirect keeps $scheme so http stays http`);
-
-    // WordOps includes conf/nginx/*.conf inside the server { } block, so
-    // if(host) + return is one of nginx's safe-if patterns here.
-    const confDir = `${config.wwwDir}/${domain}/conf/nginx`;
-    await fs.mkdir(confDir, { recursive: true });
-    await fs.writeFile(confPath,
-      `# force canonical host — 301 the other variant, preserve path + query\n` +
-      `if ($host = ${otherHost}) {\n    return 301 ${hasSsl ? 'https' : '$scheme'}://${canonicalHost}$request_uri;\n}\n`);
-    ok(`${otherHost} 301 → ${hasSsl ? 'https' : '$scheme'}://${canonicalHost}`);
-    changed = true;
-
-    // Pin WP home/siteurl to the preferred host (scheme matches cert state)
-    // so WP's own links + redirect backstop agree with nginx.
-    await pinWpUrls(helpers, domain, { scheme: hasSsl ? 'https' : 'http', host: canonicalHost });
-  }
-
-  // 2) www enablement — edit the vhost's server_name. This is the one edit
-  //    that can take a live site down: back up, edit, nginx -t, roll back.
-  //    WordOps' main vhost is /etc/nginx/sites-available/<domain> (same path
-  //    delete.js removes); the port-443 block may live in the per-site
-  //    ssl.conf instead, so probe both. No-op when no file mentions the host.
-  const files = [];
-  for (const f of [`/etc/nginx/sites-available/${domain}`, `${config.wwwDir}/${domain}/conf/nginx/ssl.conf`]) {
-    if (await pathExists(f)) files.push(f);
-  }
-  if (!files.length) {
-    warn(`No nginx vhost found for ${domain} — www ${enableWww ? 'enablement' : 'removal'} skipped; verify the config manually`);
-  }
-  for (const path of files) {
-    const orig = await fs.readFile(path, 'utf8');
-    const { out, changed: c } = adjustServerNames(orig, domain, wwwHost, enableWww);
-    if (!c) continue;
-    const backup = `${path}.wcloud-bak`;
-    await fs.copyFile(path, backup);
-    await fs.writeFile(path, out);
-    if (await nginxTest(helpers)) {
-      await removePath(backup);
-      ok(`${enableWww ? 'Enabled' : 'Removed'} ${wwwHost} in ${path}`);
-      changed = true;
-    } else {
-      await fs.copyFile(backup, path);
-      await removePath(backup);
-      err(`server_name change in ${path} failed nginx -t — rolled back; ${wwwHost} ${enableWww ? 'not enabled' : 'still served'}`);
-    }
-  }
-
-  // 3) Cert coverage: a redirect needs BOTH hosts to pass TLS. If www is
-  //    served but the cert lacks it, re-issue (requires www DNS to resolve).
-  if (canonical !== 'none' && enableWww) {
-    const certPath = `/etc/letsencrypt/live/${domain}/fullchain.pem`;
-    if ((await pathExists(certPath)) && !(await certCovers(helpers, certPath, wwwHost))) {
-      warn(`Cert for ${domain} does not cover ${wwwHost} — re-issuing (needs www DNS to resolve)`);
-      const r = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });
-      if (r.code === 0) { ok(`SSL re-issued to cover ${wwwHost}`); changed = true; }
-      else warn(`Cert re-issue failed — is DNS for ${wwwHost} ready? Re-run the SSL op once it is.`);
-    }
-  }
-
-  // 4) Final validate + reload, only when something above actually changed.
-  if (changed) {
-    if (await nginxTest(helpers)) {
-      await nginxReload(helpers);
-      ok('nginx reloaded');
-    } else {
-      err('nginx -t FAILED after canonical changes — review config');
-    }
-  }
-}
-
-// Standard cache-clear routine used after code/DB changes:
-//   - WP Rocket page cache (native fn via eval; disk fallback if provided)
-//   - object cache flush
-// webrootDir is optional; if given, the disk fallback wipes app/cache/wp-rocket.
-export async function clearWpCaches(helpers, srcDir, webrootDir = null) {
-  const wp = wpCli(helpers, srcDir);
-  const rocket = await wp([
-    'eval',
-    'if (function_exists("rocket_clean_domain")) { rocket_clean_domain(); echo "WP Rocket cache cleared"; } else { echo "WP Rocket not active"; }',
-  ]);
-  if (rocket.code !== 0 && webrootDir) {
-    const dir = `${webrootDir}/app/cache/wp-rocket`;
-    if (await pathExists(dir)) {
-      // wipe contents but keep the dir
-      const fs = await import('node:fs/promises');
-      try {
-        for (const e of await fs.readdir(dir)) await removePath(`${dir}/${e}`);
-      } catch {}
-    }
-  }
-  const flush = await wp(['cache', 'flush'], { quiet: true });
-  return { rocketOk: rocket.code === 0, objectFlushed: flush.code === 0 };
 }

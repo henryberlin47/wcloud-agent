@@ -1,100 +1,63 @@
-import { run, woSiteExists, nginxTest, nginxReload, getPhpVersion, setCanonical, wpSetPassword, resolveWpRoot, pinWpUrls, WO_SITE_TIMEOUT_MS } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import { checkCustomCert } from '../lib/certcheck.js';
-import { applySslConf } from '../lib/certinstall.js';
+import { createSite, applySslConf, syncWpAddress, requireSpec } from '../lib/sites.js';
+import { issueHttp } from '../lib/acme.js';
 
 // ============================================================
-//  deploy — create a vanilla WordPress site on this server
+//  deploy — create a site (WordPress or static) on this server
 // ============================================================
-// Two steps:
-//   1) wo site create <domain> --wp [--user --pass --email]  (provisions WP
-//      + local MySQL; --user/--pass are wo's own flags — see
-//      https://docs.wordops.net/commands/site/#site-create)
-//   2) wo site update <domain> --le --force  (issue/renew SSL)
-//      — or install the user's own certificate (cert + key), checked BEFORE
-//        step 1 so a bad pair never leaves a half-made site behind.
+//   0) own certificate: checked BEFORE anything is created
+//   1) create the site: system user, directories, (WordPress: database,
+//      wp-config, core install), vhost + PHP pool — rolled back on failure
+//   2) HTTPS: the user's certificate, Let's Encrypt, or none
+//   3) WordPress: pin its address to what nginx serves
 // DB credentials are NOT recorded here — the portal reads them live from
-// wp-config.php on demand (see lib/credentials.js). The WP admin password can't
-// be read back (WordPress keeps only a bcrypt hash); see resetPassword.js.
+// wp-config.php on demand. The WP admin password can't be read back
+// (WordPress keeps only a hash); see resetPassword.js.
 // ============================================================
 
 export async function runDeploy(job, helpers, p) {
-  const lg = logger(helpers);
-  const { step, ok, warn, skip, done } = lg;
+  const { step, ok, warn, skip, done } = logger(helpers);
   const domain = p.domain;
-  const requestedUser = p.wp_user || '';
-  const requestedPassword = p.wp_password || '';
-  const isNewSite = !(await woSiteExists(helpers, domain));
   const custom = p.cert && p.key;
 
-  // 0) Own certificate: refuse a bad pair before creating anything.
   if (custom) {
     step('Check your certificate');
-    const { warnings } = checkCustomCert(domain, p.cert, p.key, { www: p.enableWww !== false });
+    const { warnings } = checkCustomCert(domain, p.cert, p.key, { www: p.enableWww });
     ok(`Certificate and key match, and cover ${domain}`);
     for (const w of warnings) warn(w);
   }
 
-  // 1) Create WordPress site.
-  step('Create the WordPress site');
-  if (!isNewSite) {
-    warn(`${domain} already exists on this server — leaving it in place and continuing`);
-  } else {
-    const php = getPhpVersion();
-    const args = ['site', 'create', domain, '--wp', `--php${php.flag}`];
-    const setCreds = Boolean(requestedUser && requestedPassword);
-    // No --pass: a root process's argv is world-readable. WordOps generates a
-    // throwaway password; the requested one is set below via stdin.
-    if (setCreds) args.push(`--user=${requestedUser}`, `--email=admin@${domain}`);
-    const r = await run(helpers, 'wo', args, { timeout: WO_SITE_TIMEOUT_MS });
-    if (r.code !== 0) {
-      const detail = r.timedOut
-        ? `timed out after ${WO_SITE_TIMEOUT_MS}ms`
-        : `code ${r.code}`;
-      throw new Error(`wo site create failed (${detail})`);
-    }
-    ok(`Site created — ${domain}`);
-    if (setCreds) {
-      const pw = await wpSetPassword(helpers, await resolveWpRoot(domain), requestedUser, requestedPassword);
-      if (pw.code === 0) ok(`Admin password set for ${requestedUser}`);
-      else warn(`The site is up, but setting the admin password failed — use "Reset password" on the site page.`);
-    }
-  }
+  step(p.type === 'wordpress' ? `Create the WordPress site (PHP ${p.php})` : 'Create the static site');
+  await createSite(helpers, {
+    domain, type: p.type, php: p.php, enableWww: p.enableWww, canonical: p.canonical,
+    wp: { adminUser: p.wp_user, adminPassword: p.wp_password },
+  });
+  ok(`Site created — ${domain}`);
 
-  // 2) HTTPS: the user's own certificate, Let's Encrypt, or none.
   if (custom) {
     step('Install your certificate');
     try {
-      // Same transaction as the site page (write, nginx -t, roll back on failure).
       await applySslConf(helpers, domain, { certs: { fullchain: p.cert, key: p.key } });
-      await pinWpUrls(helpers, domain, { scheme: 'https' });
       ok(`HTTPS enabled for ${domain} with your certificate`);
     } catch (e) {
       warn(`The site is live over HTTP, but the certificate couldn't be enabled: ${e?.message || e} Try again from the site page.`);
     }
-  } else if (p.issueSsl === false) {
-    skip('Issue the HTTPS certificate — you chose "No SSL"');
-  } else {
+  } else if (p.issueSsl) {
     step('Issue the HTTPS certificate');
-    const ssl = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: WO_SITE_TIMEOUT_MS });
-    if (ssl.code === 0) {
-      ok(`HTTPS enabled for ${domain}`);
-      // Reload nginx after cert install.
-      if (await nginxTest(helpers)) {
-        await nginxReload(helpers);
-        ok('Web server reloaded');
-      }
-    } else {
-      warn(ssl.timedOut
-        ? `Certificate request timed out after ${Math.round(WO_SITE_TIMEOUT_MS / 1000)}s. The site is live over HTTP — issue HTTPS from the site page once it settles.`
-        : `Could not issue the certificate yet — this usually means ${domain}'s DNS does not point here, or port 80 is blocked. The site is live over HTTP; enable HTTPS from the site page once DNS is ready.`);
-    }
+    const r = await issueHttp(helpers, domain, { www: p.enableWww });
+    if (r.ok) ok(`HTTPS enabled for ${r.www ? `${domain} and www.${domain}` : domain}`);
+    else warn(r.timedOut
+      ? 'The certificate request timed out. The site is live over HTTP — issue HTTPS from the site page once it settles.'
+      : `Could not issue the certificate yet — this usually means ${domain}'s DNS does not point here, or port 80 is blocked. The site is live over HTTP; enable HTTPS from the site page once DNS is ready.`);
+  } else {
+    skip('Issue the HTTPS certificate — you chose "No SSL"');
   }
 
-  // Apply domain preferences (canonical redirect + www enablement). Handles
-  // none/enable-www itself and reloads nginx only if it changed something.
-  step('Apply the www / non-www preference');
-  await setCanonical(helpers, domain, p.canonical, p.enableWww);
-
-  done(`Site ready — https://${domain}`);
+  const s = await requireSpec(domain);
+  if (s.type === 'wordpress') {
+    step('Set the WordPress address');
+    await syncWpAddress(helpers, s);
+  }
+  done(`Site ready — ${s.ssl ? 'https' : 'http'}://${domain}`);
 }

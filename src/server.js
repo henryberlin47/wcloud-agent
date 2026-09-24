@@ -1,6 +1,6 @@
 import express from 'express';
 import dns from 'node:dns';
-import { execSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 
 // Prefer IPv4 for the agent's own outbound (enrolment, provision log) — fresh
 // VPS images often have a broken/unrouted IPv6 that stalls Node's fetch. Mirrors
@@ -12,18 +12,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import config, { validateConfig } from './config.js';
 import { requireAuth } from './auth.js';
-import { getOperation } from './operations/index.js';
+import { operations, getOperation, normDomain, isDomain } from './operations/index.js';
 import { serveExport } from './operations/export.js';
 import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './jobs.js';
-import { woSiteList, run, getPhpVersion, readCanonical } from './lib/sys.js';
+import { run } from './lib/sys.js';
 import { listTopLevel, putObject, deleteObject, statObject, explainSpacesError } from './lib/spaces.js';
-import { enforceAdminPanelCert } from './lib/panelcert.js';
-import { readDbCredentials } from './lib/credentials.js';
 import { readSiteSsl } from './lib/certinfo.js';
-import { readChallenge } from './lib/acmedns.js';
-import { readWpVersion } from './lib/wpinfo.js';
+import { readChallenge } from './lib/acme.js';
+import { listSites, readSpec, publicSpec } from './lib/sites.js';
+import { readWpVersion, readDbCredentials } from './lib/wp.js';
+import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService } from './lib/stack.js';
 import { enroll } from './enroll.js';
-import { normDomain, isDomain } from './operations/index.js';
 
 // --- startup validation -----------------------------------------------------
 const problems = validateConfig();
@@ -32,21 +31,6 @@ if (problems.length) {
   for (const p of problems) console.error('  - ' + p);
   process.exit(1);
 }
-
-// WordOps' `wo` prompts for a git identity when none is set, which hangs any
-// endpoint that shells out to it (e.g. /api/info). Seed one so `wo` stays
-// non-interactive — covers servers installed before init.sh did this.
-try {
-  execSync('git config --global user.name', { stdio: 'ignore' });
-} catch {
-  try {
-    execSync('git config --global user.name wcloud && git config --global user.email agent@wcloud.local', { stdio: 'ignore' });
-  } catch { /* git absent or unwritable — best-effort */ }
-}
-
-// Pin the :22222 admin panel to its self-signed cert and lock it immutable, so
-// it can't be repointed at a deletable site cert. Idempotent; best-effort.
-enforceAdminPanelCert().catch((e) => console.error('[agent] panel-cert enforce failed:', e));
 
 const app = express();
 app.disable('x-powered-by');
@@ -93,7 +77,8 @@ app.get('/api/info', async (req, res) => {
     server: config.serverName,
     version: config.version,
     commit: config.commit,
-    operations: ['deploy', 'update', 'delete', 'ssl', 'sslDnsVerify', 'canonical', 'purge', 'resetPassword', 'export', 'import'],
+    operations: Object.keys(operations),
+    stack: 'wcloud', // nginx + PHP-FPM per site + MariaDB + Redis, managed by this agent
     maxConcurrentJobs: config.maxConcurrentJobs,
   };
 
@@ -172,21 +157,15 @@ app.get('/api/info', async (req, res) => {
       if (m) info.nginx = m[1];
     }
 
-    // PHP version
-    const php = await run(helpers, 'php', ['-v'], { quiet: true, timeout: 8000 });
-    if (php.code === 0) {
-      const m = php.stdout.match(/PHP\s+([\d.]+)/);
-      if (m) info.php = m[1];
+    // PHP: every installed version with its FPM status; the offered list lets
+    // the portal show what a site can switch to.
+    info.php = [];
+    for (const v of await installedPhp()) {
+      const st = await run(helpers, 'systemctl', ['is-active', fpmService(v)], { quiet: true, timeout: 10000 });
+      info.php.push({ version: v, status: st.stdout.trim() === 'active' ? 'active' : 'inactive' });
     }
-
-    // PHP-FPM service status
-    const phpVer = getPhpVersion();
-    const phpStatus = await run(helpers, 'systemctl', ['is-active', phpVer.service], { quiet: true, timeout: 10000 });
-    info.phpFpm = {
-      version: phpVer.version,
-      status: phpStatus.stdout.trim() === 'active' ? 'active' : 'inactive',
-      service: phpVer.service,
-    };
+    info.phpOffered = PHP_VERSIONS;
+    info.phpDefault = DEFAULT_PHP;
 
     // MariaDB version + status. Client CLIs (`mysql`/`mariadb`) may be absent on
     // a server-only install, so fall back to the daemon (`mariadbd`/`mysqld`),
@@ -206,13 +185,6 @@ app.get('/api/info', async (req, res) => {
       const s = ms.stdout.trim();
       if (s === 'active') { info.mariadbStatus = 'active'; break; }
       if (s) info.mariadbStatus = s;
-    }
-
-    // WordOps version. Timeout-guarded: `wo` prompts (and hangs) if git has no
-    // identity configured, which would otherwise stall this whole endpoint.
-    const wo = await run(helpers, 'wo', ['--version'], { quiet: true, timeout: 8000 });
-    if (wo.code === 0) {
-      info.wordops = wo.stdout.trim();
     }
 
     // Redis version + status
@@ -243,18 +215,25 @@ app.get('/api/info', async (req, res) => {
 });
 
 // --- list websites on this server ------------------------------------------
-// GET /api/sites  ->  { server, sites: [domain, ...] }
-// Read-only; runs `wo site list` directly (not a job).
+// GET /api/sites  ->  { server, count, sites: [domain, ...], details: [spec, ...] }
+// Read straight from the site specs (/etc/wcloud/sites).
 app.get('/api/sites', async (req, res) => {
-  // sys.run expects a helpers object; for a one-shot read we discard output.
-  const helpers = NOOP_HELPERS;
-  try {
-    const sites = await woSiteList(helpers);
-    res.json({ server: config.serverName, count: sites.length, sites });
-  } catch (e) {
-    res.status(500).json({ error: 'wo_site_list_failed', message: e?.message || 'failed' });
-  }
+  const specs = await listSites();
+  res.json({ server: config.serverName, count: specs.length, sites: specs.map((s) => s.domain), details: specs.map(publicSpec) });
 });
+
+// Middleware for /api/sites/:domain/* — normalized domain + its spec, or 404.
+async function siteParam(req, res, next) {
+  const domain = normDomain(req.params.domain);
+  if (!isDomain(domain)) return res.status(400).json({ error: 'invalid_domain' });
+  const spec = await readSpec(domain);
+  if (!spec) return res.status(404).json({ error: 'not_found' });
+  req.site = spec;
+  next();
+}
+
+// --- one site's settings (type, PHP version, www, HTTPS) ----------------------
+app.get('/api/sites/:domain', siteParam, (req, res) => res.json(publicSpec(req.site)));
 
 // --- start an operation -----------------------------------------------------
 // POST /api/op/:type   body = operation params
@@ -347,10 +326,10 @@ app.post('/api/jobs/:id/cancel', (req, res) => {
 // --- get a site's DB credentials, read live from wp-config.php --------------
 // Already behind requireAuth (mounted above). 404 = not a WordPress site the
 // agent can read (missing/invalid wp-config.php).
-app.get('/api/sites/:domain/credentials', async (req, res) => {
+app.get('/api/sites/:domain/credentials', siteParam, async (req, res) => {
   const helpers = NOOP_HELPERS;
   try {
-    const creds = await readDbCredentials(helpers, req.params.domain);
+    const creds = await readDbCredentials(helpers, req.site);
     if (!creds) return res.status(404).json({ error: 'not_found' });
     res.json(creds);
   } catch (e) {
@@ -359,13 +338,11 @@ app.get('/api/sites/:domain/credentials', async (req, res) => {
 });
 
 // --- WordPress version for a site (live via wp-cli, nothing stored) -----------
-app.get('/api/sites/:domain/wp', async (req, res) => {
-  const domain = normDomain(req.params.domain);
-  if (!isDomain(domain)) return res.status(400).json({ error: 'invalid_domain' });
+app.get('/api/sites/:domain/wp', siteParam, async (req, res) => {
   try {
-    const v = await readWpVersion(NOOP_HELPERS, domain);
+    const v = await readWpVersion(NOOP_HELPERS, req.site);
     if (!v) return res.status(404).json({ error: 'not_found' });
-    res.json({ domain, wp_version: v });
+    res.json({ domain: req.site.domain, wp_version: v });
   } catch (e) {
     res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
   }
@@ -380,19 +357,6 @@ app.get('/api/sites/:domain/ssl', async (req, res) => {
   const helpers = NOOP_HELPERS;
   try {
     res.json(await readSiteSsl(helpers, domain));
-  } catch (e) {
-    res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
-  }
-});
-
-// --- live domain preference (www / preferred address) ------------------------
-// Read from the nginx config on disk, like the SSL state — nothing stored, so
-// the site page shows what is actually configured, not what deploy was told.
-app.get('/api/sites/:domain/canonical', async (req, res) => {
-  const domain = normDomain(req.params.domain);
-  if (!isDomain(domain)) return res.status(400).json({ error: 'invalid_domain' });
-  try {
-    res.json(await readCanonical(NOOP_HELPERS, domain));
   } catch (e) {
     res.status(500).json({ error: 'read_failed', message: e?.message || 'failed' });
   }
@@ -425,7 +389,7 @@ app.get('/api/sites/:domain/ssl-challenge', async (req, res) => {
 let selfUpdating = false;
 app.post('/api/self-update', async (req, res) => {
   // The restart stops everything in the unit — a restore/delete/import would be
-  // cut off mid-way (wo, mysql, tar killed). ponytail: a job enqueued during the
+  // cut off mid-way (mysql, tar, wp-cli killed). ponytail: a job enqueued during the
   // git/npm window can still be cut; recheck before restart if that ever bites.
   if (listJobs().some((j) => j.state === 'queued' || j.state === 'running')) {
     return res.status(409).json({ ok: false, error: 'An operation is running on this server — update once it finishes.' });

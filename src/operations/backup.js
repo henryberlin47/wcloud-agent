@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
-import { woSiteExists, removePath } from '../lib/sys.js';
+import { removePath } from '../lib/sys.js';
+import { readSpec } from '../lib/sites.js';
 import { logger, humanSize } from '../lib/log.js';
 import { buildSiteArchive } from './export.js';
 import { uploadFile, explainSpacesError } from '../lib/spaces.js';
@@ -17,7 +18,7 @@ import { uploadFile, explainSpacesError } from '../lib/spaces.js';
 export async function runBackup(job, helpers, p) {
   const { step, ok, err, done } = logger(helpers);
 
-  if (!(await woSiteExists(helpers, p.domain))) {
+  if (!(await readSpec(p.domain))) {
     throw new Error(`${p.domain} is not a site on this server.`);
   }
 

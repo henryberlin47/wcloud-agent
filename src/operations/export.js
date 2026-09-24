@@ -2,8 +2,10 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import config from '../config.js';
-import { run, woSiteExists, pathExists, wpCli, removePath } from '../lib/sys.js';
+import { run, pathExists, removePath } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
+import { requireSpec, publicSpec, siteDir, siteTmp } from '../lib/sites.js';
+import { wpCli } from '../lib/wp.js';
 import { makeStagingDir } from './import.js';
 
 // Temporary export archives and their one-time tokens.
@@ -28,36 +30,39 @@ async function createPrivateFile(p) {
 // The caller owns the returned path and must remove it when done.
 export async function buildSiteArchive(helpers, domain, { includeSsl = false, encryptKey = '', nested = false } = {}) {
   const { step, ok } = logger(helpers, { nested });
-  // 0700 staging dir owned by www-data (wp-cli dumps the DB as www-data).
-  const tmpDir = await makeStagingDir(helpers, 'export');
+  const s = await requireSpec(domain);
+  const tmpDir = await makeStagingDir(helpers, 'export'); // root-only 0700
   const archivePath = `${tmpDir}.tar.gz`;
-  const siteDir = `${config.wwwDir}/${domain}`;
+  // Type + PHP version travel with the archive, so a restore rebuilds the same site.
+  await fs.writeFile(`${tmpDir}/wcloud-site.json`, JSON.stringify(publicSpec(s), null, 2));
 
-  // 1) Dump the database (runs as www-data, needs access to tmpDir).
-  step('Export the database');
-  const wpRoot = `${siteDir}/htdocs`;
-  const wp = wpCli(helpers, wpRoot);
-  const sqlPath = `${tmpDir}/db.sql`;
-  const dbDump = await wp(['db', 'export', sqlPath]);
-  if (dbDump.code !== 0) {
-    await removePath(tmpDir);
-    throw new Error('Database export failed');
+  // 1) Dump the database. wp-cli runs as the site's user, so it writes into
+  //    the site's own tmp dir; root then moves the dump into staging.
+  if (s.type === 'wordpress') {
+    step('Export the database');
+    const dump = `${siteTmp(domain)}/wcloud-export-${crypto.randomBytes(6).toString('hex')}.sql`;
+    const dbDump = await (await wpCli(helpers, s))(['db', 'export', dump]);
+    if (dbDump.code !== 0 || (await run(helpers, 'mv', ['--', dump, `${tmpDir}/db.sql`])).code !== 0) {
+      await removePath(dump);
+      await removePath(tmpDir);
+      throw new Error('Database export failed');
+    }
+    ok('Database exported');
   }
-  ok('Database exported');
 
-  // 2) Copy site files (as root — root can write to www-data-owned dir).
+  // 2) Copy the site files (root, reading everything).
   step('Copy the site files');
   const destSite = `${tmpDir}/site`;
-  const cpR = await run(helpers, 'cp', ['-a', siteDir, destSite]);
+  const cpR = await run(helpers, 'cp', ['-a', siteDir(domain), destSite]);
   if (cpR.code !== 0) {
     // A partial copy would still archive and upload "successfully" — a
     // silently incomplete restore point.
     await removePath(tmpDir);
     throw new Error('Copying the site files failed — the disk may be full.');
   }
-  // Remove cache dirs to shrink archive.
-  for (const cacheDir of ['app/cache', 'wp-content/cache', 'wp-content/uploads/wp-rocket-minify']) {
-    await removePath(`${destSite}/${cacheDir}`);
+  // Sessions, uploads in flight and caches don't belong in a restore point.
+  for (const dir of ['tmp', 'htdocs/wp-content/cache', 'htdocs/app/cache']) {
+    await removePath(`${destSite}/${dir}`);
   }
   ok('Site files copied');
 
@@ -117,10 +122,6 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
 export async function runExport(job, helpers, p) {
   const { log, ok } = logger(helpers);
   const domain = p.domain;
-
-  if (!(await woSiteExists(helpers, domain))) {
-    throw new Error(`Site not found: ${domain}`);
-  }
 
   const { path: finalPath } = await buildSiteArchive(helpers, domain, {
     includeSsl: p.includeSsl,

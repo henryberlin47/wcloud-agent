@@ -1,28 +1,26 @@
 import fs from 'node:fs/promises';
-import config from '../config.js';
-import {
-  run, woSiteExists, nginxTest, nginxReload, getPhpVersion,
-  wpCli, clearWpCaches, pathExists, removePath, setCanonical,
-  WO_SITE_TIMEOUT_MS,
-} from '../lib/sys.js';
+import { randomBytes } from 'node:crypto';
+import { run, pathExists, removePath, userIds } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
-import { applySslConf } from '../lib/certinstall.js';
+import {
+  SITE_TYPES, readSpec, createSite, deleteSite, applySslConf, syncWpAddress, webRoot, siteTmp,
+} from '../lib/sites.js';
+import { wpCli, clearWpCaches, safePrefix } from '../lib/wp.js';
+import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
+import { issueHttp } from '../lib/acme.js';
 
-// Unpredictable, atomically-created 0700 staging dir (mkdtemp never reuses an
-// existing path). www-data gets it because wp-cli's db import/export runs as
-// www-data. ponytail: www-data (any site's PHP) could still tamper with the tree
-// mid-run; a root-only dir + a single www-data-owned SQL file closes that.
+// Unpredictable, atomically-created staging dir (mkdtemp: 0700 root, never
+// reuses an existing path). Only root touches it; the one file a site's wp-cli
+// needs (the SQL dump) is handed over through the site's own tmp dir.
 export async function makeStagingDir(helpers, prefix) {
-  const dir = await fs.mkdtemp(`/tmp/wcloud_${prefix}_`);
-  await run(helpers, 'chown', ['www-data:www-data', dir], { timeout: 30000 });
-  return dir;
+  return fs.mkdtemp(`/tmp/wcloud_${prefix}_`);
 }
 
 // A crafted archive can make a top-level entry (site, site/htdocs, ssl/live) a
 // symlink, and `cp -a src/. dest` DEREFERENCES the source root — copying an
-// arbitrary host dir (e.g. /root) into the web root, then chowning it to
-// www-data. Only ever copy out of real directories. (Symlinks *inside* a tree
-// are copied as links, not followed — WordOps' own logs/*.log links are fine.)
+// arbitrary host dir (e.g. /root) into the web root, then chowning it to the
+// site. Only ever copy out of real directories. (Symlinks *inside* a tree are
+// copied as links, not followed.)
 async function isRealDir(p) {
   try { return (await fs.lstat(p)).isDirectory(); } catch { return false; }
 }
@@ -65,7 +63,7 @@ export async function runImport(job, helpers, p) {
   const domain = p.domain;
   const sourceDomain = p.sourceDomain || domain;
 
-  if (await woSiteExists(helpers, domain)) {
+  if (await readSpec(domain)) {
     throw new Error(`${domain} already exists on this server. Delete it first, or choose a different domain.`);
   }
 
@@ -122,14 +120,13 @@ export async function runRestoreFromLocal(job, helpers, {
 }) {
   const { log, step, ok, warn, err, skip } = logger(helpers, { nested });
   const domainChanged = sourceDomain !== domain;
-  const siteDir = `${config.wwwDir}/${domain}`;
   let siteCreated = false;
 
   try {
     await prepareArchive(helpers, tmpDir, encryptKey, { step, ok });
 
-    // 2) Extract archive. --no-same-owner: entries land root-owned regardless of
-    // the uids recorded in a (possibly foreign) archive.
+    // --no-same-owner: entries land root-owned regardless of the uids recorded
+    // in a (possibly foreign) archive.
     step('Unpack the archive');
     const extractR = await run(helpers, 'tar', ['xzf', `${tmpDir}/export.tar.gz`, '--no-same-owner', '-C', tmpDir]);
     if (extractR.code !== 0) {
@@ -138,160 +135,101 @@ export async function runRestoreFromLocal(job, helpers, {
     await removePath(`${tmpDir}/export.tar.gz`);
     ok('Archive unpacked');
 
-    // 3) Read source table prefix from archived wp-config.php.
-    let sourcePrefix = '';
-    const srcConfigPaths = [
-      `${tmpDir}/site/wp-config.php`,
-      `${tmpDir}/site/htdocs/wp-config.php`,
-    ];
-    for (const cfgPath of srcConfigPaths) {
-      if (await pathExists(cfgPath)) {
-        const cfgContent = await fs.readFile(cfgPath, 'utf8');
-        const prefixMatch = cfgContent.match(/\$table_prefix\s*=\s*['"]([^'"]+)['"]/);
-        if (prefixMatch) {
-          sourcePrefix = prefixMatch[1];
+    // What kind of site this was. Archives made before site types existed are
+    // WordPress; values are checked, never trusted.
+    let src = {};
+    try { src = JSON.parse(await fs.readFile(`${tmpDir}/wcloud-site.json`, 'utf8')); } catch { /* older archive */ }
+    const type = SITE_TYPES.includes(src.type) ? src.type : 'wordpress';
+    const php = PHP_VERSIONS.includes(src.php) ? src.php : DEFAULT_PHP;
+
+    // Source table prefix, from the archived wp-config.php.
+    let tablePrefix = 'wp_';
+    if (type === 'wordpress') {
+      for (const cfgPath of [`${tmpDir}/site/wp-config.php`, `${tmpDir}/site/htdocs/wp-config.php`]) {
+        if (!(await pathExists(cfgPath))) continue;
+        const m = (await fs.readFile(cfgPath, 'utf8')).match(/\$table_prefix\s*=\s*['"]([^'"]+)['"]/);
+        if (m) {
+          if (safePrefix(m[1])) tablePrefix = m[1];
+          else warn('The archived table prefix is not a plain name — using wp_');
           break;
         }
       }
     }
 
-    // 4) Create WordPress site via WordOps.
-    step('Create the WordPress site');
-    const php = getPhpVersion();
-    const woArgs = ['site', 'create', domain, '--wp', `--php${php.flag}`];
-    const deployR = await run(helpers, 'wo', woArgs, { timeout: WO_SITE_TIMEOUT_MS });
-    if (deployR.code !== 0) {
-      const detail = deployR.timedOut
-        ? `timed out after ${WO_SITE_TIMEOUT_MS}ms`
-        : `code ${deployR.code}`;
-      throw new Error(`wo site create failed (${detail})`);
-    }
+    step(type === 'wordpress' ? `Create the WordPress site (PHP ${php})` : 'Create the static site');
+    const s = await createSite(helpers, {
+      domain, type, php, enableWww, canonical,
+      wp: { install: false, tablePrefix }, // the archive brings WordPress itself
+    });
     siteCreated = true;
     ok(`Site created — ${domain}`);
 
-    // 5) Fix table prefix BEFORE importing DB.
-    if (sourcePrefix) {
-      step('Match the database table prefix');
-      const wpRoot = `${siteDir}/htdocs`;
-      const wp = wpCli(helpers, wpRoot);
-      const setPrefix = await wp(['config', 'set', 'table_prefix', sourcePrefix, '--type=variable']);
-      if (setPrefix.code === 0) {
-        ok(`Table prefix set to '${sourcePrefix}'`);
-      } else {
-        warn('Failed to set table prefix — DB import may have mismatched prefix');
-      }
-    }
-
-    // 6) Restore site files (exclude wp-config.php from htdocs copy).
     step('Restore the site files');
     const srcSite = `${tmpDir}/site`;
     if (await isRealDir(srcSite)) {
       const srcHtdocs = `${srcSite}/htdocs`;
-      const destHtdocs = `${siteDir}/htdocs`;
-
-      // One overlay copy of the whole tree (wp-content included). A per-subdir
-      // `cp -a src/plugins dest/plugins` used to run first: dest already exists
-      // on a fresh WordOps site, so it nested (plugins/plugins/…) and copied
-      // uploads twice.
+      const dest = webRoot(domain);
       const from = (await isRealDir(srcHtdocs)) ? srcHtdocs : srcSite;
-      await mustRun(helpers, 'cp', ['-a', `${from}/.`, destHtdocs], 'Copying the site files');
-      // The target keeps its own wp-config.php (non-standard sources leak one in).
-      await removePath(`${destHtdocs}/wp-config.php`);
-
-      // Fix file ownership — source UID may differ from target. (-R does not
-      // follow symlinks, so a link in the tree can't redirect the chown.)
-      await mustRun(helpers, 'chown', ['-R', 'www-data:www-data', destHtdocs], 'Setting file ownership');
+      await mustRun(helpers, 'cp', ['-a', `${from}/.`, dest], 'Copying the site files');
+      // The site keeps its own wp-config.php (non-standard sources leak one in).
+      if (type === 'wordpress') await removePath(`${dest}/wp-config.php`);
+      // The source's uids mean nothing here. (-R does not follow symlinks, so a
+      // link in the tree can't redirect the chown.)
+      await mustRun(helpers, 'chown', ['-R', `${s.user}:www-data`, dest], 'Setting file ownership');
       ok('Site files restored');
     } else {
       warn('No site files found in archive');
     }
 
-    // 7) Restore database.
-    step('Restore the database');
-    const sqlFile = `${tmpDir}/db.sql`;
-    if (await pathExists(sqlFile)) {
-      // Ensure www-data can read the SQL file.
-      await run(helpers, 'chown', ['www-data:www-data', sqlFile]);
-      await run(helpers, 'chmod', ['640', sqlFile]);
+    if (type === 'wordpress') {
+      step('Restore the database');
+      const sqlFile = `${tmpDir}/db.sql`;
+      if (await pathExists(sqlFile)) {
+        // Hand the dump to the site through its own tmp dir: wp-cli runs as the
+        // site's user and can't (and mustn't) read the root-only staging dir.
+        const handed = `${siteTmp(domain)}/wcloud-import-${randomBytes(6).toString('hex')}.sql`;
+        await mustRun(helpers, 'mv', ['--', sqlFile, handed], 'Preparing the database dump');
+        const { uid, gid } = await userIds(s.user);
+        await fs.chown(handed, uid, gid);
+        await fs.chmod(handed, 0o600);
 
-      const wpRoot = `${siteDir}/htdocs`;
-      const wp = wpCli(helpers, wpRoot);
+        const wp = await wpCli(helpers, s);
+        const importR = await wp(['db', 'import', handed]);
+        await removePath(handed);
+        if (importR.code !== 0) throw new Error('Database import failed');
+        ok('Database imported');
 
-      const importR = await wp(['db', 'import', sqlFile]);
-      if (importR.code !== 0) {
-        err(`Database import failed (code ${importR.code})`);
-        throw new Error('Database import failed');
+        if (domainChanged) {
+          step('Update site URLs');
+          // --precise does exact string match, avoiding partial hits in emails.
+          // --all-tables covers options, usermeta, postmeta, custom tables.
+          const replaceR = await wp(['search-replace', sourceDomain, domain, '--all-tables', '--precise', '--report-changed-only']);
+          if (replaceR.code !== 0) warn('URL search-replace had issues — may need manual review');
+          else ok(`URLs updated: ${sourceDomain} → ${domain}`);
+        }
+
+        await clearWpCaches(helpers, s);
+        ok('Caches cleared');
+      } else {
+        warn('No database dump found in archive');
       }
-      ok('Database imported');
-
-      // 8) Update site URLs if domain changed.
-      if (domainChanged) {
-        step('Update site URLs');
-        // --precise does exact string match, avoiding partial hits in emails.
-        // --all-tables covers options, usermeta, postmeta, custom tables.
-        const replaceR = await wp([
-          'search-replace', sourceDomain, domain,
-          '--all-tables', '--precise', '--report-changed',
-        ]);
-        if (replaceR.code !== 0) {
-          warn('URL search-replace had issues — may need manual review');
-        } else {
-          ok(`URLs updated: ${sourceDomain} → ${domain}`);
-        }
-
-        // Update WP_HOME / WP_SITEURL constants if they reference old domain.
-        const homeR = await wp(['config', 'get', 'WP_HOME']);
-        if (homeR.code === 0 && homeR.stdout.includes(sourceDomain)) {
-          await wp(['config', 'set', 'WP_HOME', `https://${domain}`, '--type=constant']);
-        }
-        const siteUrlR = await wp(['config', 'get', 'WP_SITEURL']);
-        if (siteUrlR.code === 0 && siteUrlR.stdout.includes(sourceDomain)) {
-          await wp(['config', 'set', 'WP_SITEURL', `https://${domain}`, '--type=constant']);
-        }
-      }
-
-      await clearWpCaches(helpers, wpRoot, siteDir);
-      ok('Caches cleared');
-    } else {
-      warn('No database dump found in archive');
     }
 
-    // 9) Handle SSL.
     if (includeSsl) {
       step('Restore SSL certificates');
-      const sslLive = `${tmpDir}/ssl/live`;
-      const sslArchiveDir = `${tmpDir}/ssl/archive`;
-
       const destLive = `/etc/letsencrypt/live/${domain}`;
       const destArchive = `/etc/letsencrypt/archive/${domain}`;
-
-      // Only cert material comes from the archive. The archive's renewal.conf
-      // (certbot-format, can carry root-run hook commands) and ssl.conf (raw
-      // nginx directives included into the server block) are NOT restored —
-      // ssl.conf is regenerated below by the transactional applySslConf.
-      if (await isRealDir(sslLive)) {
-        await fs.mkdir(destLive, { recursive: true });
-        await mustRun(helpers, 'cp', ['-a', `${sslLive}/.`, destLive], 'Copying the certificates');
+      // Only cert material comes from the archive — never a renewal.conf
+      // (can carry root-run hook commands) or nginx config.
+      for (const [from, to] of [[`${tmpDir}/ssl/live`, destLive], [`${tmpDir}/ssl/archive`, destArchive]]) {
+        if (!(await isRealDir(from))) continue;
+        await fs.mkdir(to, { recursive: true });
+        await mustRun(helpers, 'cp', ['-a', `${from}/.`, to], 'Copying the certificates');
+        await run(helpers, 'chown', ['-R', 'root:root', to]);
+        await run(helpers, 'find', [to, '-type', 'd', '-exec', 'chmod', '700', '{}', ';']);
+        await run(helpers, 'find', [to, '-type', 'f', '-exec', 'chmod', '600', '{}', ';']);
       }
-      if (await isRealDir(sslArchiveDir)) {
-        await fs.mkdir(destArchive, { recursive: true });
-        await mustRun(helpers, 'cp', ['-a', `${sslArchiveDir}/.`, destArchive], 'Copying the certificates');
-      }
-
-      // Set correct permissions: dirs 700 (traversable), files 600.
-      if (await pathExists(destLive)) {
-        await run(helpers, 'chown', ['-R', 'root:root', destLive]);
-        await run(helpers, 'find', [destLive, '-type', 'd', '-exec', 'chmod', '700', '{}', ';']);
-        await run(helpers, 'find', [destLive, '-type', 'f', '-exec', 'chmod', '600', '{}', ';']);
-      }
-      if (await pathExists(destArchive)) {
-        await run(helpers, 'chown', ['-R', 'root:root', destArchive]);
-        await run(helpers, 'find', [destArchive, '-type', 'd', '-exec', 'chmod', '700', '{}', ';']);
-        await run(helpers, 'find', [destArchive, '-type', 'f', '-exec', 'chmod', '600', '{}', ';']);
-      }
-
-      // Wire HTTPS to the copied cert (backup → nginx -t → rollback). A bad or
-      // missing cert must not cost the restored site: warn and serve HTTP.
+      // A bad or missing cert must not cost the restored site: warn, serve HTTP.
       try {
         await applySslConf(helpers, domain);
         ok('SSL certificates restored');
@@ -301,41 +239,28 @@ export async function runRestoreFromLocal(job, helpers, {
       }
     } else if (issueSsl) {
       step('Issue SSL certificate');
-      const sslR = await run(helpers, 'wo', ['site', 'update', domain, '--le', '--force'], { timeout: 300000 });
-      if (sslR.code === 0) {
-        ok(`SSL issued for ${domain}`);
-      } else {
-        warn(`SSL failed (DNS/propagation?) — run the SSL op from the site page later`);
-      }
+      const r = await issueHttp(helpers, domain, { www: enableWww });
+      if (r.ok) ok(`SSL issued for ${domain}`);
+      else warn('SSL failed (DNS/propagation?) — issue it from the site page later');
     } else {
       skip('SSL — "No SSL" selected');
     }
 
-    // Apply domain preferences (after DB import so WP options aren't
-    // overwritten by imported values). Handles none/enable-www itself.
-    step('Apply domain preferences');
-    await setCanonical(helpers, domain, canonical, enableWww);
-
-    // 10) Validate + reload nginx.
-    step('Validate + reload nginx');
-    if (await nginxTest(helpers)) {
-      await nginxReload(helpers);
-      ok('nginx reloaded');
-    } else {
-      err('The web server configuration is invalid, so it was not reloaded. The site may not serve until this is fixed.');
+    // After the DB import, so the imported home/siteurl don't win.
+    if (type === 'wordpress') {
+      step('Set the WordPress address');
+      await syncWpAddress(helpers, await readSpec(domain));
     }
 
     log(`Restore completed: ${domain}`);
   } catch (e) {
-    // Rollback: if we created the site but the restore failed, clean up the
-    // half-site.
     if (siteCreated) {
-      warn('Restore failed — rolling back half-created site');
+      warn('Restore failed — removing the half-created site');
       try {
-        await run(helpers, 'wo', ['site', 'delete', domain, '--no-prompt', '--force'], { stdin: '', timeout: 120000 });
+        await deleteSite(helpers, domain);
         ok('Half-created site removed');
       } catch {
-        warn(`Failed to clean up ${domain} — delete manually: wo site delete ${domain} --no-prompt --force`);
+        err(`Failed to clean up ${domain} — delete it from the site page.`);
       }
     }
     throw e;

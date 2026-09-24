@@ -1,14 +1,23 @@
 import fs from 'node:fs/promises';
-import { run, pathExists, pinWpUrls } from './sys.js';
+import config from '../config.js';
+import { run, pathExists, removePath } from './sys.js';
 import { logger } from './log.js';
-import { certDir, applySslConf, writeManualMarker } from './certinstall.js';
+import { certDir, applySslConf, requireSpec, syncWpAddress } from './sites.js';
 
 // ============================================================
-//  acmedns.js — Let's Encrypt via manual DNS-01 (two-step)
+//  acme.js — Let's Encrypt certificates via acme.sh
 // ============================================================
-// WordOps ships acme.sh at /etc/letsencrypt (config home
-// /etc/letsencrypt/config, cert home /etc/letsencrypt/renewal, default key
-// ec-256 → the domain conf lives in <D>_ecc/). The manual flow:
+// init.sh installs acme.sh at /etc/letsencrypt (config home
+// /etc/letsencrypt/config, cert home /etc/letsencrypt/renewal, ec-256 keys →
+// the domain conf lives in <D>_ecc/) with its daily renewal cron. Every
+// issuer's cert ends up at /etc/letsencrypt/live/<D>/ (sites.certDir).
+//
+// HTTP-01 (issueHttp): the challenge is answered from /var/www/html, which
+// every vhost serves at /.well-known/acme-challenge/ even when it redirects to
+// HTTPS. acme.sh stores the install paths + reload command, so renewals land
+// in place and reload nginx on their own.
+//
+// Manual DNS-01 (two-step):
 //
 //   start  --issue --dns -d D --force --yes-I-know...  → prints the TXT
 //                                                        records, saves the
@@ -29,6 +38,62 @@ const ACME_OPTS = ['--config-home', '/etc/letsencrypt/config'];
 const MANUAL_FLAG = '--yes-I-know-dns-manual-mode-enough-go-ahead-please';
 const CODE_DNS_MANUAL = 3;
 const STATE_DIR = '/var/lib/wcloud/ssl-challenge';
+const ACME_WEBROOT = '/var/www/html';
+
+// Marker: the current cert was issued via manual DNS-01 and will NOT be
+// auto-renewed. Read by certinfo; removed whenever a new cert is installed.
+export const manualMarkerPath = (domain) => `${config.wwwDir}/${domain}/conf/nginx/.wcloud-ssl-manual`;
+const writeManualMarker = (domain) =>
+  fs.writeFile(manualMarkerPath(domain), `manual dns-01 ${new Date().toISOString()}\n`, { mode: 0o600 });
+export const removeManualMarker = (domain) => removePath(manualMarkerPath(domain));
+
+// Copy an issued cert into certDir (600 root:root). With a reload command
+// acme.sh repeats this after every renewal.
+async function installCert(helpers, domain, { renew }) {
+  const dir = certDir(domain);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const inst = await run(helpers, ACME, [
+    ...ACME_OPTS, '--install-cert', '-d', domain, '--ecc',
+    '--cert-file', `${dir}/cert.pem`,
+    '--key-file', `${dir}/key.pem`,
+    '--fullchain-file', `${dir}/fullchain.pem`,
+    '--ca-file', `${dir}/ca.pem`,
+    ...(renew ? ['--reloadcmd', 'systemctl reload nginx'] : []),
+  ], { quiet: true, timeout: 60_000 });
+  if (inst.code !== 0) {
+    throw new Error('The certificate was issued but could not be installed on this server. See the details above.');
+  }
+  await run(helpers, 'chmod', ['600', `${dir}/cert.pem`, `${dir}/key.pem`, `${dir}/fullchain.pem`, `${dir}/ca.pem`]);
+  await run(helpers, 'chown', ['-R', 'root:root', dir]);
+}
+
+// --- HTTP-01 (auto-renewing) --------------------------------------------------
+// Issue for <domain> (+ www.<domain> when the site serves it), install it and
+// switch the site to HTTPS. www failing (no DNS record yet) falls back to the
+// bare domain rather than failing outright. Returns { ok, www, timedOut }.
+export async function issueHttp(helpers, domain, { www = false } = {}) {
+  const { warn } = logger(helpers);
+  const issue = (withWww) => run(helpers, ACME, [...ACME_OPTS, '--issue', '--server', 'letsencrypt',
+    '-w', ACME_WEBROOT, '-d', domain, ...(withWww ? ['-d', `www.${domain}`] : []),
+    '--keylength', 'ec-256', '--force'], { quiet: true, timeout: 300_000 });
+
+  let r = await issue(www);
+  let covered = www;
+  if (r.code !== 0 && www && !r.timedOut) {
+    warn(`www.${domain} could not be verified (does its DNS point here?) — issuing for ${domain} only`);
+    r = await issue(false);
+    covered = false;
+  }
+  if (r.code !== 0) {
+    const tail = `${r.stdout}\n${r.stderr}`.trim().split('\n').slice(-6);
+    for (const l of tail) helpers.err?.(`    ${stripAnsi(l)}`);
+    return { ok: false, www: false, timedOut: !!r.timedOut };
+  }
+  await installCert(helpers, domain, { renew: true });
+  await removeManualMarker(domain);
+  await applySslConf(helpers, domain);
+  return { ok: true, www: covered };
+}
 
 const stripAnsi = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, '');
 
@@ -97,14 +162,14 @@ async function restoreVlist(domain, vlist) {
 export async function startManualDns(helpers, domain) {
   const { step, ok, err } = logger(helpers);
   if (!(await pathExists(ACME))) {
-    throw new Error('This server has no certificate tool installed yet. Issue a Let\'s Encrypt certificate over HTTP once first, then use DNS mode.');
+    throw new Error('This server has no certificate tool installed. Re-run the server install command.');
   }
   await clearChallenge(domain); // a fresh start supersedes any stale pending challenge
 
   // Pin the key type: verify/install below always pass --ecc, so the order must
   // live in <D>_ecc no matter what this box's acme.sh default keylength is.
   step('Start DNS verification');
-  const r = await run(helpers, ACME, [...ACME_OPTS, '--issue', '--dns', '-d', domain, '--keylength', 'ec-256', '--force', MANUAL_FLAG],
+  const r = await run(helpers, ACME, [...ACME_OPTS, '--issue', '--server', 'letsencrypt', '--dns', '-d', domain, '--keylength', 'ec-256', '--force', MANUAL_FLAG],
     { quiet: true, timeout: 180_000 });
   if (r.code !== CODE_DNS_MANUAL) {
     err('The certificate authority did not return the DNS records to add.');
@@ -167,23 +232,10 @@ export async function verifyManualDns(helpers, domain) {
   }
 
   step('Install the certificate');
-  const dir = certDir(domain);
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const inst = await run(helpers, ACME, [
-    ...ACME_OPTS, '--install-cert', '-d', domain, '--ecc',
-    '--cert-file', `${dir}/cert.pem`,
-    '--key-file', `${dir}/key.pem`,
-    '--fullchain-file', `${dir}/fullchain.pem`,
-    '--ca-file', `${dir}/ca.pem`,
-  ], { quiet: true, timeout: 60_000 });
-  if (inst.code !== 0) {
-    throw new Error('The certificate was issued but could not be installed on this server. See the details above.');
-  }
-  await run(helpers, 'chmod', ['600', `${dir}/cert.pem`, `${dir}/key.pem`, `${dir}/fullchain.pem`, `${dir}/ca.pem`]);
-  await run(helpers, 'chown', ['-R', 'root:root', dir]);
+  await installCert(helpers, domain, { renew: false });
   await writeManualMarker(domain); // this cert will NOT auto-renew
   await applySslConf(helpers, domain);
-  await pinWpUrls(helpers, domain, { scheme: 'https' });
+  await syncWpAddress(helpers, await requireSpec(domain));
   await clearChallenge(domain);
   done(`HTTPS enabled for ${domain} via DNS verification`);
   return { pending: false };

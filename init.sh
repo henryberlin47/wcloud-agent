@@ -29,7 +29,7 @@ fi
 
 BOX_WIDTH=60
 STEP_NO=0
-STEP_TOTAL=14
+STEP_TOTAL=12
 WARNINGS=()
 
 _repeat() { local n=$1 ch=$2 out=''; while ((n-- > 0)); do out+="$ch"; done; printf '%s' "$out"; }
@@ -97,8 +97,8 @@ run() {
 }
 
 # Fresh cloud images run unattended-upgrades / apt-daily on first boot, which hold
-# /var/lib/dpkg/lock-frontend. Any apt-based install (WordOps, `wo stack install`)
-# then dies with "Could not get lock ... held by process N (unattended-upgr)".
+# /var/lib/dpkg/lock-frontend. Any apt-based install then dies with
+# "Could not get lock ... held by process N (unattended-upgr)".
 # Stop those timers/services so they can't re-grab the lock during provisioning,
 # then wait for any in-flight run to release it. Call before every apt step.
 # Lock holders via fuser (psmisc); minimal images may lack it, so fall back to
@@ -137,7 +137,7 @@ fi
 # that draws a TUI prompt hangs provisioning forever — most notably Ubuntu's
 # needrestart popping a "Pending kernel upgrade" / service-restart dialog after
 # NodeSource's prereq install. These exports are inherited by every child
-# (WordOps, NodeSource, apt-get) so no step can block on a dialog.
+# (NodeSource, apt-get, add-apt-repository) so no step can block on a dialog.
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a       # auto-restart services, never ask
 export NEEDRESTART_SUSPEND=1    # belt-and-suspenders: disable needrestart prompts
@@ -151,7 +151,7 @@ fi
 
 # ------------------------------------------------------------
 # Prefer IPv4 for everything. Fresh VPS images often ship a broken/unrouted IPv6
-# that silently stalls curl/git/apt/wo/acme.sh and enrollment on long timeouts.
+# that silently stalls curl/git/apt/acme.sh and enrollment on long timeouts.
 # gai.conf makes the whole system prefer IPv4 (covers every glibc-based tool);
 # explicit `-4` on our own fetches below is belt-and-suspenders.
 if ! grep -qs '^precedence ::ffff:0:0/96  100' /etc/gai.conf 2>/dev/null; then
@@ -194,7 +194,7 @@ if [ -n "$PROVISION_ID" ] && [ -n "${ENROLL_URL:-}" ] && [ -n "${ENROLL_TOKEN:-}
   PROVISION_LOG=$(mktemp)
   ESC=$(printf '\033')
   # Ship new log bytes to the portal every few seconds. Strip ANSI colour codes
-  # and carriage returns first (our script AND WordOps colour their output, and
+  # and carriage returns first (our script and some tools colour their output, and
   # `curl | bash` leaves stdout a tty) so the portal shows clean text.
   ( off=0
     while true; do
@@ -224,8 +224,14 @@ fi
 
 # ------------------------------------------------------------
 step "Preflight checks"
+# The stack targets Ubuntu LTS (distro nginx/MariaDB/Redis + the ondrej/php PPA).
+OS_ID=$(. /etc/os-release 2>/dev/null; echo "${ID:-}:${VERSION_ID:-}")
+case "$OS_ID" in
+  ubuntu:22.04|ubuntu:24.04) ok "Ubuntu ${OS_ID#*:}" ;;
+  *) die "Unsupported OS ($OS_ID). Use a fresh Ubuntu 22.04 or 24.04 server." ;;
+esac
 [ -d "$BIN_DIR" ] || die "$BIN_DIR does not exist."
-for c in wget bash openssl sed systemctl ip awk hostname; do
+for c in curl bash openssl sed systemctl ip awk hostname; do
   command -v "$c" >/dev/null 2>&1 && ok "$c present" || die "Required command missing: $c"
 done
 
@@ -252,217 +258,243 @@ fi
 ok "Agent source ready at /opt/wcloud."
 
 # ------------------------------------------------------------
-step "Installing WordOps"
-# WordOps prompts for a git name/email (to save server configs) on install AND on
-# every `wo` invocation until one is set. Under `curl | bash` there's no TTY, so
-# its read loops forever. Seed a random identity up front — unconditionally, so it
-# also covers a half-installed `wo` left by an interrupted earlier run.
-GIT_RAND=$(openssl rand -hex 4)
-git config --global user.name  >/dev/null 2>&1 || git config --global user.name  "wcloud-$GIT_RAND"
-git config --global user.email >/dev/null 2>&1 || git config --global user.email "wcloud-$GIT_RAND@wcloud.local"
+# The web stack. wcloud manages it end to end (no control-panel layer in
+# between): Ubuntu's own nginx / MariaDB / Redis packages get Ubuntu's security
+# updates; PHP comes from the ondrej/php PPA so any offered version can sit side
+# by side. Per-site pieces (system user, PHP pool, vhost, database, Redis user)
+# are created by the agent — see src/lib/sites.js.
+PHP_DEFAULT="8.3"
+# Keep in sync with PHP_EXTS in src/lib/stack.js (it installs other versions on demand).
+PHP_EXTS="fpm cli mysql curl gd intl mbstring xml zip bcmath soap imagick redis opcache"
+APT_OPTS=(-y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=600)
+apt_install() { apt_wait; apt-get "${APT_OPTS[@]}" install "$@" </dev/null; }
 
+step "Installing Nginx, MariaDB and Redis"
 apt_wait
-if command -v wo >/dev/null 2>&1; then
-  ok "WordOps already installed ($(wo --version 2>/dev/null | head -n1 || echo present)) — skipping."
+apt-get -q -o DPkg::Lock::Timeout=600 update </dev/null >/dev/null || warn "apt-get update reported errors — continuing."
+if apt_install nginx mariadb-server redis-server cron curl unzip git openssl ca-certificates logrotate software-properties-common; then
+  ok "Packages installed."
 else
-  info "Downloading WordOps installer (wops.cc)..."
-  # https explicitly: a bare `wops.cc` makes wget start with plain http (then
-  # follow the 301) — an unauthenticated hop that could swap the root installer.
-  if wget -4 -qO /tmp/wo-install https://wops.cc && bash /tmp/wo-install </dev/null; then
-    ok "WordOps installed."
+  die "Installing the base packages failed — see the output above."
+fi
+systemctl enable --now nginx mariadb redis-server >/dev/null 2>&1 || true
+
+# ------------------------------------------------------------
+step "Installing PHP $PHP_DEFAULT"
+if ! grep -rqs "ondrej/php" /etc/apt/sources.list /etc/apt/sources.list.d/; then
+  info "Adding the PHP package repository (ppa:ondrej/php)..."
+  apt_wait
+  LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php </dev/null >/dev/null \
+    || die "Could not add the PHP package repository (ppa:ondrej/php)."
+fi
+PHP_PKGS=(); for e in $PHP_EXTS; do PHP_PKGS+=("php$PHP_DEFAULT-$e"); done
+apt_install "${PHP_PKGS[@]}" || die "Installing PHP $PHP_DEFAULT failed — see the output above."
+# The package's `www` pool runs as www-data — the group that can read every
+# site. Replace it with an inert placeholder (php-fpm won't start without a
+# pool); sites get their own pools. Same as stack.js writePlaceholderPool.
+cat > "/etc/php/$PHP_DEFAULT/fpm/pool.d/www.conf" <<EOF
+; wcloud: placeholder so php-fpm starts with no sites. Site pools are <domain>.conf.
+[www]
+user = nobody
+group = nogroup
+listen = /run/php/php$PHP_DEFAULT-fpm.sock
+listen.owner = root
+listen.group = root
+listen.mode = 0600
+pm = ondemand
+pm.max_children = 1
+EOF
+systemctl enable "php$PHP_DEFAULT-fpm" >/dev/null 2>&1
+systemctl restart "php$PHP_DEFAULT-fpm" || die "php$PHP_DEFAULT-fpm failed to start — check journalctl -u php$PHP_DEFAULT-fpm."
+ok "PHP $PHP_DEFAULT ready (other versions install on demand)."
+
+# ------------------------------------------------------------
+step "Installing WP-CLI"
+if curl -4 -fsSL -o /usr/local/bin/wp.new https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
+   && "php$PHP_DEFAULT" /usr/local/bin/wp.new --allow-root --version >/dev/null 2>&1; then
+  chmod 755 /usr/local/bin/wp.new && mv -f /usr/local/bin/wp.new /usr/local/bin/wp
+  ok "$("php$PHP_DEFAULT" /usr/local/bin/wp --allow-root --version 2>/dev/null)"
+else
+  rm -f /usr/local/bin/wp.new
+  die "WP-CLI download failed."
+fi
+
+# ------------------------------------------------------------
+step "Installing acme.sh (Let's Encrypt)"
+# Same layout the agent expects (src/lib/acme.js). --install also adds the
+# daily renewal cron job.
+ACME_HOME=/etc/letsencrypt
+if [ -x "$ACME_HOME/acme.sh" ]; then
+  ok "acme.sh already installed."
+else
+  ACME_SRC=$(mktemp -d)
+  if git clone -q --depth 1 https://github.com/acmesh-official/acme.sh.git "$ACME_SRC" \
+     && (cd "$ACME_SRC" && ./acme.sh --install --home "$ACME_HOME" --config-home "$ACME_HOME/config" \
+          --cert-home "$ACME_HOME/renewal" --noprofile >/dev/null); then
+    ok "acme.sh installed."
   else
-    rm -f /tmp/wo-install
-    die "WordOps install failed — cannot continue without it."
+    rm -rf "$ACME_SRC"
+    die "acme.sh install failed."
   fi
-  rm -f /tmp/wo-install
+  rm -rf "$ACME_SRC"
 fi
-
-# Make sure wo is on PATH for the rest of this script (installer adds it, but
-# the current shell may not have picked it up yet).
-if ! command -v wo >/dev/null 2>&1; then
-  export PATH="$PATH:/usr/local/bin"
-fi
-command -v wo >/dev/null 2>&1 || die "wo not found on PATH after install."
+"$ACME_HOME/acme.sh" --config-home "$ACME_HOME/config" --set-default-ca --server letsencrypt >/dev/null 2>&1 \
+  && ok "Default CA: Let's Encrypt" || warn "Could not set Let's Encrypt as the default CA."
 
 # ------------------------------------------------------------
-step "Installing WordOps stack"
-# The base stack (nginx/php/mysql) is mandatory: without it every later step
-# cascades into "nginx: command not found". `wo stack install` returns 0 when the
-# stack is already present, so a non-zero here is a genuine failure, not "already
-# installed" — treat it as fatal and surface WordOps' own log (the portal's
-# provision stream can't see the box, so its "check the log" is otherwise useless).
-apt_wait
-# </dev/null on every child that might read stdin: under `curl | bash`, bash
-# reads THIS script from stdin as it goes, so a prompting child would swallow
-# the rest of the script (or hang) instead of getting EOF.
-if wo stack install </dev/null; then
-  ok "Base stack installed."
-else
-  err "wo stack install failed — last lines of /var/log/wo/wordops.log:"
-  tail -n 30 /var/log/wo/wordops.log 2>/dev/null || true
-  die "WordOps base stack install failed — see the log above (common causes: unsupported OS release/arch, apt repo/lock, no disk)."
-fi
+step "Configuring Nginx"
+# We own nginx.conf outright (no merging with the distro's defaults, which
+# would collide on ssl_protocols/gzip). Back up → write → nginx -t → restore
+# on failure, so a re-run on a live server can't leave nginx broken.
+NGX_BAK=$(mktemp -d)
+cp -a /etc/nginx/nginx.conf "$NGX_BAK/" 2>/dev/null || true
+[ -e /etc/nginx/sites-enabled/00-default.conf ] && cp -a /etc/nginx/sites-enabled/00-default.conf "$NGX_BAK/"
 
-# ------------------------------------------------------------
-step "Installing Redis stack"
-# Redis is the object cache — non-essential, so a redis-only failure warns rather
-# than aborts, but we still surface its log tail so it's diagnosable.
-if wo stack install --redis </dev/null; then
-  ok "Redis stack installed."
-else
-  warn "wo stack install --redis returned non-zero — last lines of /var/log/wo/wordops.log:"
-  tail -n 20 /var/log/wo/wordops.log 2>/dev/null || true
-  WARNINGS+=("wo stack install --redis returned non-zero — verify Redis manually.")
-fi
+cat > /etc/nginx/nginx.conf <<'EOF'
+# Managed by wcloud (init.sh). Sites live in sites-enabled/<domain>.conf.
+user www-data;
+worker_processes auto;
+worker_rlimit_nofile 65535;
+pid /run/nginx.pid;
+error_log /var/log/nginx/error.log;
+include /etc/nginx/modules-enabled/*.conf;
 
-# ------------------------------------------------------------
-step "Securing default Nginx vhost"
-
-info "Writing default catch-all vhost..."
-# Same contract as the agent's nginx edits: back up, write, `nginx -t`, and
-# restore on failure — a broken default vhost would make every later `nginx -t`
-# (so every SSL/canonical op) fail on this box.
-DEFAULT_VHOST=/etc/nginx/sites-available/default
-DEFAULT_BAK=""
-if [ -f "$DEFAULT_VHOST" ]; then
-  DEFAULT_BAK="$DEFAULT_VHOST.wcloud-bak"
-  cp -p "$DEFAULT_VHOST" "$DEFAULT_BAK"
-fi
-DEFAULT_LINKED=0
-cat >"$DEFAULT_VHOST" <<'EOF'
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-
-    server_name _;
-
-    root /var/www/html;
-
-    # Allow Let's Encrypt HTTP-01 challenge
-    location ^~ /.well-known/acme-challenge/ {
-        allow all;
-        default_type "text/plain";
-        try_files $uri =404;
-    }
-
-    location / {
-        return 403;
-    }
+events {
+    worker_connections 4096;
+    multi_accept on;
 }
 
-server {
-    listen 443 ssl default_server;
-    listen [::]:443 ssl default_server;
+http {
+    sendfile on;
+    tcp_nopush on;
+    types_hash_max_size 2048;
+    server_tokens off;
+    server_names_hash_bucket_size 128;
+    server_names_hash_max_size 4096;
+    client_max_body_size 512m;
+    keepalive_timeout 65;
 
-    server_name _;
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
 
-    root /var/www/html;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:20m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
 
-    ssl_certificate     /var/www/22222/cert/22222.crt;
-    ssl_certificate_key /var/www/22222/cert/22222.key;
+    access_log /var/log/nginx/access.log;
 
-    # Allow Let's Encrypt HTTP-01 challenge
-    location ^~ /.well-known/acme-challenge/ {
-        allow all;
-        default_type "text/plain";
-        try_files $uri =404;
-    }
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 5;
+    gzip_min_length 256;
+    gzip_types text/plain text/css text/xml text/javascript application/javascript application/json application/xml application/rss+xml application/atom+xml image/svg+xml font/ttf font/otf;
 
-    location / {
-        return 403;
-    }
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
 }
 EOF
 
-# Ensure the vhost is actually enabled (WordOps normally symlinks it, but be safe).
-if [ ! -e /etc/nginx/sites-enabled/default ]; then
-  ln -s "$DEFAULT_VHOST" /etc/nginx/sites-enabled/default && DEFAULT_LINKED=1
+# Catch-all for unknown hosts: close the connection. A throwaway self-signed
+# cert answers TLS for them (nginx on 22.04 predates ssl_reject_handshake).
+mkdir -p /etc/nginx/ssl
+if [ ! -s /etc/nginx/ssl/default.key ]; then
+  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -subj "/CN=invalid" \
+    -keyout /etc/nginx/ssl/default.key -out /etc/nginx/ssl/default.crt >/dev/null 2>&1
+  chmod 600 /etc/nginx/ssl/default.key
 fi
-
-info "Preparing ACME challenge directory..."
-mkdir -p /var/www/html/.well-known/acme-challenge
-chown -R www-data:www-data /var/www/html/.well-known
-chmod -R 755 /var/www/html/.well-known
-
-info "Testing Nginx configuration..."
-if nginx -t; then
-  [ -n "$DEFAULT_BAK" ] && rm -f "$DEFAULT_BAK"
-  if systemctl reload nginx; then
-    ok "Default catch-all installed (unknown domains -> 403, ACME allowed)."
-  else
-    warn "nginx reload failed."
-    WARNINGS+=("nginx reload failed after installing default vhost.")
-  fi
-else
-  if [ -n "$DEFAULT_BAK" ]; then mv -f "$DEFAULT_BAK" "$DEFAULT_VHOST"; else rm -f "$DEFAULT_VHOST"; fi
-  [ "$DEFAULT_LINKED" = 1 ] && rm -f /etc/nginx/sites-enabled/default
-  warn "nginx -t failed — the previous default vhost was restored and nothing was reloaded."
-  WARNINGS+=("nginx -t failed for the default catch-all vhost (reverted; unknown domains are not blocked).")
-fi
-
-# ============================================================
-# PHP-FPM Tuning for WordOps (dynamic version detection)
-# ============================================================
-# Detect highest installed PHP version under /etc/php (e.g., 8.4, 8.3)
-PHP_VERSION=$(ls /etc/php 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
-if [ -z "$PHP_VERSION" ]; then
-  PHP_VERSION="8.3"
-fi
-PHP_INI="/etc/php/$PHP_VERSION/fpm/php.ini"
-POOL_CONF="/etc/php/$PHP_VERSION/fpm/pool.d/www.conf"
-
-banner "$C_CYAN" "PHP-FPM $PHP_VERSION Tuning (WordOps)" \
-  "php.ini : $PHP_INI" \
-  "pool    : $POOL_CONF"
-
-# ------------------------------------------------------------
-step "Checking PHP config files"
-[ -f "$PHP_INI" ]   || die "PHP-FPM php.ini not found: $PHP_INI"
-ok "Found php.ini"
-[ -f "$POOL_CONF" ] || die "PHP-FPM pool config not found: $POOL_CONF"
-ok "Found pool config"
-
-# Sets `key = value`, uncommenting/replacing an existing line or appending.
-set_ini_value() {
-  local file="$1" key="$2" value="$3"
-  if grep -qE "^[;[:space:]]*$key[[:space:]]*=" "$file"; then
-    sed -i -E "s|^[;[:space:]]*$key[[:space:]]*=.*|$key = $value|" "$file"
-  else
-    echo "$key = $value" >> "$file"
-  fi
-  info "$(printf '%-24s = %s' "$key" "$value")"
+rm -f /etc/nginx/sites-enabled/default
+cat > /etc/nginx/sites-enabled/00-default.conf <<'EOF'
+# Managed by wcloud (init.sh): requests for domains not hosted here.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    location ^~ /.well-known/acme-challenge/ { root /var/www/html; default_type text/plain; try_files $uri =404; }
+    location / { return 444; }
 }
 
-# ------------------------------------------------------------
-step "Tuning php.ini"
-set_ini_value "$PHP_INI" "max_execution_time"     "600"
-set_ini_value "$PHP_INI" "max_input_time"         "600"
-set_ini_value "$PHP_INI" "max_input_vars"         "3000"
-set_ini_value "$PHP_INI" "memory_limit"           "512M"
-set_ini_value "$PHP_INI" "post_max_size"          "512M"
-set_ini_value "$PHP_INI" "upload_max_filesize"    "512M"
-set_ini_value "$PHP_INI" "session.gc_maxlifetime" "1440"
-ok "php.ini tuned (7 directives)"
+server {
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
+    server_name _;
+    ssl_certificate     /etc/nginx/ssl/default.crt;
+    ssl_certificate_key /etc/nginx/ssl/default.key;
+    return 444;
+}
+EOF
 
-# ------------------------------------------------------------
-step "Tuning PHP-FPM pool"
-set_ini_value "$POOL_CONF" "pm.start_servers"     "12"
-set_ini_value "$POOL_CONF" "pm.min_spare_servers" "8"
-set_ini_value "$POOL_CONF" "pm.max_spare_servers" "16"
-set_ini_value "$POOL_CONF" "pm.max_children"      "30"
-set_ini_value "$POOL_CONF" "pm.max_requests"      "500"
-ok "Pool tuned (5 directives)"
+# HTTP-01 challenges for every site are answered from here (root-owned: no
+# site can write into it).
+mkdir -p /var/www/html/.well-known/acme-challenge
+chmod 755 /var/www /var/www/html /var/www/html/.well-known /var/www/html/.well-known/acme-challenge
+rm -f /var/www/html/index.nginx-debian.html
 
-# ------------------------------------------------------------
-step "Restarting & verifying PHP-FPM"
-if run "restart php$PHP_VERSION-fpm" systemctl restart "php$PHP_VERSION-fpm"; then
-  echo
-  info "Effective values:"
-  "php-fpm$PHP_VERSION" -i 2>/dev/null \
-    | grep -E "max_execution_time|max_input_time|max_input_vars|memory_limit|post_max_size|upload_max_filesize|session.gc_maxlifetime" \
-    | sed 's/^/     /'
+# Per-site PHP error logs (written by each site's own user).
+mkdir -p /var/log/wcloud && chmod 755 /var/log/wcloud
+cat > /etc/logrotate.d/wcloud <<'EOF'
+/var/log/wcloud/*.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+
+if nginx -t; then
+  systemctl reload nginx || systemctl restart nginx || die "nginx failed to (re)start."
+  rm -rf "$NGX_BAK"
+  ok "Nginx configured (unknown domains are refused, ACME challenges allowed)."
 else
-  WARNINGS+=("php$PHP_VERSION-fpm failed to restart — check journalctl -u php$PHP_VERSION-fpm.")
+  cp -a "$NGX_BAK/nginx.conf" /etc/nginx/nginx.conf 2>/dev/null
+  if [ -e "$NGX_BAK/00-default.conf" ]; then cp -a "$NGX_BAK/00-default.conf" /etc/nginx/sites-enabled/; else rm -f /etc/nginx/sites-enabled/00-default.conf; fi
+  rm -rf "$NGX_BAK"
+  die "The nginx configuration failed its test — previous files restored. See the output above."
+fi
+
+# ------------------------------------------------------------
+step "Configuring MariaDB and Redis"
+MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+BUF_MB=$(( MEM_MB / 4 )); [ "$BUF_MB" -lt 128 ] && BUF_MB=128
+cat > /etc/mysql/mariadb.conf.d/60-wcloud.cnf <<EOF
+# Managed by wcloud (init.sh): sized for this server's ${MEM_MB} MB of RAM.
+[mysqld]
+innodb_buffer_pool_size = ${BUF_MB}M
+max_connections = 300
+EOF
+systemctl restart mariadb || die "MariaDB failed to start — check journalctl -u mariadb."
+# The agent manages databases as root over the unix socket (Ubuntu default).
+mysql -e 'SELECT 1' >/dev/null 2>&1 || die "MariaDB is not accepting root connections over its socket."
+ok "MariaDB ready (buffer pool ${BUF_MB} MB)."
+
+# Redis: the passwordless default user is turned off; each site gets its own
+# login confined to its key prefix (src/lib/stack.js). The agent's admin
+# password is root-only.
+mkdir -p /etc/wcloud && chmod 700 /etc/wcloud
+if [ ! -s /etc/wcloud/redis-admin.pass ]; then
+  ( umask 077; openssl rand -hex 24 > /etc/wcloud/redis-admin.pass )
+fi
+REDIS_ACL=/etc/redis/users.acl
+if [ ! -s "$REDIS_ACL" ]; then
+  REDIS_HASH=$(tr -d '\n' < /etc/wcloud/redis-admin.pass | sha256sum | cut -d' ' -f1)
+  printf 'user default off\nuser wcloud on #%s ~* +@all\n' "$REDIS_HASH" > "$REDIS_ACL"
+  chown redis:redis "$REDIS_ACL" && chmod 640 "$REDIS_ACL"
+fi
+grep -q '^aclfile ' /etc/redis/redis.conf || echo "aclfile $REDIS_ACL" >> /etc/redis/redis.conf
+# One database per site (REDIS_DBS in src/lib/stack.js); empty ones cost ~nothing.
+sed -i -E 's/^databases [0-9]+/databases 1024/' /etc/redis/redis.conf
+grep -q '^databases ' /etc/redis/redis.conf || echo 'databases 1024' >> /etc/redis/redis.conf
+systemctl restart redis-server || die "Redis failed to start — check journalctl -u redis-server."
+if REDISCLI_AUTH="$(cat /etc/wcloud/redis-admin.pass)" redis-cli --user wcloud --no-auth-warning ping 2>/dev/null | grep -q PONG; then
+  ok "Redis ready (per-site logins)."
+else
+  warn "Redis is running but the admin login failed — sites will run without an object cache."
+  WARNINGS+=("Redis admin login failed — object cache unavailable.")
 fi
 
 # ------------------------------------------------------------
@@ -629,14 +661,17 @@ else
   fi
 fi
 
+# apt_wait paused the apt timers for the install; security updates resume now.
+systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+
 # ------------------------------------------------------------
 # Summary
 # ------------------------------------------------------------
 echo
 if [ "${#WARNINGS[@]}" -eq 0 ]; then
   banner "$C_GREEN" "${G_OK} Server initialization complete" \
-    "WordOps + Redis installed" \
-    "Nginx default secured, PHP tuned" \
+    "Nginx, PHP $PHP_DEFAULT, MariaDB, Redis installed" \
+    "WP-CLI + acme.sh (Let's Encrypt) ready" \
     "Node.js installed, agent configured & started"
 else
   banner "$C_YELLOW" "${G_WARN} Initialized with ${#WARNINGS[@]} warning(s)" \
@@ -649,6 +684,6 @@ fi
 
 echo
 printf '   %sNext steps:%s\n' "$C_BOLD" "$C_RESET"
-printf '     %s%s Deploy a WordPress site: wo site create <domain> --wp%s\n' "$C_DIM" "$G_ARROW" "$C_RESET"
+printf '     %s%s Add a site from the wcloud dashboard%s\n' "$C_DIM" "$G_ARROW" "$C_RESET"
 printf '     %s%s Check the agent service: systemctl status wcloud%s\n' "$C_DIM" "$G_ARROW" "$C_RESET"
 echo

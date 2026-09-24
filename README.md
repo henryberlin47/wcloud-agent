@@ -1,16 +1,18 @@
 # wcloud Agent
 
-Part of **wcloud** (WordOps Multi-Site Manager). The control panel lives in a
+Part of **wcloud** (multi-server site manager). The control panel lives in a
 separate repo, [`wcloud-portal`](../wcloud-portal); this repo is the agent that
-runs on each WordOps server.
+runs on each server — and the installer for the web stack it manages (nginx,
+PHP-FPM 8.1–8.4, MariaDB, Redis, WP-CLI, acme.sh on Ubuntu 22.04/24.04). Every
+site gets its own system user, PHP pool, database and Redis login.
 
 A per-server HTTP agent for wcloud. Runs deploy/update/
 delete/ssl/purge/reset-password operations so the control panel can trigger them
 over an authenticated API instead of SSH. Returns a **job ID** immediately and
 streams **live logs** over SSE.
 
-> **Security posture.** The agent runs as **root** (it invokes `wo`, nginx,
-> systemctl). Its bearer token is therefore equivalent to root. Bind to a
+> **Security posture.** The agent runs as **root** (it manages nginx, php-fpm,
+> MariaDB, users). Its bearer token is therefore equivalent to root. Bind to a
 > private/VPN interface, set an IP allowlist, and keep the token secret. The IP
 > allowlist is checked **before** the token; only `/healthz` skips it. So the
 > allowlist must contain the portal's *egress* IP — if it doesn't, ping still
@@ -18,15 +20,17 @@ streams **live logs** over SSE.
 
 ## Operations
 
-All logic is native JS in `src/operations/*.js`, built on shared helpers in
-`src/lib/sys.js` (process, filesystem, wo, nginx, wp-cli wrappers).
+All logic is native JS in `src/operations/*.js`, built on `src/lib/` (`sites.js`
+is the site model — see AGENTS.md §6).
 
 | Operation | Params | What it does |
 |---|---|---|
-| **deploy** | `{ domain, wp_user?, wp_password? }` | `wo site create --wp` + SSL |
-| **update** | `{ domain }` | `wp core update` + `wp core update-db` + php-fpm restart |
-| **delete** | `{ domain, confirm: true }` | Removes cron, files, WordOps site, nginx config, certs |
-| **ssl** | `{ domain }` | `wo site update --le --force` |
+| **deploy** | `{ domain, type?: wordpress\|static, php?, wp_user?, wp_password?, canonical?, enableWww?, issueSsl?, cert?, key? }` | Creates the site (user, pool, vhost, DB, WordPress) + HTTPS |
+| **php** | `{ domain, php }` | Switch the site's PHP version (installed on demand) |
+| **update** | `{ domain }` | `wp core update` + `wp core update-db` + php-fpm reload |
+| **delete** | `{ domain, confirm: true }` | Removes everything the site has: files, DB, user, pool, vhost, certs |
+| **ssl** | `{ domain, mode: off\|le-http\|le-dns-manual\|custom, cert?, key? }` | HTTPS on/off, Let's Encrypt (auto-renew) or your own certificate |
+| **canonical** | `{ domain, canonical: www\|root\|none, enableWww }` | Preferred address + www |
 | **purge** | `{ domain }` | WP Rocket page cache + object cache flush |
 | **resetPassword** | `{ domain, wp_password }` | `wp user update --user_pass` on the admin account |
 
@@ -44,8 +48,8 @@ curl -fsSL https://raw.githubusercontent.com/henryberlin47/wcloud-agent/main/ini
     ALLOWED_IPS='<portal-egress-ip>' bash
 ```
 
-`init.sh` clones this repo to `/opt/wcloud`, installs WordOps + the agent, writes
-`.env`, and starts the systemd service. Then:
+`init.sh` clones this repo to `/opt/wcloud`, installs the web stack + the agent,
+writes `.env`, and starts the systemd service (about 3–5 minutes). Then:
 
 - **Live progress** streams to the portal while it installs (each run mints its
   own `PROVISION_ID`); watch it as a card on the portal's `/servers` page.
@@ -110,7 +114,8 @@ must come from an allowed IP.
 |---|---|---|
 | GET | `/healthz` | Liveness (no auth, skips the IP allowlist) |
 | GET | `/api/info` | System info (memory, disk, CPU load, software stack, OS/kernel, uptime) + supported operations |
-| GET | `/api/sites` | List websites (`wo site list`) |
+| GET | `/api/sites` | List sites (+ `details`: type, PHP version, HTTPS) |
+| GET | `/api/sites/:domain` | One site's settings |
 | GET | `/api/sites/:domain/credentials` | DB credentials, read live from the site's `wp-config.php` |
 | POST | `/api/op/:type` | Start an operation → `{ jobId }` |
 | GET | `/api/jobs` | List recent jobs |
