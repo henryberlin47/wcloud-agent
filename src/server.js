@@ -55,7 +55,7 @@ if (config.trustProxy) app.set('trust proxy', true);
 // --- health (unauthenticated, minimal) --------------------------------------
 // Useful for the panel to see the server is up before auth. Reveals nothing.
 app.get('/healthz', (req, res) => {
-  res.json({ ok: true, server: config.serverName, version: config.version, time: Date.now() });
+  res.json({ ok: true, server: config.serverName, version: config.version, commit: config.commit, time: Date.now() });
 });
 
 // --- export archive (one-time token, no auth needed) -------------------------
@@ -92,6 +92,7 @@ app.get('/api/info', async (req, res) => {
   const info = {
     server: config.serverName,
     version: config.version,
+    commit: config.commit,
     operations: ['deploy', 'update', 'delete', 'ssl', 'sslDnsVerify', 'canonical', 'purge', 'resetPassword', 'export', 'import'],
     maxConcurrentJobs: config.maxConcurrentJobs,
   };

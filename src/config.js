@@ -2,6 +2,8 @@
 // nothing sensitive is baked into the source. See .env.example.
 
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 function parseList(v) {
   if (!v) return [];
@@ -13,6 +15,16 @@ let agentVersion = '';
 try {
   agentVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version || '';
 } catch { /* running without package.json — leave blank */ }
+
+// The exact code running: short git commit of the checkout (repo root). Self-
+// update often ships without a package.json bump, so the version alone can't
+// show whether an update took. Read once — self-update restarts the process.
+let agentCommit = '';
+try {
+  agentCommit = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)), timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
+  }).toString().trim();
+} catch { /* not a git checkout, or git missing — leave blank */ }
 
 const config = {
   // HTTP
@@ -52,6 +64,7 @@ const config = {
 
   // This agent's version (from package.json), surfaced in /healthz + /api/info.
   version: agentVersion,
+  commit: agentCommit, // short git hash of the running checkout ('' if unknown)
 
   // Self-enrollment (optional). When both are set, the agent registers itself
   // with the portal on startup, so there's no manual "add server" step.

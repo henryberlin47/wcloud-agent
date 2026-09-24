@@ -23,6 +23,7 @@ export async function enroll() {
     name: config.serverName,
     hostname: os.hostname(),
     version: config.version,
+    commit: config.commit,
     provision_id: config.provisionId,
   };
 
