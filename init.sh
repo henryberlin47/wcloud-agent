@@ -126,6 +126,15 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+# Non-interactive apt for the whole run. Under `curl | bash`, any apt operation
+# that draws a TUI prompt hangs provisioning forever — most notably Ubuntu's
+# needrestart popping a "Pending kernel upgrade" / service-restart dialog after
+# NodeSource's prereq install. These exports are inherited by every child
+# (WordOps, NodeSource, apt-get) so no step can block on a dialog.
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a       # auto-restart services, never ask
+export NEEDRESTART_SUSPEND=1    # belt-and-suspenders: disable needrestart prompts
+
 # The normal (non-root) user that should own the GitHub SSH key. When the script
 # is run via sudo, $SUDO_USER is that user. Falls back to a detected login user.
 TARGET_USER="${SUDO_USER:-}"
