@@ -1,5 +1,11 @@
 import express from 'express';
+import dns from 'node:dns';
 import { execSync, spawn } from 'node:child_process';
+
+// Prefer IPv4 for the agent's own outbound (enrolment, provision log) — fresh
+// VPS images often have a broken/unrouted IPv6 that stalls Node's fetch. Mirrors
+// the system-wide gai.conf preference init.sh sets.
+dns.setDefaultResultOrder('ipv4first');
 import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';

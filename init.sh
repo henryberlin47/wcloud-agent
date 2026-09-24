@@ -113,6 +113,15 @@ if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
 fi
 
 # ------------------------------------------------------------
+# Prefer IPv4 for everything. Fresh VPS images often ship a broken/unrouted IPv6
+# that silently stalls curl/git/apt/wo/acme.sh and enrollment on long timeouts.
+# gai.conf makes the whole system prefer IPv4 (covers every glibc-based tool);
+# explicit `-4` on our own fetches below is belt-and-suspenders.
+if ! grep -qs '^precedence ::ffff:0:0/96  100' /etc/gai.conf 2>/dev/null; then
+  printf '\n# wcloud: prefer IPv4 (broken IPv6 on fresh VPS stalls installs)\nprecedence ::ffff:0:0/96  100\n' >> /etc/gai.conf
+fi
+
+# ------------------------------------------------------------
 # Portal provisioning stream (optional). When the install command supplies a
 # PROVISION_ID, mirror all output + step milestones to the portal so the user can
 # watch this install live. Best-effort — it must never break the install.
@@ -134,7 +143,7 @@ if [ -n "$PROVISION_ID" ] && [ -n "${ENROLL_URL:-}" ] && [ -n "${ENROLL_TOKEN:-}
   # Real milestone poster (replaces the early no-op stub).
   provision_event() { # $1=status $2=step $3=step_no $4=step_total
     [ -n "$PORTAL_ORIGIN" ] || return 0
-    curl -fsS -m 8 -X POST "$PORTAL_ORIGIN/api/provision/$PROVISION_ID/log" \
+    curl -4 -fsS -m 8 -X POST "$PORTAL_ORIGIN/api/provision/$PROVISION_ID/log" \
       -H "Authorization: Bearer $ENROLL_TOKEN" -H "X-Name: $PROVISION_NAME" \
       ${1:+-H "X-Status: $1"} ${2:+-H "X-Step: $2"} ${3:+-H "X-Step-No: $3"} ${4:+-H "X-Step-Total: $4"} \
       >/dev/null 2>&1 || true
@@ -151,7 +160,7 @@ if [ -n "$PROVISION_ID" ] && [ -n "${ENROLL_URL:-}" ] && [ -n "${ENROLL_TOKEN:-}
       if [ "${sz:-0}" -gt "$off" ]; then
         if tail -c +$((off + 1)) "$PROVISION_LOG" 2>/dev/null \
              | sed "s/${ESC}\[[0-9;?]*[A-Za-z]//g" | tr -d '\r' \
-             | curl -fsS -m 8 -X POST "$PORTAL_ORIGIN/api/provision/$PROVISION_ID/log" \
+             | curl -4 -fsS -m 8 -X POST "$PORTAL_ORIGIN/api/provision/$PROVISION_ID/log" \
                  -H "Authorization: Bearer $ENROLL_TOKEN" -H 'Content-Type: text/plain' \
                  --data-binary @- >/dev/null 2>&1; then
           off=$sz
@@ -209,7 +218,7 @@ if command -v wo >/dev/null 2>&1; then
   ok "WordOps already installed ($(wo --version 2>/dev/null | head -n1 || echo present)) — skipping."
 else
   info "Downloading WordOps installer (wops.cc)..."
-  if wget -qO /tmp/wo-install wops.cc && bash /tmp/wo-install </dev/null; then
+  if wget -4 -qO /tmp/wo-install wops.cc && bash /tmp/wo-install </dev/null; then
     ok "WordOps installed."
   else
     rm -f /tmp/wo-install
@@ -387,7 +396,7 @@ if command -v node >/dev/null 2>&1; then
   ok "Node.js already installed ($(node --version 2>/dev/null))"
 else
   info "Node.js not found — installing Node.js 22.x LTS via NodeSource..."
-  if curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh \
+  if curl -4 -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh \
      && bash /tmp/nodesource_setup.sh \
      && apt-get install -y nodejs; then
     rm -f /tmp/nodesource_setup.sh
