@@ -96,6 +96,27 @@ run() {
   fi
 }
 
+# Fresh cloud images run unattended-upgrades / apt-daily on first boot, which hold
+# /var/lib/dpkg/lock-frontend. Any apt-based install (WordOps, `wo stack install`)
+# then dies with "Could not get lock ... held by process N (unattended-upgr)".
+# Stop those timers/services so they can't re-grab the lock during provisioning,
+# then wait for any in-flight run to release it. Call before every apt step.
+apt_wait() {
+  systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service >/dev/null 2>&1 || true
+  local waited=0
+  # `fuser` returns non-zero (or 127 if absent) when the lock is free → loop ends.
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+     || fuser /var/lib/apt/lists/lock     >/dev/null 2>&1; do
+    if [ "$waited" -ge 300 ]; then
+      warn "dpkg/apt lock still held after 5m — proceeding anyway."
+      break
+    fi
+    [ "$waited" -eq 0 ] && info "Background apt (unattended-upgrades) is running; waiting for the dpkg lock..."
+    sleep 5; waited=$((waited + 5))
+  done
+}
+
 # ============================================================
 #  Root check (must come AFTER helpers — err/C_DIM are used here)
 # ============================================================
@@ -214,6 +235,7 @@ GIT_RAND=$(openssl rand -hex 4)
 git config --global user.name  >/dev/null 2>&1 || git config --global user.name  "wcloud-$GIT_RAND"
 git config --global user.email >/dev/null 2>&1 || git config --global user.email "wcloud-$GIT_RAND@wcloud.local"
 
+apt_wait
 if command -v wo >/dev/null 2>&1; then
   ok "WordOps already installed ($(wo --version 2>/dev/null | head -n1 || echo present)) — skipping."
 else
@@ -236,19 +258,29 @@ command -v wo >/dev/null 2>&1 || die "wo not found on PATH after install."
 
 # ------------------------------------------------------------
 step "Installing WordOps stack"
+# The base stack (nginx/php/mysql) is mandatory: without it every later step
+# cascades into "nginx: command not found". `wo stack install` returns 0 when the
+# stack is already present, so a non-zero here is a genuine failure, not "already
+# installed" — treat it as fatal and surface WordOps' own log (the portal's
+# provision stream can't see the box, so its "check the log" is otherwise useless).
+apt_wait
 if wo stack install; then
   ok "Base stack installed."
 else
-  warn "wo stack install returned non-zero (may already be installed)."
-  WARNINGS+=("wo stack install returned non-zero — verify base stack manually.")
+  err "wo stack install failed — last lines of /var/log/wo/wordops.log:"
+  tail -n 30 /var/log/wo/wordops.log 2>/dev/null || true
+  die "WordOps base stack install failed — see the log above (common causes: unsupported OS release/arch, apt repo/lock, no disk)."
 fi
 
 # ------------------------------------------------------------
 step "Installing Redis stack"
+# Redis is the object cache — non-essential, so a redis-only failure warns rather
+# than aborts, but we still surface its log tail so it's diagnosable.
 if wo stack install --redis; then
   ok "Redis stack installed."
 else
-  warn "wo stack install --redis returned non-zero (may already be installed)."
+  warn "wo stack install --redis returned non-zero — last lines of /var/log/wo/wordops.log:"
+  tail -n 20 /var/log/wo/wordops.log 2>/dev/null || true
   WARNINGS+=("wo stack install --redis returned non-zero — verify Redis manually.")
 fi
 
