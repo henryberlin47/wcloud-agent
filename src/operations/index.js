@@ -10,6 +10,8 @@ import { runImport } from './import.js';
 import { runBackup } from './backup.js';
 import { runRestore } from './restore.js';
 import { runPhp } from './php.js';
+import { runPlugin } from './plugin.js';
+import { PLUGIN_NAME, UPLOAD_NAME } from '../lib/plugins.js';
 import { SITE_TYPES } from '../lib/sites.js';
 import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
 
@@ -129,6 +131,48 @@ const phpOp = {
   },
   async run(job, helpers, p) {
     await runPhp(job, helpers, p);
+  },
+};
+
+// ============================================================
+//  plugin — manage a WordPress site's plugins (see plugin.js)
+// ============================================================
+const PLUGIN_ACTIONS = ['install', 'activate', 'deactivate', 'update', 'delete', 'auto-update-on', 'auto-update-off'];
+const pluginOp = {
+  name: 'plugin',
+  // params: { domain, action, plugins?: [name], all?, slug?, upload?, activate?, replace? }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    const action = PLUGIN_ACTIONS.includes(p.action) ? p.action : null;
+    if (!action) errors.push(`action must be one of: ${PLUGIN_ACTIONS.join(', ')}`);
+    const clean = { domain: p.domain, action };
+    if (action === 'install') {
+      // Exactly one source: a WordPress.org slug or an uploaded zip.
+      if (typeof p.upload === 'string' && p.upload) {
+        if (!UPLOAD_NAME.test(p.upload)) errors.push('upload must be a file from the upload endpoint');
+        clean.upload = p.upload;
+      } else if (typeof p.slug === 'string' && /^[a-z0-9-]{1,100}$/.test(p.slug)) {
+        clean.slug = p.slug;
+      } else errors.push('slug (a WordPress.org plugin slug) or upload is required');
+      clean.activate = p.activate === true;
+      clean.replace = p.replace === true;
+    } else if (action) {
+      // update/activate/… accept all:true where wp-cli supports --all
+      if (p.all === true && action !== 'delete') clean.all = true;
+      else {
+        const plugins = Array.isArray(p.plugins) ? p.plugins : [];
+        if (!plugins.length || plugins.length > 200 || !plugins.every((n) => typeof n === 'string' && PLUGIN_NAME.test(n))) {
+          errors.push('plugins must be a list of plugin names');
+        }
+        clean.plugins = plugins;
+      }
+    }
+    return { ok: errors.length === 0, errors, clean };
+  },
+  async run(job, helpers, p) {
+    await runPlugin(job, helpers, p);
   },
 };
 
@@ -444,7 +488,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { deploy, php: phpOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { deploy, php: phpOp, plugin: pluginOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

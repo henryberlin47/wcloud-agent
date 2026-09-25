@@ -25,6 +25,9 @@ import { readWpVersion, readDbCredentials } from './lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService } from './lib/stack.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
+import { createPmaLink } from './lib/pma.js';
+import { listPlugins, searchPlugins } from './lib/plugins.js';
+import { siteTmp } from './lib/sites.js';
 import { enroll } from './enroll.js';
 
 // --- startup validation -----------------------------------------------------
@@ -375,6 +378,46 @@ app.post('/api/sites/:domain/wp-login', siteParam, async (req, res) => {
   } catch (e) {
     res.status(502).json({ error: 'login_failed', message: e?.message || 'failed' });
   }
+});
+
+// --- one-click phpMyAdmin for a site's database (lib/pma.js) -----------------
+// { url, db, https, expires_in } — single-use sign-in link, 2 minutes.
+app.post('/api/sites/:domain/pma-login', siteParam, async (req, res) => {
+  if (req.site.type !== 'wordpress') return res.status(400).json({ error: 'not_wordpress', message: 'Only WordPress sites have a database.' });
+  try {
+    res.json(await createPmaLink(NOOP_HELPERS, req.site));
+  } catch (e) {
+    res.status(502).json({ error: 'pma_failed', message: e?.message || 'failed' });
+  }
+});
+
+// --- WordPress plugins (changes are the `plugin` op) -------------------------
+const wpOnly = (req, res, next) => (req.site.type === 'wordpress' ? next()
+  : res.status(400).json({ error: 'not_wordpress', message: 'Only WordPress sites have plugins.' }));
+
+app.get('/api/sites/:domain/plugins', siteParam, wpOnly, async (req, res) => {
+  try { res.json({ plugins: await listPlugins(NOOP_HELPERS, req.site) }); }
+  catch (e) { res.status(502).json({ error: 'plugins_failed', message: e.message }); }
+});
+
+app.get('/api/sites/:domain/plugins/search', siteParam, wpOnly, async (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 100) : '';
+  if (!q) return res.status(400).json({ error: 'EINVAL', message: 'Type something to search for.' });
+  try { res.json({ plugins: await searchPlugins(NOOP_HELPERS, req.site, q) }); }
+  catch (e) { res.status(502).json({ error: 'search_failed', message: e.message }); }
+});
+
+// A plugin .zip → the site's PRIVATE tmp/ (never web-reachable), written as the
+// site's user. Returns { upload } for the `plugin` op's install action.
+app.put('/api/sites/:domain/plugins/upload', siteParam, wpOnly, async (req, res) => {
+  if (req.is('application/json')) return res.status(415).json({ error: 'unsupported', message: 'Send the zip as application/octet-stream.' });
+  const upload = `wcloud-upload-${randomBytes(8).toString('hex')}.zip`;
+  const child = await spawnWorker(req.site, 'write', { path: upload, max: 100 * 1024 * 1024 }, { root: siteTmp(req.site.domain) });
+  child.stdin.on('error', () => {});
+  req.pipe(child.stdin);
+  const r = await settle(child, { timeout: 30 * 60_000 });
+  if (!r.ok) return fmFail(res, r);
+  res.json({ upload, size: r.data?.size });
 });
 
 // --- file manager -----------------------------------------------------------

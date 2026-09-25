@@ -69,6 +69,30 @@ as the source of truth for writing code** — the graph is only a map.
   (rewritten on every call, as the site user) deletes it before checking —
   single use even when invalid — then sets the auth cookie. The minting PHP
   goes to `wp eval-file -` on stdin, so the token never touches argv.
+- `POST /api/sites/:domain/pma-login` — **one-click phpMyAdmin** (`lib/pma.js`):
+  `{ url, db, https, expires_in }`. phpMyAdmin is installed ONCE per server by
+  `init.sh` (latest release, SHA-256 verified, `setup/` etc. removed) at
+  `/usr/share/wcloud-pma` → versioned dir, with `auth_type=signon` and our
+  `wcloud-signon.php`. Each WordPress vhost serves it at `/.wcloud-pma/` through
+  **that site's own PHP pool** (runs as the site user) and the link signs in
+  with **that site's own DB login** (read live from wp-config) — it can see
+  only that database. No login form: the agent writes a token file
+  `{user,password,db,expires}` into the site's `tmp/wcloud-pma/` AS THE SITE
+  USER (password on stdin), named by the token's SHA-256; the signon script
+  deletes it before checking (single use), 2-minute expiry. `libraries/`,
+  `templates/`, `vendor/`, `sql/` are denied by nginx. The call re-applies the
+  site (older vhosts gain the location; no-op otherwise).
+- **Plugins** (WordPress sites): `GET /api/sites/:domain/plugins` (live
+  `wp plugin list`), `GET …/plugins/search?q=` (WordPress.org, from the server),
+  `PUT …/plugins/upload` (raw .zip ≤100 MB → the site's PRIVATE `tmp/` as
+  `wcloud-upload-<hex>.zip`, written by fm-worker as the site user — never
+  web-reachable) → `{ upload }`. Changes are the **`plugin` op**
+  (`operations/plugin.js`): `install` (WordPress.org `slug` or `upload`,
+  `activate`, `replace` → `--force`; the zip is always removed), `activate`,
+  `deactivate`, `update` (names or `all`), `delete` (= `wp plugin uninstall
+  --deactivate`, i.e. WordPress's own Delete incl. the uninstall routine),
+  `auto-update-on|off`. Plugin names are checked against `PLUGIN_NAME` (no
+  leading `--` can reach wp-cli); all wp-cli runs as the site user.
 - `GET /api/sites/:domain/credentials` — DB creds read **live** from `wp-config.php`.
   404 = not a readable WP site.
 - `GET /api/sites/:domain/wp` — WordPress core version, read **live** via
@@ -229,6 +253,8 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   `{code:-1}` — use it on probes that might hang). Also `userIds(name)`,
   `certCovers`, nginx/systemctl helpers.
 - **wplogin.js** — one-click wp-admin login links (§2).
+- **pma.js** — one-click phpMyAdmin links for a site's database (§2).
+- **plugins.js** — plugin list + WordPress.org search (changes: the `plugin` op).
 - **files.js** + **../fm-worker.js** — the file manager (§2): spawn the worker
   as the site user, collect its JSON / stream its output, map error codes.
 - **sites.js** — the site model (§6): spec store (`readSpec`/`listSites`),

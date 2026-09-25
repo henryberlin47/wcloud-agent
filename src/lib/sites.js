@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import config from '../config.js';
-import { run, pathExists, removePath, userIds, nginxTest, nginxReload } from './sys.js';
+import { run, pathExists, removePath, userIds, nginxTest, nginxReload, sleep } from './sys.js';
 import { logger } from './log.js';
 import { ensurePhp, installedPhp, fpmService, dropDatabase, dropRedisUser, REDIS_DBS } from './stack.js';
 import { setupWordPress, pinWpUrls } from './wp.js';
@@ -29,6 +29,10 @@ import { setupWordPress, pinWpUrls } from './wp.js';
 // ============================================================
 
 export const SITE_TYPES = ['wordpress', 'static'];
+
+// phpMyAdmin: installed once per server by init.sh, served per WordPress site.
+export const PMA_DIR = '/usr/share/wcloud-pma';
+export const PMA_PATH = '/.wcloud-pma/';
 
 const SPEC_DIR = '/etc/wcloud/sites';
 export const siteDir = (d) => `${config.wwwDir}/${d}`;
@@ -120,6 +124,22 @@ function siteBody(s) {
     '    fastcgi_buffer_size 32k;',
     '}',
     assets('/index.php?$args'),
+    '',
+    // phpMyAdmin, reachable only through a single-use link from the panel
+    // (lib/pma.js). Runs in THIS site's pool, as this site's user, signed in
+    // with this site's DB login. ^~ wins over the regex locations above.
+    `location ^~ ${PMA_PATH} {`,
+    `    alias ${PMA_DIR}/;`,
+    '    index index.php;',
+    `    location ~ ^${PMA_PATH.replace(/\./g, '\\.')}(?:libraries|templates|vendor|sql|config)/ { deny all; }`,
+    `    location ~ ^${PMA_PATH.replace(/\./g, '\\.')}(.+\\.php)$ {`,
+    `        alias ${PMA_DIR}/$1;`,
+    '        include fastcgi_params;',
+    `        fastcgi_param SCRIPT_FILENAME ${PMA_DIR}/$1;`,
+    `        fastcgi_pass unix:${sockPath(d)};`,
+    '        fastcgi_read_timeout 600s;',
+    '    }',
+    '}',
   ];
 }
 
@@ -239,6 +259,11 @@ export async function applySite(helpers, s, { certs, prevPhp } = {}) {
 
   // Old version first (it lets go of the socket), then the new one.
   for (const v of poolVersions) await run(helpers, 'systemctl', ['reload-or-restart', fpmService(v)], { timeout: 60_000 });
+  // A php-fpm reload returns before the new pool's socket exists: wait for it,
+  // or the site's first requests after "ready" get a 502.
+  if (poolVersions.includes(s.php)) {
+    for (let i = 0; i < 50 && !(await pathExists(sockPath(d))); i++) await sleep(200);
+  }
   if (changed.some((e) => !e.path.startsWith('/etc/php/') && e.path !== specPath(d))) await nginxReload(helpers);
   return { changed: true };
 }

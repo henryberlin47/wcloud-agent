@@ -29,7 +29,7 @@ fi
 
 BOX_WIDTH=60
 STEP_NO=0
-STEP_TOTAL=12
+STEP_TOTAL=13
 WARNINGS=()
 
 _repeat() { local n=$1 ch=$2 out=''; while ((n-- > 0)); do out+="$ch"; done; printf '%s' "$out"; }
@@ -317,6 +317,106 @@ if curl -4 -fsSL -o /usr/local/bin/wp.new https://raw.githubusercontent.com/wp-c
 else
   rm -f /usr/local/bin/wp.new
   die "WP-CLI download failed."
+fi
+
+# ------------------------------------------------------------
+step "Installing phpMyAdmin"
+# One copy per server, served by each WordPress site at /.wcloud-pma/ through
+# that SITE's own PHP pool and signed in with that site's own database login
+# (see src/lib/pma.js) — it can only ever see that one site's database.
+# There is no login form: the panel hands out single-use sign-in links.
+# Latest release, checksum-verified; a re-run upgrades it.
+PMA_DIR=/usr/share/wcloud-pma
+PMA_VER=$(curl -4 -fsSL https://www.phpmyadmin.net/home_page/version.txt 2>/dev/null | head -n1)
+if ! [[ "$PMA_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  warn "Could not look up the latest phpMyAdmin version — skipping (re-run the installer later)."
+  WARNINGS+=("phpMyAdmin not installed (version lookup failed).")
+elif [ -f "$PMA_DIR-$PMA_VER/index.php" ]; then
+  ok "phpMyAdmin $PMA_VER already installed."
+else
+  PMA_TMP=$(mktemp -d)
+  PMA_TGZ="phpMyAdmin-$PMA_VER-english.tar.gz"
+  PMA_URL="https://files.phpmyadmin.net/phpMyAdmin/$PMA_VER/$PMA_TGZ"
+  if curl -4 -fsSL -o "$PMA_TMP/$PMA_TGZ" "$PMA_URL" \
+     && curl -4 -fsSL -o "$PMA_TMP/$PMA_TGZ.sha256" "$PMA_URL.sha256" \
+     && (cd "$PMA_TMP" && sha256sum -c "$PMA_TGZ.sha256" >/dev/null) \
+     && tar xzf "$PMA_TMP/$PMA_TGZ" -C "$PMA_TMP"; then
+    rm -rf "$PMA_DIR-$PMA_VER"
+    mv "$PMA_TMP/phpMyAdmin-$PMA_VER-english" "$PMA_DIR-$PMA_VER"
+    rm -rf "$PMA_DIR-$PMA_VER"/{setup,examples,test,doc} # not needed, and setup/ is a known target
+    ok "phpMyAdmin $PMA_VER installed (checksum verified)."
+  else
+    warn "phpMyAdmin download or checksum check failed — skipping."
+    WARNINGS+=("phpMyAdmin not installed (download/checksum failed).")
+  fi
+  rm -rf "$PMA_TMP"
+fi
+if [ -f "$PMA_DIR-$PMA_VER/index.php" ]; then
+  # blowfish_secret: stable across upgrades. (Readable by site users — phpMyAdmin
+  # runs as them — which is fine: signon auth keeps no credentials in cookies.)
+  mkdir -p /etc/wcloud && chmod 700 /etc/wcloud
+  [ -s /etc/wcloud/pma.secret ] || ( umask 077; openssl rand -hex 16 > /etc/wcloud/pma.secret )
+  PMA_SECRET=$(cat /etc/wcloud/pma.secret)
+  cat > "$PMA_DIR-$PMA_VER/config.inc.php" <<EOF
+<?php
+// Managed by wcloud (init.sh). phpMyAdmin runs in each site's own PHP pool.
+declare(strict_types=1);
+\$cfg['blowfish_secret'] = '$PMA_SECRET';
+\$cfg['Servers'][1]['auth_type'] = 'signon';
+\$cfg['Servers'][1]['SignonSession'] = 'WcloudPMA';
+\$cfg['Servers'][1]['SignonURL'] = 'wcloud-signon.php';
+\$cfg['Servers'][1]['LogoutURL'] = 'wcloud-signon.php?logout=1';
+\$cfg['Servers'][1]['host'] = 'localhost';
+\$cfg['Servers'][1]['AllowRoot'] = false;
+\$cfg['Servers'][1]['AllowNoPassword'] = false;
+// The pool points sys_temp_dir at the site's own tmp/.
+\$cfg['TempDir'] = sys_get_temp_dir() . '/wcloud-pma-tmp';
+if (!is_dir(\$cfg['TempDir'])) { @mkdir(\$cfg['TempDir'], 0700, true); }
+\$cfg['UploadDir'] = '';
+\$cfg['SaveDir'] = '';
+\$cfg['VersionCheck'] = false;
+\$cfg['SendErrorReports'] = 'never';
+\$cfg['ShowCreateDb'] = false;
+EOF
+  cat > "$PMA_DIR-$PMA_VER/wcloud-signon.php" <<'EOF'
+<?php
+// wcloud: single-use sign-in to phpMyAdmin from the panel. The agent drops a
+// token file (JSON: user, password, db, expires) in THIS site's own temp dir,
+// named by the token's SHA-256; this redeems it once and hands the login to
+// phpMyAdmin's signon session. No token → no way in (there is no login form).
+declare(strict_types=1);
+$fail = static function (string $msg): void {
+    http_response_code(403);
+    header('Content-Type: text/plain; charset=utf-8');
+    exit($msg);
+};
+if (isset($_GET['logout'])) {
+    $fail('Signed out of phpMyAdmin. Open it again from your wcloud panel.');
+}
+$t = $_GET['t'] ?? '';
+if (!is_string($t) || !preg_match('/^[a-f0-9]{64}$/', $t)) {
+    $fail('Open phpMyAdmin from your wcloud panel.');
+}
+$file = sys_get_temp_dir() . '/wcloud-pma/' . hash('sha256', $t);
+$raw = @file_get_contents($file);
+@unlink($file); // single use, even when expired
+$d = $raw ? json_decode($raw, true) : null;
+if (!is_array($d) || ($d['expires'] ?? 0) < time()) {
+    $fail('This phpMyAdmin link has expired or was already used. Open a new one from your wcloud panel.');
+}
+session_name('WcloudPMA');
+session_set_cookie_params(['path' => rtrim(dirname($_SERVER['SCRIPT_NAME']), '/') . '/', 'httponly' => true, 'samesite' => 'Lax', 'secure' => !empty($_SERVER['HTTPS'])]);
+session_start();
+session_regenerate_id(true);
+$_SESSION['PMA_single_signon_user'] = (string) $d['user'];
+$_SESSION['PMA_single_signon_password'] = (string) $d['password'];
+$_SESSION['PMA_single_signon_host'] = 'localhost';
+session_write_close();
+header('Location: index.php' . (!empty($d['db']) ? '?route=/database/structure&db=' . rawurlencode((string) $d['db']) : ''));
+EOF
+  chown -R root:root "$PMA_DIR-$PMA_VER"
+  chmod -R u=rwX,go=rX "$PMA_DIR-$PMA_VER"
+  ln -sfn "$PMA_DIR-$PMA_VER" "$PMA_DIR"   # atomic switch; old versions are left for rollback
 fi
 
 # ------------------------------------------------------------

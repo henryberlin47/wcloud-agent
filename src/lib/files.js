@@ -18,10 +18,12 @@ export const UPLOAD_MAX = 512 * 1024 * 1024; // matches the PHP upload limit
 const STATUS = { ENOENT: 404, EEXIST: 409, EACCES: 403, EPERM: 403, ETOOBIG: 413 };
 export const statusFor = (code) => STATUS[code] || 400;
 
-export async function spawnWorker(site, op, args = {}) {
+// root: the folder the worker is confined to — the web root, or the site's
+// private tmp/ for plugin uploads that must never be web-reachable.
+export async function spawnWorker(site, op, args = {}, { root = webRoot(site.domain) } = {}) {
   const { uid, gid } = await userIds(site.user);
-  return spawn(process.execPath, [WORKER, op, webRoot(site.domain), JSON.stringify(args)], {
-    uid, gid, cwd: webRoot(site.domain),
+  return spawn(process.execPath, [WORKER, op, root, JSON.stringify(args)], {
+    uid, gid, cwd: root,
     env: { PATH: '/usr/bin:/bin', HOME: siteTmp(site.domain), LANG: 'C.UTF-8' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });

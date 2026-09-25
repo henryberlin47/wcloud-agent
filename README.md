@@ -3,7 +3,8 @@
 Part of **wcloud** (multi-server site manager). The control panel lives in a
 separate repo, [`wcloud-portal`](../wcloud-portal); this repo is the agent that
 runs on each server — and the installer for the web stack it manages (nginx,
-PHP-FPM 8.1–8.4, MariaDB, Redis, WP-CLI, acme.sh on Ubuntu 22.04/24.04). Every
+PHP-FPM 8.1–8.4, MariaDB, Redis, WP-CLI, acme.sh, phpMyAdmin on Ubuntu
+22.04/24.04). Every
 site gets its own system user, PHP pool, database and Redis login.
 
 A per-server HTTP agent for wcloud. Runs deploy/update/
