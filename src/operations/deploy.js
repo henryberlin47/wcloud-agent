@@ -1,7 +1,7 @@
 import { logger } from '../lib/log.js';
 import { checkCustomCert } from '../lib/certcheck.js';
 import { createSite, applySslConf, syncWpAddress, requireSpec } from '../lib/sites.js';
-import { issueHttp } from '../lib/acme.js';
+import { issueHttp, issueDnsCloudflare } from '../lib/acme.js';
 import { syncCachePlugin, setObjectCache } from '../lib/cache.js';
 
 // ============================================================
@@ -56,6 +56,15 @@ export async function runDeploy(job, helpers, p) {
     } catch (e) {
       warn(`The site is live over HTTP, but the certificate couldn't be enabled: ${e?.message || e} Try again from the site page.`);
     }
+  } else if (p.issueSsl && p.cfToken) {
+    // Cloudflare manages the DNS: DNS-01 through its API works whether or not
+    // the site is proxied (orange cloud) — HTTP-01 can be broken by the proxy.
+    step('Issue the HTTPS certificate (Let\'s Encrypt via Cloudflare DNS)');
+    const r = await issueDnsCloudflare(helpers, domain, { www: p.enableWww, token: p.cfToken, zoneId: p.cfZoneId });
+    if (r.ok) ok(`HTTPS enabled for ${p.enableWww ? `${domain} and www.${domain}` : domain} — renews itself`);
+    else warn(r.timedOut
+      ? 'The certificate request timed out. The site is live over HTTP — issue HTTPS from the site page once it settles.'
+      : 'Could not issue the certificate through Cloudflare — check that the token can edit DNS for this zone. The site is live over HTTP; enable HTTPS from the site page.');
   } else if (p.issueSsl) {
     step('Issue the HTTPS certificate');
     const r = await issueHttp(helpers, domain, { www: p.enableWww });

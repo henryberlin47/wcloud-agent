@@ -120,7 +120,15 @@ const deploy = {
     // certificate replaces Let's Encrypt.
     const issueSsl = !cert && p.issueSsl !== false;
 
-    return { ok: errors.length === 0, errors, clean: { domain: p.domain, type, php, cache, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww, issueSsl, ...(cert ? { cert, key } : {}) } };
+    // Cloudflare-managed DNS: the portal passes the zone token so the
+    // certificate is issued over DNS-01 (redacted in job views: "token").
+    let cf = {};
+    if (issueSsl && p.cfToken != null) {
+      if (typeof p.cfToken !== 'string' || !/^[A-Za-z0-9_-]{30,200}$/.test(p.cfToken)) errors.push('cfToken is invalid');
+      if (typeof p.cfZoneId !== 'string' || !/^[a-f0-9]{32}$/.test(p.cfZoneId)) errors.push('cfZoneId is invalid');
+      cf = { cfToken: p.cfToken, cfZoneId: p.cfZoneId };
+    }
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, type, php, cache, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww, issueSsl, ...(cert ? { cert, key } : {}), ...cf } };
   },
   async run(job, helpers, p) {
     await runDeploy(job, helpers, p);
