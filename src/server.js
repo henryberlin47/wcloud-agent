@@ -10,6 +10,7 @@ import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import https from 'node:https';
 import config, { validateConfig } from './config.js';
 import { requireAuth } from './auth.js';
 import { operations, getOperation, normDomain, isDomain } from './operations/index.js';
@@ -575,14 +576,18 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'internal_error' });
 });
 
-const server = app.listen(config.port, config.host, () => {
+const onListen = () => {
   console.log(
-    `[agent] ${config.serverName} listening on http://${config.host}:${config.port} ` +
+    `[agent] ${config.serverName} listening on ${config.tls ? 'https' : 'http'}://${config.host}:${config.port} ` +
       `(allowlist: ${config.allowedIps.length ? config.allowedIps.join(',') : 'ANY'}, ` +
       `concurrency: ${config.maxConcurrentJobs})`
   );
+  if (!config.tls) console.warn('[agent] WARNING: no TLS certificate (/etc/wcloud/agent.crt) — serving plain HTTP; the bearer token crosses the network unencrypted.');
   enroll(); // self-register with the portal if PORTAL_ENROLL_URL/ENROLL_TOKEN are set
-});
+};
+const server = config.tls
+  ? https.createServer({ key: config.tls.key, cert: config.tls.cert, minVersion: 'TLSv1.2' }, app).listen(config.port, config.host, onListen)
+  : app.listen(config.port, config.host, onListen);
 
 // Graceful shutdown
 for (const sig of ['SIGINT', 'SIGTERM']) {

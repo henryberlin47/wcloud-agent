@@ -91,6 +91,26 @@ as the source of truth for writing code** — the graph is only a map.
   job status/logs/cancel. Jobs are **in-memory** (`src/jobs.js`), serialized
   (`AGENT_MAX_CONCURRENT=1`), forgotten ~1h after finishing.
 
+### Transport security (TLS pinning) + sandbox
+
+- The agent serves **HTTPS** with a self-signed EC certificate `init.sh` creates
+  at `/etc/wcloud/agent.{crt,key}` (kept across re-runs). `config.tls` holds it
+  plus its SHA-256 **fingerprint** and **SPKI pin**; both go to the portal in
+  the enroll payload — over the *portal's* HTTPS, with the one-time enroll
+  token — and the portal refuses any other certificate from then on. No
+  cert files → plain HTTP with a loud warning (dev only).
+- `publicUrl()` (config.js) is the one place the agent's own URL is built
+  (enrollment, export download links).
+- Server-to-server archive downloads (import `sourceUrl`) carry the source
+  agent's `sourcePin`; curl checks it with `--pinnedpubkey` (`-k` only skips
+  the CA chain — the pin is still enforced). No pin → normal CA verification,
+  which a self-signed agent fails: never "accept anything".
+- `wcloud.service` sandboxing (NoNewPrivileges, PrivateDevices, Protect*,
+  ProtectHome + HOME=/var/lib/wcloud, …) is defence in depth, not a wall. **No
+  `User=root` line**: with these options an explicit `User=root` makes systemd
+  drop CAP_SETUID, and every run-as-site-user spawn fails with EPERM. `init.sh`
+  always installs the repo's unit; self-update does not (re-run init.sh).
+
 ---
 
 ## 3. Operations

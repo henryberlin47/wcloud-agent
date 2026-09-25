@@ -1,7 +1,7 @@
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
-import config from './config.js';
+import config, { publicUrl } from './config.js';
 
 // Enroll tokens are one-time, so once we've registered we must not try again on
 // every restart (the portal would 409). A marker file records success.
@@ -14,7 +14,7 @@ export async function enroll() {
   if (!config.enrollUrl || !config.enrollToken) return;
   if (fs.existsSync(MARKER)) return; // already enrolled (one-time token spent)
 
-  const base_url = config.advertiseUrl || `http://${config.host}:${config.port}`;
+  const base_url = publicUrl();
   const payload = {
     token: config.enrollToken,
     api_key: config.authToken,
@@ -25,6 +25,9 @@ export async function enroll() {
     version: config.version,
     commit: config.commit,
     provision_id: config.provisionId,
+    // The portal pins these: from now on it only talks to this exact certificate.
+    tls_fingerprint: config.tls?.fingerprint || null,
+    tls_spki: config.tls?.spki || null,
   };
 
   for (let attempt = 1; attempt <= 3; attempt++) {

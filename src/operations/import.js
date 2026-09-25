@@ -82,6 +82,9 @@ export async function runImport(job, helpers, p) {
         // otherwise happily follow an http(s) URL into file:// or a link-local
         // metadata address.
         '--proto', '=http,https', '--proto-redir', '=http,https',
+        // Another agent's self-signed certificate: trusted by its pinned public
+        // key (curl still checks the pin with -k), never by "accept anything".
+        ...(p.sourcePin ? ['-k', '--pinnedpubkey', `sha256//${p.sourcePin}`] : []),
         '-sL', '--fail', '--create-dirs',
         '-o', `${tmpDir}/export.tar.gz.enc`,
         p.sourceUrl,

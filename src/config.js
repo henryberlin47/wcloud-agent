@@ -3,6 +3,7 @@
 
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { X509Certificate, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 function parseList(v) {
@@ -76,6 +77,33 @@ const config = {
   // override if the agent is behind NAT/proxy with a different public address.
   advertiseUrl: process.env.AGENT_ADVERTISE_URL || '',
 };
+
+// TLS: init.sh generates a self-signed certificate for the agent. The portal
+// pins its fingerprint at enrollment (sent over the portal's own HTTPS, with
+// the one-time enroll token), so the connection is encrypted AND can't be
+// intercepted — no CA or domain needed. Missing files → plain HTTP (dev only).
+function loadTls() {
+  const certPath = process.env.AGENT_TLS_CERT || '/etc/wcloud/agent.crt';
+  const keyPath = process.env.AGENT_TLS_KEY || '/etc/wcloud/agent.key';
+  try {
+    const cert = readFileSync(certPath);
+    const key = readFileSync(keyPath);
+    const x = new X509Certificate(cert);
+    return {
+      cert, key,
+      fingerprint: x.fingerprint256, // what the portal pins ("AB:CD:…")
+      // SPKI pin for curl --pinnedpubkey (server-to-server archive downloads)
+      spki: createHash('sha256').update(x.publicKey.export({ type: 'spki', format: 'der' })).digest('base64'),
+    };
+  } catch {
+    return null;
+  }
+}
+config.tls = loadTls();
+
+// Where the portal (and other agents, for archive downloads) reach this agent.
+export const publicUrl = () =>
+  (config.advertiseUrl || `${config.tls ? 'https' : 'http'}://${config.host}:${config.port}`).replace(/\/+$/, '');
 
 export function validateConfig() {
   const problems = [];

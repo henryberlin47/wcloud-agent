@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
-import config from '../config.js';
+import { publicUrl } from '../config.js';
 import { run, pathExists, removePath } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import { requireSpec, publicSpec, siteDir, siteTmp } from '../lib/sites.js';
@@ -137,8 +137,7 @@ export async function runExport(job, helpers, p) {
   // because no later export runs cleanupExports.
   setTimeout(cleanupExports, 3600_000 + 1000).unref();
 
-  const baseUrl = config.advertiseUrl || `http://${config.host}:${config.port}`;
-  const fetchUrl = `${baseUrl.replace(/\/+$/, '')}/api/export/${token}`;
+  const fetchUrl = `${publicUrl()}/api/export/${token}`;
 
   // Return URL as job result (not logged — token is secret).
   job.result = { url: fetchUrl, token, localArchive: finalPath };

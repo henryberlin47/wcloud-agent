@@ -5,19 +5,44 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Runs as root (by design — it invokes root-level deploy/delete scripts).
-User=root
+# Runs as root by design (the default — no User= line: an explicit User=root
+# combined with the sandboxing below makes systemd drop CAP_SETUID, and the
+# agent can no longer run wp-cli / the file manager as a site's user).
+# It manages users, nginx, php-fpm, MariaDB, packages; work done on a site's
+# behalf (wp-cli, file manager) runs as that site's user.
 WorkingDirectory=/opt/wcloud
-# Load config from an env file (keep AGENT_TOKEN out of the unit file).
+# Config + token live in an env file, not in this unit.
 EnvironmentFile=/opt/wcloud/.env
 ExecStart=/usr/bin/node /opt/wcloud/src/server.js
 Restart=on-failure
 RestartSec=3
-# Basic hardening (the agent still needs broad access to run deploys, so these
-# are conservative — tighten per your environment).
-NoNewPrivileges=false
-ProtectSystem=false
-# Log to journald.
+
+# ── Sandboxing ─────────────────────────────────────────────────────────────
+# Defence in depth, not a wall: a root process that may write /etc and talk
+# to systemd can always escape. These close the easy paths for an exploit and
+# stop accidents. Every option here is exercised by the full operation suite
+# (install PHP via apt, create/delete sites + users, certs, file manager).
+# Deliberately NOT set: ProtectSystem (writes /etc/nginx, /etc/php, users),
+# RestrictSUIDSGID (site web roots are setgid dirs; apt may install setuid
+# files), PrivateTmp (cleans other processes' /tmp cron locks),
+# MemoryDenyWriteExecute (breaks V8's JIT).
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectHome=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+# /root is hidden (ProtectHome): npm/git during self-update use this instead.
+StateDirectory=wcloud
+Environment=HOME=/var/lib/wcloud
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=wcloud

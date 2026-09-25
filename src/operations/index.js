@@ -344,6 +344,11 @@ const importOp = {
     }
     reqDomain(errors, 'domain', out.domain);
     if (out.sourceDomain && !isDomain(out.sourceDomain)) errors.push('sourceDomain must be a valid domain');
+    // The source agent's public-key pin (base64 SHA-256 of its SPKI): its
+    // certificate is self-signed, so this is what makes the download trusted.
+    if (out.sourcePin != null && out.sourcePin !== '' && !/^[A-Za-z0-9+/]{43}=$/.test(String(out.sourcePin))) {
+      errors.push('sourcePin must be a base64 SHA-256 public-key pin');
+    }
     let canonical = (out.canonical === 'www' || out.canonical === 'root' || out.canonical === 'none') ? out.canonical : 'none';
     const enableWww = out.enableWww !== false;
     if (canonical === 'www' && !enableWww) canonical = 'root'; // can't redirect to a host we don't serve
@@ -352,6 +357,7 @@ const importOp = {
       errors,
       clean: {
         sourceUrl: out.sourceUrl,
+        sourcePin: out.sourcePin || null,
         domain: out.domain,
         sourceDomain: out.sourceDomain || out.domain,
         includeSsl: out.includeSsl === true,

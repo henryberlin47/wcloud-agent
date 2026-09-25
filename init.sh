@@ -525,6 +525,22 @@ command -v npm >/dev/null 2>&1 && ok "npm present ($(npm --version 2>/dev/null))
 
 # ------------------------------------------------------------
 step "Generating agent configuration"
+# The agent's TLS certificate. Self-signed on purpose: the portal pins its
+# fingerprint when the agent enrolls, which is stronger than trusting any CA and
+# needs no domain. Kept across re-runs — a new certificate would break the pin
+# (re-enrolling, e.g. with a fresh install command, re-pins it).
+mkdir -p /etc/wcloud && chmod 700 /etc/wcloud
+if [ ! -s /etc/wcloud/agent.key ] || [ ! -s /etc/wcloud/agent.crt ]; then
+  if ( umask 077; openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 \
+         -subj "/CN=wcloud-agent $(hostname)" -keyout /etc/wcloud/agent.key -out /etc/wcloud/agent.crt ) >/dev/null 2>&1; then
+    ok "Agent TLS certificate created (pinned by the portal at enrollment)"
+  else
+    warn "Could not create the agent TLS certificate — the agent will serve plain HTTP."
+    WARNINGS+=("No agent TLS certificate — portal traffic to this server is unencrypted.")
+  fi
+else
+  ok "Agent TLS certificate kept"
+fi
 # Canonical location — .env in the agent's working directory so both
 # systemd EnvironmentFile= and dotenv (require('dotenv').config()) find it.
 AGENT_CONFIG="/opt/wcloud/.env"
@@ -634,31 +650,22 @@ fi
 
 # ------------------------------------------------------------
 step "Deploying wcloud service"
-if [ -f "/etc/systemd/system/wcloud.service" ]; then
-  ok "wcloud service already deployed"
-  systemctl daemon-reload
-  if systemctl restart wcloud.service; then
-    ok "wcloud service restarted"
-  else
-    warn "wcloud restart failed — check journalctl -u wcloud."
-    WARNINGS+=("wcloud.service failed to restart.")
-  fi
+[ -f /opt/wcloud/wcloud.service ] \
+  || die "/opt/wcloud/wcloud.service not found — cannot deploy agent unit."
+# Sanity-check it's actually a systemd unit, not stray file content
+if ! grep -q '^\[Service\]' /opt/wcloud/wcloud.service \
+   || ! grep -q '^ExecStart=' /opt/wcloud/wcloud.service; then
+  die "wcloud.service is not a valid systemd unit (missing [Service]/ExecStart) — fix the file in the repo."
+fi
+# Always install the repo's unit: re-runs pick up sandboxing changes.
+cp "/opt/wcloud/wcloud.service" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable wcloud.service >/dev/null 2>&1
+if systemctl restart wcloud.service; then
+  ok "wcloud service started"
 else
-  [ -f /opt/wcloud/wcloud.service ] \
-    || die "/opt/wcloud/wcloud.service not found — cannot deploy agent unit."
-  # Sanity-check it's actually a systemd unit, not stray file content
-  if ! grep -q '^\[Service\]' /opt/wcloud/wcloud.service \
-     || ! grep -q '^ExecStart=' /opt/wcloud/wcloud.service; then
-    die "wcloud.service is not a valid systemd unit (missing [Service]/ExecStart) — fix the file in the repo."
-  fi
-  cp "/opt/wcloud/wcloud.service" /etc/systemd/system/
-  systemctl daemon-reload
-  if systemctl enable --now wcloud.service; then
-    ok "wcloud service started"
-  else
-    warn "wcloud failed to start — check journalctl -u wcloud."
-    WARNINGS+=("wcloud.service failed to start.")
-  fi
+  warn "wcloud failed to start — check journalctl -u wcloud."
+  WARNINGS+=("wcloud.service failed to start.")
 fi
 
 # apt_wait paused the apt timers for the install; security updates resume now.
