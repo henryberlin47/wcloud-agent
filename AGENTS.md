@@ -93,6 +93,12 @@ as the source of truth for writing code** — the graph is only a map.
   --deactivate`, i.e. WordPress's own Delete incl. the uninstall routine),
   `auto-update-on|off`. Plugin names are checked against `PLUGIN_NAME` (no
   leading `--` can reach wp-cli); all wp-cli runs as the site user.
+- **Search engine visibility** (WordPress): `GET /api/sites/:domain/indexing`
+  → `{ indexing }` (WordPress's `blog_public`, read live); the `indexing` op
+  `{ domain, enabled }` sets it (same setting as Settings → Reading) and clears
+  the page cache. The vhost sends `/robots.txt` to `index.php?robots=1`, so
+  WordPress's virtual robots.txt works even on plain permalinks (where it would
+  otherwise 301 to `/robots.txt/`).
 - `GET /api/sites/:domain/credentials` — DB creds read **live** from `wp-config.php`.
   404 = not a readable WP site.
 - `GET /api/sites/:domain/wp` — WordPress core version, read **live** via

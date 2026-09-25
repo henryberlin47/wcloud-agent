@@ -12,6 +12,7 @@ import { runRestore } from './restore.js';
 import { runPhp } from './php.js';
 import { runPlugin } from './plugin.js';
 import { runCache } from './cache.js';
+import { runIndexing } from './indexing.js';
 import { CACHE_MODES } from '../lib/sites.js';
 import { PLUGIN_NAME, UPLOAD_NAME } from '../lib/plugins.js';
 import { SITE_TYPES } from '../lib/sites.js';
@@ -204,6 +205,24 @@ const cacheOp = {
   },
   async run(job, helpers, p) {
     await runCache(job, helpers, p);
+  },
+};
+
+// ============================================================
+//  indexing — search engine visibility (see indexing.js)
+// ============================================================
+const indexingOp = {
+  name: 'indexing',
+  // params: { domain, enabled: boolean }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    if (typeof p.enabled !== 'boolean') errors.push('enabled must be true or false');
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, enabled: p.enabled } };
+  },
+  async run(job, helpers, p) {
+    await runIndexing(job, helpers, p);
   },
 };
 
@@ -519,7 +538,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { deploy, php: phpOp, plugin: pluginOp, cache: cacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { deploy, php: phpOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

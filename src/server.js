@@ -21,7 +21,7 @@ import { listTopLevel, putObject, deleteObject, statObject, explainSpacesError }
 import { readSiteSsl } from './lib/certinfo.js';
 import { readChallenge } from './lib/acme.js';
 import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
-import { readWpVersion, readDbCredentials } from './lib/wp.js';
+import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
@@ -407,6 +407,13 @@ app.get('/api/sites/:domain/plugins/search', siteParam, wpOnly, async (req, res)
   if (!q) return res.status(400).json({ error: 'EINVAL', message: 'Type something to search for.' });
   try { res.json({ plugins: await searchPlugins(NOOP_HELPERS, req.site, q) }); }
   catch (e) { res.status(502).json({ error: 'search_failed', message: e.message }); }
+});
+
+// Search engine visibility: WordPress's blog_public option (read live).
+app.get('/api/sites/:domain/indexing', siteParam, wpOnly, async (req, res) => {
+  const r = await (await wpCli(NOOP_HELPERS, req.site))(['option', 'get', 'blog_public'], { quiet: true, timeout: 60_000 });
+  if (r.code !== 0) return res.status(502).json({ error: 'wp_failed', message: 'WordPress on this site didn\'t respond — is it installed and working?' });
+  res.json({ indexing: r.stdout.trim() !== '0' });
 });
 
 // A plugin .zip → the site's PRIVATE tmp/ (never web-reachable), written as the

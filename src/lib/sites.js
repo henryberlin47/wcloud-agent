@@ -159,6 +159,10 @@ function siteBody(s) {
       'if ($skip_cache = 1) { set $rocket_file "/wcloud-no-rocket-cache"; }',
     ] : []),
     'location ~* ^/wp-content/uploads/.*\\.php$ { deny all; }',
+    // WordPress only serves its virtual robots.txt through permalink rewrite
+    // rules; on plain permalinks it 301s to /robots.txt/. Ask for it directly
+    // (a real robots.txt file in htdocs still wins).
+    'location = /robots.txt { try_files $uri /index.php?robots=1; access_log off; }',
     mode === 'wprocket'
       ? 'location / { try_files $rocket_file $uri $uri/ /index.php?$args; }'
       : 'location / { try_files $uri $uri/ /index.php?$args; }',
