@@ -158,7 +158,10 @@ Current ops: **deploy** (`type` wordpress|static + `php` → `sites.createSite`,
 **update** (`wp core update` + `update-db` + php-fpm reload), **delete** (custom
 cron/procs/locks, then `sites.deleteSite`; requires `confirm:true`), **ssl** (mode-driven, below),
 **sslDnsVerify** (step 2 of manual DNS-01, below),
-**purge** (WP Rocket + object cache), **resetPassword** (`wp user update --user_pass`),
+**purge** (WP Rocket + object cache), **siteconfig** (`realIp` and/or
+`redirects` → spec → `applySite`; redirects validated by `sites.cleanRedirects`),
+**nginxrule** (named custom nginx rules: save/delete via `lib/nginxrules.js`),
+**resetPassword** (`wp user update --user_pass`),
 **export** (builds the archived site; `buildSiteArchive` in `export.js` is the shared
 archive builder), **import** (restores an archive; `runRestoreFromLocal` in
 `import.js` is the shared restore body — decrypt/extract/DB/SSL/canonical all live
@@ -169,7 +172,7 @@ in params and run with a longer per-op timeout (`AGENT_BACKUP_TIMEOUT_MS`, defau
 12h). No shells are used — args are arrays, so domain values can't inject shell
 syntax.
 
-**ssl — mode-driven (`{ domain, mode, cert?, key? }`)**, never "always issue":
+**ssl — mode-driven (`{ domain, mode, cert?, key?, cfToken?, cfZoneId? }`)**, never "always issue":
 - `off` — `spec.ssl = false` and re-apply: the vhost is rendered without the 443
   server, **the certs stay on disk** (turning HTTPS back on is instant).
 - `le-http` — `acme.issueHttp`: acme.sh HTTP-01 via the shared webroot
@@ -184,6 +187,16 @@ syntax.
   state file (§2) and returns `{ pending, txt_records }`; nothing on the box is
   changed yet. **Step 2** is the `sslDnsVerify` op — the user has added the TXT
   records at their DNS provider by then.
+- `le-dns-cf` — DNS-01 through the **Cloudflare API** (`acme.issueDnsCloudflare`):
+  works behind the orange cloud and renews itself. The portal sends the owner's
+  token for the domain's zone + the zone id. acme.sh's `dns_cf` runs with them in
+  env; its saved `SAVED_CF_*` copy is stripped from `account.conf` straight after,
+  and the acme.sh domain entry is removed (`--remove`) so its cron never renews it
+  with a token it no longer has. The agent keeps `{token, zoneId, www}` in
+  `/etc/wcloud/cf-dns/<d>.json` (root 0600) and sets `spec.sslDns = 'cloudflare'`;
+  `acme.startDnsRenewer` (every 12h) queues an `ssl-renew` job for such sites
+  with ≤30 days left. Any other mode (or deleting the site) removes the token file.
+  Live status: `source: letsencrypt-dns`, `auto_renew: true`.
 - `custom` — pasted fullchain + key. **Validated before anything is written**: both
   parse as PEM, the key's public key equals the cert's (public-key compare — covers
   RSA/EC/Ed25519), and the cert's SAN covers the domain. A bad pair never touches
@@ -290,13 +303,34 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   and IPv4), so the real code lives in `.errors`/`.cause`.
 - **certcheck.js** — `checkCustomCert(domain, cert, key, {www})`: in-memory (Node crypto) validation of a user certificate — PEM parses, key matches, `checkHost` covers the domain, not expired/not-yet-valid; www-coverage and self-signed are warnings. Shared by the ssl op (custom) and deploy. The portal runs the same rules (`server/utils/certcheck.ts`) for its live form check.
 - **log.js** — the step logger used by operations.
+- **sitelogs.js** — `readSiteLog(domain, access|error|php, {lines, q})`: the tail
+  (last 4 MB window) of a site's log, filtered; opened `O_NOFOLLOW` (a symlinked
+  log is refused, never read as root). `GET /api/sites/:d/logs`.
+- **realip.js** — `/etc/nginx/wcloud/cloudflare-realip.conf` (`set_real_ip_from`
+  for every Cloudflare range + `real_ip_header CF-Connecting-IP`), included by a
+  vhost when `spec.realIp` (default on). Only Cloudflare's addresses are trusted,
+  so the header can't be spoofed by a direct visitor. The built-in list is
+  refreshed daily from cloudflare.com/ips-v4|v6 (validated CIDRs, `nginx -t`,
+  restored on failure).
+- **nginxrules.js** — named custom nginx rules in `/var/www/<d>/conf/nginx/<id>.conf`
+  (first line `# wcloud-name: <name>`; disabled = renamed `.conf.off`). Every
+  save/delete is one transaction: write, `nginx -t`, restore the previous files
+  on failure and throw nginx's own `[emerg]` line; success reloads nginx and
+  clears the page cache. `GET /api/sites/:d/nginx-rules` lists them.
 
 ---
 
 ## 6. The site model (`src/lib/sites.js`) — read before touching a site
 
 **`/etc/wcloud/sites/<domain>.json` is the source of truth** (root 0600):
-`{ domain, type, php, user, enableWww, canonical, ssl, redisDb, created_at }`.
+`{ domain, type, php, user, enableWww, canonical, ssl, redisDb, cache, realIp,
+redirects, sslDns, created_at }`.
+`redirects` = `[{ from, to, code: 301|302, regex, keepQuery }]`, rendered as
+`location = "from"` / `location ~ "from"` with `return code "to[$is_args$args]"`.
+`cleanRedirects` is the injection boundary: exact paths start with `/`, patterns
+may not contain whitespace/quotes/`;{}`, targets are a URL or `/path`, and the
+only `$` allowed is `$1`…`$9` (patterns only). A pattern nginx can't compile
+fails `nginx -t` and the transaction rolls back.
 The nginx vhost (`/etc/nginx/sites-enabled/<d>.conf`) and PHP-FPM pool
 (`/etc/php/<v>/fpm/pool.d/<d>.conf`) are **rendered** from it — never edited in
 place, never parsed back. Every change goes through **`applySite(helpers, spec,
@@ -413,6 +447,12 @@ loopback; set to the box's IP to accept portal calls), `AGENT_PORT` (8787),
   `gzip -t`s the archive BEFORE deleting the live site.
 - **Staging is private.** `makeStagingDir` (`mkdtemp`, 0700); archives are
   pre-created `O_EXCL` 0600 so a DB dump/keys are never world-readable in /tmp.
+- **Express 4 doesn't catch rejected async handlers** — one would crash the
+  agent. `server.js` wraps `app.get/post/put/delete` so a rejection reaches the
+  error handler (500 JSON) instead.
+- **`add_header` belongs at server level in the vhost.** nginx drops inherited
+  `add_header`s in any location that sets its own, so an `X-Cache` header inside
+  the PHP location silently discarded every custom-rule header on PHP pages.
 - **Archive ops (export/import/backup/restore) share AGENT_BACKUP_TIMEOUT_MS** (12h)
   — export/import used to get the 20-minute default and large migrations died.
 

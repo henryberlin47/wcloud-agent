@@ -5,6 +5,7 @@ import { run, pathExists, removePath, userIds, nginxTest, nginxReload, sleep } f
 import { logger } from './log.js';
 import { ensurePhp, installedPhp, fpmService, dropDatabase, dropRedisUser, REDIS_DBS } from './stack.js';
 import { setupWordPress, pinWpUrls } from './wp.js';
+import { ensureRealIpConf } from './realip.js';
 
 // ============================================================
 //  sites.js — the site model: one spec file → everything else
@@ -51,6 +52,47 @@ export async function clearPageCache(domain) {
   try { entries = await fs.readdir(pageCacheDir(domain)); } catch { return false; }
   for (const e of entries) await removePath(`${pageCacheDir(domain)}/${e}`);
   return true;
+}
+
+// Real visitor IPs behind Cloudflare (spec.realIp): nginx takes the client IP
+// from CF-Connecting-IP — but ONLY for connections from Cloudflare's published
+// ranges (lib/realip.js keeps this file current), so it can't be spoofed.
+export const REALIP_CONF = '/etc/nginx/wcloud/cloudflare-realip.conf';
+
+// Let's Encrypt via Cloudflare DNS (spec.sslDns = 'cloudflare'): the site's
+// Cloudflare token, root-only, for the agent's own renewals (lib/acme.js).
+export const cfDnsTokenPath = (d) => `/etc/wcloud/cf-dns/${d}.json`;
+
+// Redirects (spec.redirects): [{ from, to, code: 301|302, regex, keepQuery }].
+// Exact paths → `location =`; regexes → `location ~` listed before every other
+// regex location, so they win. `to` may use $1…$9 from a regex.
+export const REDIRECT_MAX = 200;
+const REDIRECT_FROM_EXACT = /^\/[^\s"';{}\\]*$/;
+const REDIRECT_FROM_REGEX = /^[^\s"';{}]{1,300}$/;
+const REDIRECT_TO = /^(https?:\/\/[^\s"';{}\\$]+|\/[^\s"';{}\\$]*)([^\s"';{}\\]*)$/;
+export function cleanRedirects(list) {
+  if (!Array.isArray(list)) return 'redirects must be a list';
+  if (list.length > REDIRECT_MAX) return `up to ${REDIRECT_MAX} redirects`;
+  const out = [];
+  for (const r of list) {
+    const regex = r?.regex === true;
+    const from = String(r?.from || '').trim();
+    const to = String(r?.to || '').trim();
+    const code = r?.code === 302 ? 302 : 301;
+    if (regex ? !REDIRECT_FROM_REGEX.test(from) : !REDIRECT_FROM_EXACT.test(from)) return `"${from}" isn't a valid ${regex ? 'pattern' : 'path (it must start with /)'}`;
+    // Only $1…$9 may appear in the target — no other nginx variables.
+    if (!REDIRECT_TO.test(to) || /\$(?![1-9])/.test(to) || (!regex && /\$/.test(to))) return `"${to}" isn't a valid target (a URL or a path starting with /${regex ? '; $1…$9 for captures' : ''})`;
+    out.push({ from, to, code, regex, keepQuery: r?.keepQuery === true });
+  }
+  return out;
+}
+function redirectLocations(s) {
+  const rs = Array.isArray(s.redirects) ? s.redirects : [];
+  const target = (r) => `"${r.to}${r.keepQuery ? '$is_args$args' : ''}"`;
+  return [
+    ...rs.filter((r) => !r.regex).map((r) => `location = "${r.from}" { return ${r.code} ${target(r)}; }`),
+    ...rs.filter((r) => r.regex).map((r) => `location ~ "${r.from}" { return ${r.code} ${target(r)}; }`),
+  ];
 }
 
 // phpMyAdmin: installed once per server by init.sh, served per WordPress site.
@@ -101,7 +143,9 @@ export async function listSites() {
 // What the portal sees (all of it is non-secret).
 export const publicSpec = (s) => ({
   domain: s.domain, type: s.type, php: s.php || null, enableWww: s.enableWww,
-  canonical: s.canonical, ssl: s.ssl, cache: s.type === 'wordpress' ? cacheMode(s) : null, created_at: s.created_at,
+  canonical: s.canonical, ssl: s.ssl, cache: s.type === 'wordpress' ? cacheMode(s) : null,
+  realIp: !!s.realIp, redirects: Array.isArray(s.redirects) ? s.redirects : [], sslDns: s.sslDns || null,
+  created_at: s.created_at,
 });
 
 // --- rendering ----------------------------------------------------------------
@@ -129,9 +173,11 @@ function siteBody(s) {
     `access_log /var/log/nginx/${d}.access.log;`,
     `error_log /var/log/nginx/${d}.error.log;`,
     '',
+    ...(s.realIp ? ['# Real visitor IPs behind Cloudflare (trusted only from Cloudflare\'s ranges).', `include ${REALIP_CONF};`] : []),
     '# Custom rules for this site (root-owned; not overwritten by wcloud).',
     `include ${siteDir(d)}/conf/nginx/*.conf;`,
     '',
+    ...redirectLocations(s),
     'location ~ /\\.(?!well-known/) { deny all; }',
   ];
   const assets = (fallback) =>
@@ -151,6 +197,10 @@ function siteBody(s) {
     ...common,
     'index index.php index.html;',
     ...(mode === 'off' ? [] : cacheSkipRules()),
+    // At server level, not in the PHP location: a location's own add_header
+    // would stop the site's custom-rule headers from reaching PHP pages.
+    // Empty (= not sent) on responses that didn't go through the cache.
+    ...(mode === 'fastcgi' ? ['add_header X-Cache $upstream_cache_status always;'] : []),
     ...(mode === 'wprocket' ? [
       '# WP Rocket: serve its cached page straight from disk when there is one.',
       'set $rocket_https "";',
@@ -183,7 +233,6 @@ function siteBody(s) {
       '    fastcgi_cache_use_stale error timeout updating invalid_header http_500 http_503;',
       '    fastcgi_cache_background_update on;',
       '    fastcgi_cache_lock on;',
-      '    add_header X-Cache $upstream_cache_status always;',
     ] : []),
     '}',
     assets('/index.php?$args'),
@@ -301,6 +350,7 @@ export async function applySite(helpers, s, { certs, prevPhp } = {}) {
     await fs.chown(pageCacheDir(d), www.uid, www.gid);
     await fs.chmod(pageCacheDir(d), 0o700);
   }
+  if (s.realIp) await ensureRealIpConf();
   const https = s.ssl && (!!certs || (await pathExists(fullchainPath(d))));
   await fs.mkdir(SPEC_DIR, { recursive: true, mode: 0o700 });
   await stage(specPath(d), JSON.stringify(s, null, 2) + '\n', 0o600);
@@ -361,9 +411,11 @@ export async function applySite(helpers, s, { certs, prevPhp } = {}) {
 
 // HTTPS on, with the cert already in certDir or a new pair (joins the same
 // transaction, so a chain nginx rejects restores the previous working cert).
-export async function applySslConf(helpers, domain, { certs } = {}) {
+export async function applySslConf(helpers, domain, { certs, sslDns } = {}) {
   const s = await requireSpec(domain);
-  await applySite(helpers, { ...s, ssl: true }, { certs });
+  // Any other kind of certificate ends Cloudflare-DNS renewals for the site.
+  await applySite(helpers, { ...s, ssl: true, sslDns: sslDns || undefined }, { certs });
+  if (!sslDns) await removePath(cfDnsTokenPath(domain));
   logger(helpers).ok('Web server reloaded with the new certificate');
 }
 
@@ -420,6 +472,7 @@ export async function createSite(helpers, o) {
     s.redisDb = await freeRedisDb();
     s.cache = CACHE_MODES.includes(o.cache) ? o.cache : 'fastcgi';
   }
+  s.realIp = o.realIp !== false; // harmless without Cloudflare: only CF's own ranges are trusted
   try {
     const { uid, gid } = await userIds(user);
     const wwwGid = (await userIds('www-data')).gid;
@@ -476,6 +529,7 @@ export async function deleteSite(helpers, domain, spec = null) {
   }
   await removePath(siteDir(domain));
   await removePath(pageCacheDir(domain));
+  await removePath(cfDnsTokenPath(domain));
   for (const f of [phpLogPath(domain), `/var/log/nginx/${domain}.access.log`, `/var/log/nginx/${domain}.error.log`]) await removePath(f);
   if (ids && ids.uid >= 1000) {
     const del = await run(helpers, 'userdel', [user], { timeout: 30_000 });

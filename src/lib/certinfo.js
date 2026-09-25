@@ -49,14 +49,16 @@ export async function readSiteSsl(helpers, domain) {
     return { ...base, enabled: false, source: 'none', auto_renew: false, note: 'cert on disk could not be parsed' };
   }
   const isLe = /let['’]?s? ?encrypt/i.test(info.issuer);
+  const spec = await readSpec(domain);
   const manual = isLe && (await pathExists(manualMarkerPath(domain)));
-  const source = isLe ? (manual ? 'letsencrypt-manual' : 'letsencrypt') : 'custom';
+  // letsencrypt-dns: issued + renewed through the Cloudflare API (acme.js).
+  const source = isLe ? (spec?.sslDns === 'cloudflare' ? 'letsencrypt-dns' : manual ? 'letsencrypt-manual' : 'letsencrypt') : 'custom';
   return {
     ...base,
     // HTTPS turned off keeps the cert on disk (turning it back on is instant).
-    enabled: !!(await readSpec(domain))?.ssl,
+    enabled: !!spec?.ssl,
     source,
-    auto_renew: source === 'letsencrypt',
+    auto_renew: source === 'letsencrypt' || source === 'letsencrypt-dns',
     issuer: info.issuer,
     subject: info.subject,
     sans: info.sans,

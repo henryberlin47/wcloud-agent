@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import config from '../config.js';
 import { run, pathExists, removePath } from './sys.js';
 import { logger } from './log.js';
-import { certDir, applySslConf, requireSpec, syncWpAddress } from './sites.js';
+import { certDir, applySslConf, requireSpec, syncWpAddress, cfDnsTokenPath } from './sites.js';
 
 // ============================================================
 //  acme.js — Let's Encrypt certificates via acme.sh
@@ -65,6 +65,62 @@ async function installCert(helpers, domain, { renew }) {
   }
   await run(helpers, 'chmod', ['600', `${dir}/cert.pem`, `${dir}/key.pem`, `${dir}/fullchain.pem`, `${dir}/ca.pem`]);
   await run(helpers, 'chown', ['-R', 'root:root', dir]);
+}
+
+// --- DNS-01 through the Cloudflare API (auto-renewing, by the agent) ------------
+// acme.sh's dns_cf plugin sets the TXT records itself — works behind
+// Cloudflare's proxy, no port 80 needed. acme.sh keeps ONE Cloudflare token
+// per server (account.conf), but sites may use different tokens: so the
+// domain is taken off acme.sh's renewal list, acme.sh's saved copy is wiped,
+// and the site's own token is kept root-only for the agent's renewer
+// (startDnsRenewer) instead.
+export async function issueDnsCloudflare(helpers, domain, { www = false, token, zoneId }) {
+  const { err } = logger(helpers);
+  const r = await run(helpers, ACME, [...ACME_OPTS, '--issue', '--server', 'letsencrypt', '--dns', 'dns_cf',
+    '-d', domain, ...(www ? ['-d', `www.${domain}`] : []), '--keylength', 'ec-256', '--force'],
+  { env: { CF_Token: token, CF_Zone_ID: zoneId }, quiet: true, timeout: 600_000 });
+  await forgetAcmeCfToken();
+  if (r.code !== 0) {
+    for (const l of `${r.stdout}\n${r.stderr}`.trim().split('\n').slice(-6)) err(`    ${stripAnsi(l)}`);
+    return { ok: false, timedOut: !!r.timedOut };
+  }
+  await installCert(helpers, domain, { renew: false });
+  await run(helpers, ACME, [...ACME_OPTS, '--remove', '-d', domain, '--ecc'], { quiet: true, timeout: 60_000 });
+  await fs.mkdir('/etc/wcloud/cf-dns', { recursive: true, mode: 0o700 });
+  await fs.writeFile(cfDnsTokenPath(domain), JSON.stringify({ token, zoneId, www }), { mode: 0o600 });
+  await removeManualMarker(domain);
+  await applySslConf(helpers, domain, { sslDns: 'cloudflare' });
+  return { ok: true };
+}
+
+// acme.sh saves the dns_cf credentials it was given into account.conf.
+async function forgetAcmeCfToken() {
+  const conf = '/etc/letsencrypt/config/account.conf';
+  const c = await fs.readFile(conf, 'utf8').catch(() => null);
+  if (c && /^SAVED_CF_/m.test(c)) await fs.writeFile(conf, c.split('\n').filter((l) => !/^SAVED_CF_/.test(l)).join('\n'), { mode: 0o600 });
+}
+
+// Renew Cloudflare-DNS certificates with 30 days or less left. `enqueue`
+// (jobs.js) serialises them with every other operation.
+export function startDnsRenewer(enqueue, { listSites, readCertInfo, fullchainPath }) {
+  const tick = async () => {
+    for (const s of await listSites()) {
+      if (s.sslDns !== 'cloudflare') continue;
+      const info = await readCertInfo({ log() {}, err() {} }, fullchainPath(s.domain));
+      if (info && info.days_left != null && info.days_left > 30) continue;
+      enqueue('ssl-renew', { domain: s.domain }, async (job, helpers) => {
+        const { step, ok } = logger(helpers);
+        step(`Renew the Let's Encrypt certificate for ${s.domain} (Cloudflare DNS)`);
+        let t;
+        try { t = JSON.parse(await fs.readFile(cfDnsTokenPath(s.domain), 'utf8')); } catch { throw new Error('The Cloudflare token for this site is missing — issue the certificate again from the site page.'); }
+        const r = await issueDnsCloudflare(helpers, s.domain, { www: t.www, token: t.token, zoneId: t.zoneId });
+        if (!r.ok) throw new Error('Renewal failed — check that the Cloudflare token still works.');
+        ok('Certificate renewed');
+      });
+    }
+  };
+  setTimeout(() => tick().catch((e) => console.error('[agent] dns renewer:', e.message)), 120_000).unref();
+  setInterval(() => tick().catch((e) => console.error('[agent] dns renewer:', e.message)), 12 * 3600_000).unref();
 }
 
 // --- HTTP-01 (auto-renewing) --------------------------------------------------

@@ -13,6 +13,9 @@ import { runPhp } from './php.js';
 import { runPlugin } from './plugin.js';
 import { runCache } from './cache.js';
 import { runIndexing } from './indexing.js';
+import { runSiteconfig, runNginxrule } from './siteconfig.js';
+import { cleanRedirects } from '../lib/sites.js';
+import { RULE_MAX } from '../lib/nginxrules.js';
 import { CACHE_MODES } from '../lib/sites.js';
 import { PLUGIN_NAME, UPLOAD_NAME } from '../lib/plugins.js';
 import { SITE_TYPES } from '../lib/sites.js';
@@ -227,6 +230,63 @@ const indexingOp = {
 };
 
 // ============================================================
+//  siteconfig — real visitor IPs (Cloudflare) + redirects
+// ============================================================
+const siteconfigOp = {
+  name: 'siteconfig',
+  // params: { domain, realIp?: boolean, redirects?: [{ from, to, code, regex, keepQuery }] }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    const clean = { domain: p.domain };
+    if (p.realIp != null) {
+      if (typeof p.realIp !== 'boolean') errors.push('realIp must be true or false');
+      clean.realIp = p.realIp;
+    }
+    if (p.redirects != null) {
+      const r = cleanRedirects(p.redirects);
+      if (typeof r === 'string') errors.push(r); else clean.redirects = r;
+    }
+    if (clean.realIp == null && clean.redirects == null) errors.push('nothing to change');
+    return { ok: errors.length === 0, errors, clean };
+  },
+  async run(job, helpers, p) {
+    await runSiteconfig(job, helpers, p);
+  },
+};
+
+// ============================================================
+//  nginxrule — a site's named custom nginx rules (lib/nginxrules.js)
+// ============================================================
+const nginxruleOp = {
+  name: 'nginxrule',
+  // params: { domain, action: "save"|"delete", id?, name?, content?, enabled? }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    const action = p.action === 'save' || p.action === 'delete' ? p.action : null;
+    if (!action) errors.push('action must be save or delete');
+    const id = p.id == null || p.id === '' ? undefined : String(p.id);
+    if (id !== undefined && !/^[a-z0-9][a-z0-9-]{0,39}$/.test(id)) errors.push('invalid rule id');
+    if (action === 'delete' && !id) errors.push('id is required');
+    const clean = { domain: p.domain, action, id };
+    if (action === 'save') {
+      const name = typeof p.name === 'string' ? p.name.trim() : '';
+      const content = typeof p.content === 'string' ? p.content : '';
+      if (!name || name.length > 60 || /[\r\n]/.test(name)) errors.push('name is required (60 characters max, one line)');
+      if (content.length > RULE_MAX || content.includes('\0')) errors.push('content is too large');
+      Object.assign(clean, { name, content, enabled: p.enabled !== false });
+    }
+    return { ok: errors.length === 0, errors, clean };
+  },
+  async run(job, helpers, p) {
+    await runNginxrule(job, helpers, p);
+  },
+};
+
+// ============================================================
 //  update
 // ============================================================
 const update = {
@@ -267,10 +327,10 @@ const del = {
 // cert/key ride the authenticated body only. redactParams (jobs.js) masks
 // them in every job view; the ops never log them. le-dns-manual starts the
 // two-step manual DNS-01 flow (verified by the sslDnsVerify op).
-const SSL_MODES = ['off', 'le-http', 'le-dns-manual', 'custom'];
+const SSL_MODES = ['off', 'le-http', 'le-dns-manual', 'le-dns-cf', 'custom'];
 const ssl = {
   name: 'ssl',
-  // params: { domain, mode: "off"|"le-http"|"custom", cert?, key? }
+  // params: { domain, mode: "off"|"le-http"|"le-dns-cf"|"custom", cert?, key?, cfToken?, cfZoneId? }
   validate(p = {}) {
     p = sanitize(p);
     const errors = [];
@@ -289,10 +349,19 @@ const ssl = {
       if (key.length > 60_000) errors.push('key is too large (60KB max)');
     }
 
+    // le-dns-cf: the Cloudflare token + zone come from the portal (the owner's
+    // stored token for this domain); the key is redacted in job views.
+    let cf = {};
+    if (mode === 'le-dns-cf') {
+      if (typeof p.cfToken !== 'string' || !/^[A-Za-z0-9_-]{30,200}$/.test(p.cfToken)) errors.push('cfToken is required');
+      if (typeof p.cfZoneId !== 'string' || !/^[a-f0-9]{32}$/.test(p.cfZoneId)) errors.push('cfZoneId is required');
+      cf = { cfToken: p.cfToken, cfZoneId: p.cfZoneId };
+    }
+
     return {
       ok: errors.length === 0,
       errors,
-      clean: { domain: p.domain, mode, ...(mode === 'custom' ? { cert, key } : {}) },
+      clean: { domain: p.domain, mode, ...(mode === 'custom' ? { cert, key } : {}), ...cf },
     };
   },
   async run(job, helpers, p) {
@@ -538,7 +607,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { deploy, php: phpOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { deploy, php: phpOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

@@ -1,6 +1,6 @@
 import { logger } from '../lib/log.js';
 import { requireSpec, applySite, applySslConf, syncWpAddress, certDir } from '../lib/sites.js';
-import { issueHttp, startManualDns, verifyManualDns, removeManualMarker } from '../lib/acme.js';
+import { issueHttp, issueDnsCloudflare, startManualDns, verifyManualDns, removeManualMarker } from '../lib/acme.js';
 import { checkCustomCert } from '../lib/certcheck.js';
 
 // ============================================================
@@ -27,6 +27,7 @@ export async function runSsl(job, helpers, p) {
       return state;
     }
     case 'custom': return runSslCustom(helpers, domain, p);
+    case 'le-dns-cf': return runSslDnsCf(helpers, domain, p);
     default: throw new Error(`unknown SSL mode: ${p.mode}`);
   }
 }
@@ -85,4 +86,22 @@ async function runSslCustom(helpers, domain, p) {
   await removeManualMarker(domain);
   await syncWpAddress(helpers, await requireSpec(domain));
   done(`HTTPS is now using your certificate — ${domain}`);
+}
+
+// --- le-dns-cf ------------------------------------------------------------------
+// Let's Encrypt over DNS-01 through the Cloudflare API: works behind the
+// orange cloud, renews itself (acme.startDnsRenewer).
+async function runSslDnsCf(helpers, domain, p) {
+  const { step, ok, done } = logger(helpers);
+  const s = await requireSpec(domain);
+  step('Request a Let\'s Encrypt certificate (Cloudflare DNS)');
+  const r = await issueDnsCloudflare(helpers, domain, { www: s.enableWww, token: p.cfToken, zoneId: p.cfZoneId });
+  if (!r.ok) {
+    throw new Error(r.timedOut
+      ? `The certificate request for ${domain} timed out. Try again in a few minutes.`
+      : `Could not issue a certificate for ${domain} through Cloudflare. Check that the token can edit DNS for this zone, then try again.`);
+  }
+  ok(`Certificate issued for ${s.enableWww ? `${domain} and www.${domain}` : domain} — renews itself`);
+  await syncWpAddress(helpers, await requireSpec(domain));
+  done(`HTTPS enabled for ${domain}`);
 }

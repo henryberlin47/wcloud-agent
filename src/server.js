@@ -19,7 +19,7 @@ import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './j
 import { run } from './lib/sys.js';
 import { listTopLevel, putObject, deleteObject, statObject, explainSpacesError } from './lib/spaces.js';
 import { readSiteSsl } from './lib/certinfo.js';
-import { readChallenge } from './lib/acme.js';
+import { readChallenge, startDnsRenewer } from './lib/acme.js';
 import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning } from './lib/stack.js';
@@ -28,7 +28,11 @@ import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
 import { createPmaLink } from './lib/pma.js';
 import { listPlugins, searchPlugins } from './lib/plugins.js';
-import { siteTmp } from './lib/sites.js';
+import { siteTmp, fullchainPath } from './lib/sites.js';
+import { readSiteLog, LOG_TYPES } from './lib/sitelogs.js';
+import { listRules } from './lib/nginxrules.js';
+import { startRealIpRefresher } from './lib/realip.js';
+import { readCertInfo } from './lib/certinfo.js';
 import { enroll } from './enroll.js';
 
 // --- startup validation -----------------------------------------------------
@@ -41,6 +45,14 @@ if (problems.length) {
 
 const app = express();
 app.disable('x-powered-by');
+// Express 4 doesn't catch a rejected async handler — it would crash the agent.
+// Route every rejection to the error handler below instead.
+for (const m of ['get', 'post', 'put', 'delete']) {
+  const orig = app[m].bind(app);
+  app[m] = (path, ...handlers) => (handlers.length ? orig(path, ...handlers.map((h) => (req, res, next) => {
+    try { Promise.resolve(h(req, res, next)).catch(next); } catch (e) { next(e); }
+  })) : orig(path));
+}
 if (config.trustProxy) app.set('trust proxy', true);
 
 // --- health (unauthenticated, minimal) --------------------------------------
@@ -416,6 +428,20 @@ app.get('/api/sites/:domain/indexing', siteParam, wpOnly, async (req, res) => {
   res.json({ indexing: r.stdout.trim() !== '0' });
 });
 
+// A site's logs: the tail of access / error / php, optionally filtered.
+app.get('/api/sites/:domain/logs', siteParam, async (req, res) => {
+  const type = String(req.query.type || 'access');
+  if (!LOG_TYPES[type]) return res.status(400).json({ error: 'EINVAL', message: 'Unknown log.' });
+  const lines = Math.min(Math.max(parseInt(req.query.lines, 10) || 200, 10), 1000);
+  const q = typeof req.query.q === 'string' ? req.query.q.slice(0, 200) : '';
+  res.json(await readSiteLog(req.site.domain, type, { lines, q }));
+});
+
+// Named custom nginx rules (changed through the `nginxrule` op).
+app.get('/api/sites/:domain/nginx-rules', siteParam, async (req, res) => {
+  res.json({ rules: await listRules(req.site.domain) });
+});
+
 // A plugin .zip → the site's PRIVATE tmp/ (never web-reachable), written as the
 // site's user. Returns { upload } for the `plugin` op's install action.
 app.put('/api/sites/:domain/plugins/upload', siteParam, wpOnly, async (req, res) => {
@@ -625,7 +651,8 @@ app.use((req, res) => res.status(404).json({ error: 'not_found' }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error('unhandled error:', err);
-  res.status(500).json({ error: 'internal_error' });
+  if (res.headersSent) return res.end();
+  res.status(500).json({ error: 'internal_error', message: err?.code === 'ELOOP' ? 'That file is a symlink, so it isn\'t read.' : 'Something went wrong on the server.' });
 });
 
 // Bring the server in line with this agent version: current OPcache settings
@@ -651,6 +678,8 @@ const onListen = () => {
   enroll(); // self-register with the portal if PORTAL_ENROLL_URL/ENROLL_TOKEN are set
   enqueue('reconcile', {}, reconcile);
   startPurgeWatcher();
+  startRealIpRefresher(NOOP_HELPERS);
+  startDnsRenewer(enqueue, { listSites, readCertInfo, fullchainPath });
 };
 const server = config.tls
   ? https.createServer({ key: config.tls.key, cert: config.tls.cert, minVersion: 'TLSv1.2' }, app).listen(config.port, config.host, onListen)
