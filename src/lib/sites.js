@@ -89,6 +89,23 @@ export function cleanRedirects(list) {
   }
   return out;
 }
+// Whole-domain redirect: { to: "https://new.example/path?", code, keepPath }.
+// `to` is an absolute http(s) URL on another host, with no nginx syntax in it
+// (quotes, $, ;, braces, backslashes, whitespace). keepPath appends the
+// request's path + query. → { value } | { error }
+const DOMAIN_REDIRECT_TO = /^https?:\/\/([a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)(?::\d{1,5})?(\/[^\s"'`$;{}\\]*)?$/i;
+export function cleanDomainRedirect(v, domain) {
+  if (v === null || v === false) return { value: null };
+  if (typeof v !== 'object') return { error: 'domainRedirect must be an object or null' };
+  const to = String(v.to || '').trim();
+  const m = to.match(DOMAIN_REDIRECT_TO);
+  if (!m || to.length > 500) return { error: `"${to}" isn't a valid address — use a full URL like https://new-domain.com` };
+  const host = m[1].toLowerCase();
+  if (host === domain || host === `www.${domain}`) return { error: 'The target is this site itself — that would loop.' };
+  return { value: { to, code: v.code === 302 ? 302 : 301, keepPath: v.keepPath !== false } };
+}
+const domainRedirectTarget = (r) => `"${r.keepPath ? r.to.replace(/\/+$/, '') : r.to}${r.keepPath ? '$request_uri' : ''}"`;
+
 function redirectLocations(s) {
   const rs = Array.isArray(s.redirects) ? s.redirects : [];
   const target = (r) => `"${r.to}${r.keepQuery ? '$is_args$args' : ''}"`;
@@ -148,6 +165,7 @@ export const publicSpec = (s) => ({
   domain: s.domain, type: s.type, php: s.php || null, enableWww: s.enableWww,
   canonical: s.canonical, ssl: s.ssl, cache: s.type === 'wordpress' ? cacheMode(s) : null,
   realIp: !!s.realIp, redirects: Array.isArray(s.redirects) ? s.redirects : [], sslDns: s.sslDns || null,
+  domainRedirect: s.domainRedirect || null,
   crons: Array.isArray(s.crons) ? s.crons : [], wpCron: s.wpCron === 'server' ? 'server' : 'wordpress',
   wpCronEvery: s.wpCronEvery || 5, cfCache: !!s.cfCache,
   created_at: s.created_at,
@@ -277,14 +295,23 @@ export function renderVhost(s, { https }) {
   if (cacheMode(s) === 'fastcgi') {
     out.push(`fastcgi_cache_path ${pageCacheDir(d)} keys_zone=${cacheZone(d)}:${cacheZoneSize} ${cacheZoneArgs};`);
   }
+  // Whole-domain redirect: every request (both hosts, http and https) goes
+  // straight to the target in one hop; only ACME challenges are still
+  // answered here, so the certificate keeps renewing.
+  const dr = s.domainRedirect;
+  const redirectBody = dr ? [
+    `access_log /var/log/nginx/${d}.access.log;`, `error_log /var/log/nginx/${d}.error.log;`,
+    ...(s.realIp ? [`include ${REALIP_CONF};`] : []),
+    `# Whole-domain redirect (set in wcloud)`, `location / { return ${dr.code} ${domainRedirectTarget(dr)}; }`,
+  ] : null;
   if (https) {
     out.push(server(['listen 80;', 'listen [::]:80;', names, acme,
-      `location / { return 301 https://${canon || '$host'}$request_uri; }`]));
+      dr ? `location / { return ${dr.code} ${domainRedirectTarget(dr)}; }` : `location / { return 301 https://${canon || '$host'}$request_uri; }`]));
     out.push(server(['listen 443 ssl http2;', 'listen [::]:443 ssl http2;', names,
       `ssl_certificate     ${fullchainPath(d)};`, `ssl_certificate_key ${keyPath(d)};`, '',
-      ...toCanon('https'), ...siteBody(s)]));
+      ...(dr ? [acme, ...redirectBody] : [...toCanon('https'), ...siteBody(s)])]));
   } else {
-    out.push(server(['listen 80;', 'listen [::]:80;', names, acme, '', ...toCanon('http'), ...siteBody(s)]));
+    out.push(server(['listen 80;', 'listen [::]:80;', names, acme, '', ...(dr ? redirectBody : [...toCanon('http'), ...siteBody(s)])]));
   }
   return out.join('\n\n') + '\n';
 }

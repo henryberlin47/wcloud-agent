@@ -351,6 +351,12 @@ redirects, sslDns, crons, wpCron, wpCronEvery, cfCache, created_at }`.
 may not contain whitespace/quotes/`;{}`, targets are a URL or `/path`, and the
 only `$` allowed is `$1`…`$9` (patterns only). A pattern nginx can't compile
 fails `nginx -t` and the transaction rolls back.
+`domainRedirect` = `{ to, code: 301|302, keepPath }` | absent: the WHOLE domain
+(both hosts, http and https) goes to `to` in one hop (`+ $request_uri` when
+keepPath); the site body isn't rendered, only ACME challenges are answered so
+the certificate keeps renewing. `cleanDomainRedirect` is the boundary:
+absolute http(s) URL on another host (never the site itself or its www), no
+quotes / `$` / `;` / braces / backslashes / whitespace. Set via `siteconfig`.
 The nginx vhost (`/etc/nginx/sites-enabled/<d>.conf`) and PHP-FPM pool
 (`/etc/php/<v>/fpm/pool.d/<d>.conf`) are **rendered** from it — never edited in
 place, never parsed back. Every change goes through **`applySite(helpers, spec,

@@ -6,7 +6,7 @@ import { saveRule, deleteRule } from '../lib/nginxrules.js';
 //  siteconfig / nginxrule — per-site nginx settings
 // ============================================================
 
-// params: { domain, realIp?, redirects? } — rendered into the vhost (tested
+// params: { domain, realIp?, redirects?, domainRedirect? } — rendered into the vhost (tested
 // transaction; the page cache is cleared by applySite).
 export async function runSiteconfig(job, helpers, p) {
   const { step, ok, done } = logger(helpers);
@@ -19,6 +19,15 @@ export async function runSiteconfig(job, helpers, p) {
   if (p.redirects != null) {
     step(`Save ${p.redirects.length} redirect${p.redirects.length === 1 ? '' : 's'}`);
     next.redirects = p.redirects;
+  }
+  if (p.domainRedirect !== undefined) {
+    if (p.domainRedirect) {
+      step(`Redirect all of ${p.domain} to ${p.domainRedirect.to}${p.domainRedirect.keepPath ? ' (keeping the path)' : ''} — ${p.domainRedirect.code}`);
+      next.domainRedirect = p.domainRedirect;
+    } else {
+      step(`Stop redirecting ${p.domain} — serve the site again`);
+      delete next.domainRedirect;
+    }
   }
   await applySite(helpers, next);
   ok('Web server updated');
