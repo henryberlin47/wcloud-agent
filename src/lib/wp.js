@@ -70,6 +70,9 @@ export async function setupWordPress(helpers, s, { adminUser, adminPassword, ins
     "define( 'WP_DEBUG', false );",
     `$table_prefix = ${q(safePrefix(tablePrefix) || 'wp_')};`,
     '',
+    // wp-cli's `config set` inserts new constants above this line.
+    "/* That's all, stop editing! Happy publishing. */",
+    '',
     "if ( ! defined( 'ABSPATH' ) ) {",
     "\tdefine( 'ABSPATH', __DIR__ . '/htdocs/' );",
     '}',
@@ -176,4 +179,19 @@ export async function readDbCredentials(helpers, s) {
     db_user: user.code === 0 ? user.stdout.trim() : '',
     db_password: pass.code === 0 ? pass.stdout.trim() : '',
   };
+}
+
+/**
+ * Set a wp-config.php constant (as the site user). Configs wcloud wrote before
+ * it added wp-cli's standard "stop editing" anchor get it placed before the
+ * $table_prefix line instead. `raw` = PHP literal (true, 5, …). → boolean
+ */
+export async function setWpConstant(helpers, s, name, raw) {
+  const wp = await wpCli(helpers, s);
+  const args = ['config', 'set', name, raw, '--raw', '--type=constant'];
+  let r = await wp(args, { quiet: true, timeout: 60_000 });
+  if (r.code !== 0 && /placement anchor/i.test(`${r.stderr}${r.stdout}`)) {
+    r = await wp([...args, '--anchor=$table_prefix', '--placement=before'], { timeout: 60_000 });
+  }
+  return r.code === 0;
 }

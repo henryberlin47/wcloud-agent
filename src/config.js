@@ -62,6 +62,8 @@ const config = {
 
   // Identify this server in responses (handy when the panel manages many).
   serverName: process.env.AGENT_SERVER_NAME || process.env.HOSTNAME || 'unknown',
+  // Cloudflare API base (Cloudflare cache purges). Overridden only by tests.
+  cloudflareApi: process.env.CLOUDFLARE_API || 'https://api.cloudflare.com/client/v4',
 
   // This agent's version (from package.json), surfaced in /healthz + /api/info.
   version: agentVersion,

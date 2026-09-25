@@ -14,6 +14,9 @@ import { runPlugin } from './plugin.js';
 import { runCache } from './cache.js';
 import { runIndexing } from './indexing.js';
 import { runSiteconfig, runNginxrule } from './siteconfig.js';
+import { runCron } from './cron.js';
+import { runCfCache } from './cfcache.js';
+import { cleanJob, WP_CRON_EVERY } from '../lib/cron.js';
 import { cleanRedirects } from '../lib/sites.js';
 import { RULE_MAX } from '../lib/nginxrules.js';
 import { CACHE_MODES } from '../lib/sites.js';
@@ -287,6 +290,65 @@ const nginxruleOp = {
 };
 
 // ============================================================
+//  cron — a WordPress site's scheduled jobs (operations/cron.js)
+// ============================================================
+const cronOp = {
+  name: 'cron',
+  // params: { domain, action: save|delete|run|wpcron, job?, id?, wpCron?, every? }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    const clean = { domain: p.domain, action: p.action };
+    if (p.action === 'save') {
+      const { job, error } = cleanJob(p.job || {}, []); // id collisions are resolved at run time
+      if (error) errors.push(error);
+      else clean.job = { ...job, id: typeof p.job?.id === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(p.job.id) ? p.job.id : undefined };
+    } else if (p.action === 'delete' || p.action === 'run') {
+      if (typeof p.id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(p.id)) errors.push('invalid job id');
+      clean.id = p.id;
+    } else if (p.action === 'wpcron') {
+      if (p.wpCron !== 'server' && p.wpCron !== 'wordpress') errors.push('wpCron must be server or wordpress');
+      clean.wpCron = p.wpCron;
+      clean.every = WP_CRON_EVERY.includes(Number(p.every)) ? Number(p.every) : 5;
+    } else {
+      errors.push('action must be save, delete, run or wpcron');
+    }
+    return { ok: errors.length === 0, errors, clean };
+  },
+  async run(job, helpers, p) {
+    await runCron(job, helpers, p);
+  },
+};
+
+// ============================================================
+//  cfcache — Cloudflare cache purging for a site (operations/cfcache.js)
+// ============================================================
+const cfcacheOp = {
+  name: 'cfcache',
+  // params: { domain, enabled, cfToken?, cfZoneId?, hosts? }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    if (typeof p.enabled !== 'boolean') errors.push('enabled must be true or false');
+    const clean = { domain: p.domain, enabled: p.enabled };
+    if (p.enabled) {
+      if (typeof p.cfToken !== 'string' || !/^[A-Za-z0-9_-]{30,200}$/.test(p.cfToken)) errors.push('cfToken is required');
+      if (typeof p.cfZoneId !== 'string' || !/^[a-f0-9]{32}$/.test(p.cfZoneId)) errors.push('cfZoneId is required');
+      // Exactly as given (lowercased) — normDomain would strip the www. we need here.
+      const hosts = Array.isArray(p.hosts) ? p.hosts.map((h) => String(h).trim().toLowerCase()) : [];
+      if (!hosts.length || hosts.length > 2 || !hosts.every(isDomain)) errors.push('hosts must be the site\'s domain (and its www)');
+      Object.assign(clean, { cfToken: p.cfToken, cfZoneId: p.cfZoneId, hosts });
+    }
+    return { ok: errors.length === 0, errors, clean };
+  },
+  async run(job, helpers, p) {
+    await runCfCache(job, helpers, p);
+  },
+};
+
+// ============================================================
 //  update
 // ============================================================
 const update = {
@@ -417,12 +479,13 @@ const canonicalOp = {
 // ============================================================
 const purge = {
   name: 'purge',
-  // params: { domain }
+  // params: { domain, only?: 'cloudflare' }
   validate(p = {}) {
     p = sanitize(p);
     const errors = [];
     reqDomain(errors, 'domain', p.domain);
-    return { ok: errors.length === 0, errors, clean: { domain: p.domain } };
+    if (p.only != null && p.only !== 'cloudflare') errors.push('only must be cloudflare');
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, ...(p.only ? { only: p.only } : {}) } };
   },
   async run(job, helpers, p) {
     await runPurge(job, helpers, p);
@@ -607,7 +670,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { deploy, php: phpOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { deploy, php: phpOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

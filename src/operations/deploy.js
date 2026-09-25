@@ -2,7 +2,7 @@ import { logger } from '../lib/log.js';
 import { checkCustomCert } from '../lib/certcheck.js';
 import { createSite, applySslConf, syncWpAddress, requireSpec } from '../lib/sites.js';
 import { issueHttp } from '../lib/acme.js';
-import { installCachePlugin, setObjectCache } from '../lib/cache.js';
+import { syncCachePlugin, setObjectCache } from '../lib/cache.js';
 
 // ============================================================
 //  deploy — create a site (WordPress or static) on this server
@@ -41,7 +41,7 @@ export async function runDeploy(job, helpers, p) {
     step('Turn on caching');
     const s0 = await requireSpec(domain);
     try {
-      if (s0.cache === 'fastcgi') { await installCachePlugin(helpers, s0); ok('Server page cache on'); }
+      if (s0.cache === 'fastcgi') { await syncCachePlugin(helpers, s0); ok('Server page cache on'); }
       await setObjectCache(helpers, s0, true);
     } catch (e) {
       warn(`Caching couldn't be fully turned on (${e?.message || e}) — do it from the site page.`);

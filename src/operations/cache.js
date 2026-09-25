@@ -1,6 +1,6 @@
 import { logger } from '../lib/log.js';
 import { requireSpec, applySite } from '../lib/sites.js';
-import { clearPageCache, installCachePlugin, removeCachePlugin, setObjectCache } from '../lib/cache.js';
+import { clearPageCache, syncCachePlugin, setObjectCache } from '../lib/cache.js';
 
 // ============================================================
 //  cache — a WordPress site's page cache mode and Redis object cache
@@ -23,13 +23,9 @@ export async function runCache(job, helpers, p) {
     const next = { ...s, cache: p.mode };
     await applySite(helpers, next);
     ok('Web server updated');
-    if (p.mode === 'fastcgi') {
-      await installCachePlugin(helpers, next);
-      ok('Pages are cleared from the cache automatically when content changes');
-    } else {
-      await removeCachePlugin(helpers, next);
-      await clearPageCache(s.domain);
-    }
+    await syncCachePlugin(helpers, next); // page cache and/or Cloudflare purges
+    if (p.mode === 'fastcgi') ok('Pages are cleared from the cache automatically when content changes');
+    else await clearPageCache(s.domain);
     if (p.mode === 'wprocket') warn('Pages are only served from cache once WP Rocket is installed and active on this site.');
   }
 

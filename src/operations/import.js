@@ -3,12 +3,13 @@ import { randomBytes } from 'node:crypto';
 import { run, pathExists, removePath, userIds } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import {
-  SITE_TYPES, CACHE_MODES, readSpec, createSite, deleteSite, applySslConf, syncWpAddress, webRoot, siteTmp,
+  SITE_TYPES, CACHE_MODES, readSpec, createSite, deleteSite, applySite, applySslConf, syncWpAddress, webRoot, siteTmp,
 } from '../lib/sites.js';
-import { wpCli, clearWpCaches, safePrefix } from '../lib/wp.js';
+import { wpCli, clearWpCaches, safePrefix, setWpConstant } from '../lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
 import { issueHttp } from '../lib/acme.js';
-import { installCachePlugin } from '../lib/cache.js';
+import { syncCachePlugin } from '../lib/cache.js';
+import { cleanJob, CRON_MAX, WP_CRON_EVERY } from '../lib/cron.js';
 
 // Unpredictable, atomically-created staging dir (mkdtemp: 0700 root, never
 // reuses an existing path). Only root touches it; the one file a site's wp-cli
@@ -256,9 +257,24 @@ export async function runRestoreFromLocal(job, helpers, {
       step('Set the WordPress address');
       await syncWpAddress(helpers, await readSpec(domain));
     }
-    // The archive may predate the page cache (or come from another host).
-    if (type === 'wordpress' && cache === 'fastcgi') {
-      await installCachePlugin(helpers, await readSpec(domain)).catch((e) => warn(`Page cache helper not installed: ${e.message}`));
+    // Cron jobs travel with the site (validated like new ones); Cloudflare
+    // cache doesn't — it belongs to the destination's zone and is set up there.
+    if (type === 'wordpress') {
+      const cur = await readSpec(domain);
+      const crons = [];
+      for (const j of (Array.isArray(src.crons) ? src.crons : []).slice(0, CRON_MAX)) {
+        const { job: c } = cleanJob(j, crons.map((x) => x.id));
+        if (c) crons.push(c);
+      }
+      const wpCron = src.wpCron === 'server' ? 'server' : 'wordpress';
+      if (crons.length || wpCron === 'server') {
+        step('Restore the cron jobs');
+        if (wpCron === 'server' && !(await setWpConstant(helpers, cur, 'DISABLE_WP_CRON', 'true'))) warn('Could not set DISABLE_WP_CRON — WordPress will also run its cron on visits');
+        await applySite(helpers, { ...cur, crons, wpCron, wpCronEvery: WP_CRON_EVERY.includes(src.wpCronEvery) ? src.wpCronEvery : 5 });
+        ok(`${crons.length} cron job${crons.length === 1 ? '' : 's'}${wpCron === 'server' ? ' + WordPress cron run by the server' : ''}`);
+      }
+      // The archive's helper plugin may come from another setup — rewrite or drop it.
+      await syncCachePlugin(helpers, await readSpec(domain)).catch((e) => warn(`Cache helper not installed: ${e.message}`));
     }
 
     log(`Restore completed: ${domain}`);

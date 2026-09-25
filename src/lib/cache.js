@@ -2,9 +2,10 @@ import fs from 'node:fs/promises';
 import { constants as FS } from 'node:fs';
 import path from 'node:path';
 import { logger } from './log.js';
-import { listSites, siteTmp, webRoot, clearPageCache } from './sites.js';
+import { listSites, readSpec, siteTmp, webRoot, clearPageCache } from './sites.js';
 import { wpCli } from './wp.js';
 import { spawnWorker, settle } from './files.js';
+import { purgeCloudflare } from './cfcache.js';
 
 // ============================================================
 //  cache.js — page cache (nginx FastCGI) + Redis object cache for a site
@@ -16,28 +17,48 @@ import { spawnWorker, settle } from './files.js';
 // few seconds. The "Purge cache" operation clears it directly.
 // ============================================================
 
-const PURGE_MARKER = 'wcloud-purge';
+// Markers the helper plugin drops in the site's own tmp/ (the agent can't be
+// reached from PHP, and WordPress never holds a Cloudflare token):
+//   wcloud-purge       content changed → page cache + Cloudflare (whichever are on)
+//   wcloud-purge-page  toolbar "Purge page cache"
+//   wcloud-purge-cf    toolbar "Purge Cloudflare cache"
+const MARKERS = { 'wcloud-purge': ['page', 'cf'], 'wcloud-purge-page': ['page'], 'wcloud-purge-cf': ['cf'] };
 export { clearPageCache }; // lives in sites.js (applySite clears on config changes)
 
+const wantsHelper = (s) => s.type === 'wordpress' && (s.cache === 'fastcgi' || !!s.cfCache);
 
-// Poll each page-cached site's tmp/ for the marker. lstat + unlink never
-// follow a symlink, so a site can't point this at anything else.
+// Poll each such site's tmp/ for the markers. lstat + unlink never follow a
+// symlink, so a site can't point this at anything else.
 // ponytail: polls every site every 3s (cheap stat calls); inotify if a server
 // ever holds thousands of sites.
+// Every WordPress site is scanned and its spec re-read only when a marker is
+// found: a cached spec made a just-enabled Cloudflare cache ignore purges for
+// up to 30s.
 export function startPurgeWatcher() {
   let domains = [];
   let listedAt = 0;
   const tick = async () => {
     try {
       if (Date.now() - listedAt > 30_000) {
-        domains = (await listSites()).filter((s) => s.type === 'wordpress' && s.cache === 'fastcgi').map((s) => s.domain);
+        domains = (await listSites()).filter((x) => x.type === 'wordpress').map((x) => x.domain);
         listedAt = Date.now();
       }
       for (const d of domains) {
-        const marker = path.join(siteTmp(d), PURGE_MARKER);
-        try { await fs.lstat(marker); } catch { continue; }
-        await fs.unlink(marker).catch(() => {});
-        await clearPageCache(d);
+        const what = new Set();
+        for (const [marker, kinds] of Object.entries(MARKERS)) {
+          const f = path.join(siteTmp(d), marker);
+          try { await fs.lstat(f); } catch { continue; }
+          await fs.unlink(f).catch(() => {});
+          kinds.forEach((k) => what.add(k));
+        }
+        if (!what.size) continue;
+        const s = await readSpec(d);
+        if (!s) continue;
+        if (what.has('page') && s.cache === 'fastcgi') await clearPageCache(s.domain);
+        if (what.has('cf') && s.cfCache) {
+          const r = await purgeCloudflare(s.domain);
+          if (!r.ok) console.error(`[agent] Cloudflare purge for ${s.domain}: ${r.error}`);
+        }
       }
     } catch (e) {
       console.error('[agent] purge watcher:', e.message);
@@ -46,22 +67,33 @@ export function startPurgeWatcher() {
   setInterval(tick, 3000).unref();
 }
 
-// Clears the page cache (via the marker above) whenever content changes. Uses
-// the site root's tmp/ — the same path under PHP-FPM and wp-cli.
-const MU_CACHE = `<?php
+// The helper must-use plugin, generated per site: purge on content changes,
+// plus a toolbar "Cache" menu for administrators. Only what the site has on is
+// included (page cache, Cloudflare) — no settings are read at runtime.
+function muHelper({ page, cf }) {
+  const items = [
+    ...(page && cf ? [['all', 'Purge all caches', 'wcloud-purge']] : []),
+    ...(page ? [['page', 'Purge page cache', 'wcloud-purge-page']] : []),
+    ...(cf ? [['cloudflare', 'Purge Cloudflare cache', 'wcloud-purge-cf']] : []),
+  ];
+  const map = items.map(([k, , m]) => `'${k}' => '${m}'`).join(', ');
+  const nodes = items.map(([k, label]) => `\t$bar->add_node( array( 'parent' => 'wcloud-cache', 'id' => 'wcloud-purge-${k}', 'title' => '${label}', 'href' => wp_nonce_url( admin_url( 'admin-post.php?action=wcloud_purge&what=${k}' ), 'wcloud_purge' ) ) );`).join('\n');
+  return `<?php
 /**
- * Plugin Name: wcloud page cache
- * Description: Clears this site's server page cache when content changes. Managed by wcloud — edits are overwritten.
+ * Plugin Name: wcloud cache
+ * Description: Clears this site's caches when content changes${cf ? ' (server page cache and Cloudflare)' : ''}, and adds a Cache menu to the toolbar. Managed by wcloud — edits are overwritten.
  */
 defined( 'ABSPATH' ) || exit;
 
+function wcloud_cache_marker( $name ) {
+	@touch( dirname( rtrim( ABSPATH, '/' ) ) . '/tmp/' . $name );
+}
 function wcloud_request_purge() {
 	static $done = false;
-	if ( $done ) {
-		return;
+	if ( ! $done ) {
+		$done = true;
+		wcloud_cache_marker( 'wcloud-purge' );
 	}
-	$done = true;
-	@touch( dirname( rtrim( ABSPATH, '/' ) ) . '/tmp/${PURGE_MARKER}' );
 }
 add_action( 'save_post', function ( $id ) {
 	if ( ! wp_is_post_revision( $id ) && ! wp_is_post_autosave( $id ) ) {
@@ -74,7 +106,35 @@ foreach ( array( 'deleted_post', 'trashed_post', 'untrashed_post', 'comment_post
 	'update_option_blogname', 'update_option_blogdescription', 'woocommerce_product_set_stock' ) as $hook ) {
 	add_action( $hook, 'wcloud_request_purge' );
 }
+
+// Toolbar → Cache → Purge … (administrators only; nonce-checked).
+add_action( 'admin_bar_menu', function ( $bar ) {
+	if ( ! current_user_can( 'manage_options' ) ) {
+		return;
+	}
+	$bar->add_node( array( 'id' => 'wcloud-cache', 'title' => '<span class="ab-icon dashicons dashicons-cloud" style="top:2px"></span>Cache', 'href' => false ) );
+${nodes}
+}, 100 );
+add_action( 'admin_post_wcloud_purge', function () {
+	if ( ! current_user_can( 'manage_options' ) ) {
+		wp_die( 'Sorry, you are not allowed to do that.', 403 );
+	}
+	check_admin_referer( 'wcloud_purge' );
+	$markers = array( ${map} );
+	$what    = isset( $_GET['what'] ) ? sanitize_key( wp_unslash( $_GET['what'] ) ) : '';
+	if ( isset( $markers[ $what ] ) ) {
+		wcloud_cache_marker( $markers[ $what ] );
+	}
+	wp_safe_redirect( add_query_arg( 'wcloud_purged', $what, wp_get_referer() ? wp_get_referer() : admin_url() ) );
+	exit;
+} );
+add_action( 'admin_notices', function () {
+	if ( isset( $_GET['wcloud_purged'] ) && current_user_can( 'manage_options' ) ) {
+		echo '<div class="notice notice-success is-dismissible"><p>Cache purge requested — it completes within a few seconds.</p></div>';
+	}
+} );
 `;
+}
 
 // Write a must-use plugin AS THE SITE USER (never as root into a directory
 // the site controls). muDir: WPMU_PLUGIN_DIR if already known.
@@ -93,11 +153,13 @@ export async function installMuPlugin(helpers, s, file, content, muDir = null) {
   const r = await settle(w);
   if (!r.ok) throw new Error(`wcloud's helper plugin couldn't be installed: ${r.message}`);
 }
-export const installCachePlugin = (helpers, s) => installMuPlugin(helpers, s, 'wcloud-cache.php', MU_CACHE);
-export const removeCachePlugin = async (helpers, s) => {
+
+/** Install, rewrite or remove the helper plugin to match the site's spec. */
+export async function syncCachePlugin(helpers, s) {
+  if (wantsHelper(s)) return installMuPlugin(helpers, s, 'wcloud-cache.php', muHelper({ page: s.cache === 'fastcgi', cf: !!s.cfCache }));
   const w = await spawnWorker(s, 'delete', { paths: ['wp-content/mu-plugins/wcloud-cache.php'] });
   await settle(w); // gone already is fine
-};
+}
 
 // Is the Redis object cache active? Its drop-in is wp-content/object-cache.php.
 // Read as root, so: no symlinks (O_NOFOLLOW), regular file only, first 4 KB.

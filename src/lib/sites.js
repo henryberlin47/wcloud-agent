@@ -6,6 +6,7 @@ import { logger } from './log.js';
 import { ensurePhp, installedPhp, fpmService, dropDatabase, dropRedisUser, REDIS_DBS } from './stack.js';
 import { setupWordPress, pinWpUrls } from './wp.js';
 import { ensureRealIpConf } from './realip.js';
+import { renderCron, cronFilePath, cronLogPath, ensureWrappers } from './cron.js';
 
 // ============================================================
 //  sites.js — the site model: one spec file → everything else
@@ -62,6 +63,8 @@ export const REALIP_CONF = '/etc/nginx/wcloud/cloudflare-realip.conf';
 // Let's Encrypt via Cloudflare DNS (spec.sslDns = 'cloudflare'): the site's
 // Cloudflare token, root-only, for the agent's own renewals (lib/acme.js).
 export const cfDnsTokenPath = (d) => `/etc/wcloud/cf-dns/${d}.json`;
+// Cloudflare cache purges (lib/cfcache.js): the zone token + hosts, root-only.
+export const cfCachePath = (d) => `/etc/wcloud/cf-cache/${d}.json`;
 
 // Redirects (spec.redirects): [{ from, to, code: 301|302, regex, keepQuery }].
 // Exact paths → `location =`; regexes → `location ~` listed before every other
@@ -145,6 +148,8 @@ export const publicSpec = (s) => ({
   domain: s.domain, type: s.type, php: s.php || null, enableWww: s.enableWww,
   canonical: s.canonical, ssl: s.ssl, cache: s.type === 'wordpress' ? cacheMode(s) : null,
   realIp: !!s.realIp, redirects: Array.isArray(s.redirects) ? s.redirects : [], sslDns: s.sslDns || null,
+  crons: Array.isArray(s.crons) ? s.crons : [], wpCron: s.wpCron === 'server' ? 'server' : 'wordpress',
+  wpCronEvery: s.wpCronEvery || 5, cfCache: !!s.cfCache,
   created_at: s.created_at,
 });
 
@@ -328,6 +333,16 @@ const readOrNull = async (p) => ((await pathExists(p)) ? fs.readFile(p, 'utf8') 
 // reloaded. Services reload only for files that actually changed.
 //   certs:   { fullchain, key } — pre-validated by the caller, written 600
 //   prevPhp: the version whose pool must go (PHP version switch)
+// A log file in root-owned /var/log/wcloud that the site's own user appends to
+// (no one else can place a symlink there, so creating it as root is safe).
+async function ensureSiteLog(file, user) {
+  if (await pathExists(file)) return;
+  await fs.mkdir('/var/log/wcloud', { recursive: true, mode: 0o755 });
+  await (await fs.open(file, 'a', 0o640)).close();
+  const { uid, gid } = await userIds(user);
+  await fs.chown(file, uid, gid);
+}
+
 export async function applySite(helpers, s, { certs, prevPhp } = {}) {
   const d = s.domain;
   const edits = []; // { path, before, after (null = delete), mode }
@@ -351,12 +366,18 @@ export async function applySite(helpers, s, { certs, prevPhp } = {}) {
     await fs.chmod(pageCacheDir(d), 0o700);
   }
   if (s.realIp) await ensureRealIpConf();
+  const cron = renderCron(s);
+  if (cron) {
+    await ensureWrappers(s.php);
+    await ensureSiteLog(cronLogPath(d), s.user); // the site's user appends to it
+  }
   const https = s.ssl && (!!certs || (await pathExists(fullchainPath(d))));
   await fs.mkdir(SPEC_DIR, { recursive: true, mode: 0o700 });
   await stage(specPath(d), JSON.stringify(s, null, 2) + '\n', 0o600);
   await stage(vhostPath(d), renderVhost(s, { https }));
   if (s.php) await stage(poolPath(d, s.php), renderPool(s));
   if (prevPhp && prevPhp !== s.php) await stage(poolPath(d, prevPhp), null);
+  await stage(cronFilePath(d), cron); // null = nothing scheduled → no file
 
   const changed = edits.filter((e) => e.before !== e.after);
   if (!changed.length) return { changed: false };
@@ -530,7 +551,9 @@ export async function deleteSite(helpers, domain, spec = null) {
   await removePath(siteDir(domain));
   await removePath(pageCacheDir(domain));
   await removePath(cfDnsTokenPath(domain));
-  for (const f of [phpLogPath(domain), `/var/log/nginx/${domain}.access.log`, `/var/log/nginx/${domain}.error.log`]) await removePath(f);
+  await removePath(cfCachePath(domain));
+  await removePath(cronFilePath(domain));
+  for (const f of [phpLogPath(domain), cronLogPath(domain), `/var/log/nginx/${domain}.access.log`, `/var/log/nginx/${domain}.error.log`]) await removePath(f);
   if (ids && ids.uid >= 1000) {
     const del = await run(helpers, 'userdel', [user], { timeout: 30_000 });
     if (del.code !== 0) warn(`The system user ${user} could not be removed.`);

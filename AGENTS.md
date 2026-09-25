@@ -161,6 +161,8 @@ cron/procs/locks, then `sites.deleteSite`; requires `confirm:true`), **ssl** (mo
 **purge** (WP Rocket + object cache), **siteconfig** (`realIp` and/or
 `redirects` → spec → `applySite`; redirects validated by `sites.cleanRedirects`),
 **nginxrule** (named custom nginx rules: save/delete via `lib/nginxrules.js`),
+**cron** (a WordPress site's scheduled jobs: save/delete/run/wpcron, `lib/cron.js`),
+**cfcache** (Cloudflare cache purge credentials + helper plugin, `lib/cfcache.js`),
 **resetPassword** (`wp user update --user_pass`),
 **export** (builds the archived site; `buildSiteArchive` in `export.js` is the shared
 archive builder), **import** (restores an archive; `runRestoreFromLocal` in
@@ -312,6 +314,24 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   so the header can't be spoofed by a direct visitor. The built-in list is
   refreshed daily from cloudflare.com/ips-v4|v6 (validated CIDRs, `nginx -t`,
   restored on failure).
+- **cron.js** — per-site jobs in `/etc/cron.d/wcloud-<domain_with_underscores>`
+  (cron ignores names with dots), rendered from `spec.crons` / `spec.wpCron`
+  by `applySite` (same transaction; PHP switch re-renders). Each line runs as
+  the site user (user field is ours, never input), `cd htdocs`, PATH starts
+  with `/usr/local/lib/wcloud/php<v>` (wrappers: `php`/`wp` → the site's PHP),
+  HOME/WP_CLI_CACHE_DIR in the site's tmp, output appended to
+  `/var/log/wcloud/<d>.cron.log` (Logs tab "cron"). `cleanJob`/`scheduleOk`
+  are the boundary: 5 numeric fields or @hourly/@daily/@weekly/@monthly, one-line
+  commands (a newline could add a root line), `%` escaped. "wpCron: server" =
+  `DISABLE_WP_CRON` (`setWpConstant`) + `wp cron event run --due-now` every
+  1/5/15 min. The cron op also `systemctl enable --now cron`. "Run now" runs
+  the command exactly like cron and shows its output in the job log.
+- **cfcache.js** — Cloudflare purges for a site. The PORTAL writes the zone's
+  Cache Rules; the agent keeps `{token, zoneId, hosts}` in
+  `/etc/wcloud/cf-cache/<d>.json` (root 0600) and purges by host
+  (`purge_cache {hosts}`, 10 s debounce) — from the purge op (`only:
+  'cloudflare'` = just that), the cfcache op, and the watcher.
+  `CLOUDFLARE_API` env overrides the API base (tests).
 - **nginxrules.js** — named custom nginx rules in `/var/www/<d>/conf/nginx/<id>.conf`
   (first line `# wcloud-name: <name>`; disabled = renamed `.conf.off`). Every
   save/delete is one transaction: write, `nginx -t`, restore the previous files
@@ -324,7 +344,7 @@ Driven by env the portal's install command injects (`init.sh` writes them to
 
 **`/etc/wcloud/sites/<domain>.json` is the source of truth** (root 0600):
 `{ domain, type, php, user, enableWww, canonical, ssl, redisDb, cache, realIp,
-redirects, sslDns, created_at }`.
+redirects, sslDns, crons, wpCron, wpCronEvery, cfCache, created_at }`.
 `redirects` = `[{ from, to, code: 301|302, regex, keepQuery }]`, rendered as
 `location = "from"` / `location ~ "from"` with `return code "to[$is_args$args]"`.
 `cleanRedirects` is the injection boundary: exact paths start with `/`, patterns
@@ -450,6 +470,17 @@ loopback; set to the box's IP to accept portal calls), `AGENT_PORT` (8787),
 - **Express 4 doesn't catch rejected async handlers** — one would crash the
   agent. `server.js` wraps `app.get/post/put/delete` so a rejection reaches the
   error handler (500 JSON) instead.
+- **The helper must-use plugin (`wcloud-cache.php`) is generated per site**
+  (`syncCachePlugin`): installed when the page cache is `fastcgi` or
+  Cloudflare cache is on, removed otherwise, rewritten on every change. It
+  never reads settings or holds secrets — it only drops markers in the site's
+  tmp/ (`wcloud-purge` on content changes, `wcloud-purge-page` /
+  `wcloud-purge-cf` from its admin-toolbar "Cache" menu, `manage_options` +
+  nonce) and the agent's watcher does the purging. Call `syncCachePlugin`,
+  never write it directly.
+- **`wp config set` needs wp-cli's "stop editing" anchor** — configs wcloud
+  wrote before it was added have none; use `setWpConstant` (falls back to
+  placing before `$table_prefix`).
 - **`add_header` belongs at server level in the vhost.** nginx drops inherited
   `add_header`s in any location that sets its own, so an `X-Cache` header inside
   the PHP location silently discarded every custom-rule header on PHP pages.

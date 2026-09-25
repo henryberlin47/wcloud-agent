@@ -2,13 +2,29 @@ import { logger } from '../lib/log.js';
 import { requireSpec } from '../lib/sites.js';
 import { clearWpCaches } from '../lib/wp.js';
 import { clearPageCache } from '../lib/cache.js';
+import { purgeCloudflare } from '../lib/cfcache.js';
 
-// Purge a site's caches on demand: server page cache, WP Rocket, object cache.
+// Purge a site's caches on demand: server page cache, WP Rocket, object cache,
+// and Cloudflare when it's on. only: 'cloudflare' = just Cloudflare.
 export async function runPurge(job, helpers, p, opts = {}) {
   const { step, ok, warn } = logger(helpers, opts);
   const domain = p.domain;
   const s = await requireSpec(domain);
-  if (s.type !== 'wordpress') throw new Error(`${domain} is a static site — there's no cache to clear.`);
+  const cloudflare = async () => {
+    const r = await purgeCloudflare(domain, { force: true });
+    if (!r.ok) throw new Error(r.error);
+    ok('Cloudflare cache purged');
+  };
+  if (p.only === 'cloudflare') {
+    step('Purge the Cloudflare cache');
+    if (!s.cfCache) throw new Error(`Cloudflare cache isn't on for ${domain}.`);
+    return cloudflare();
+  }
+  if (s.type !== 'wordpress') {
+    if (!s.cfCache) throw new Error(`${domain} is a static site — there's no cache to clear.`);
+    step('Clear the site caches');
+    return cloudflare();
+  }
 
   step('Clear the site caches');
   if (s.cache === 'fastcgi' && (await clearPageCache(domain))) ok('Server page cache cleared');
@@ -20,4 +36,5 @@ export async function runPurge(job, helpers, p, opts = {}) {
   }
   r.rocketOk ? ok('Page cache cleared') : warn('WP Rocket is not active — cleared the cached files on disk instead');
   r.objectFlushed ? ok('Object cache flushed') : warn('Object cache could not be flushed — it may not be enabled on this site');
+  if (s.cfCache) await cloudflare();
 }

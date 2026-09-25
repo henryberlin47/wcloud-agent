@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import { constants as FS } from 'node:fs';
 import { phpLogPath } from './sites.js';
+import { cronLogPath } from './cron.js';
 
 // ============================================================
 //  sitelogs.js — the tail of a site's access / error / PHP log
@@ -13,6 +14,7 @@ export const LOG_TYPES = {
   access: (d) => `/var/log/nginx/${d}.access.log`,
   error: (d) => `/var/log/nginx/${d}.error.log`,
   php: (d) => phpLogPath(d),
+  cron: (d) => cronLogPath(d),
 };
 const WINDOW = 4 * 1024 * 1024;
 

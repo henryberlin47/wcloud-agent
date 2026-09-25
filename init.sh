@@ -277,7 +277,7 @@ if apt_install nginx mariadb-server redis-server cron curl unzip git openssl ca-
 else
   die "Installing the base packages failed — see the output above."
 fi
-systemctl enable --now nginx mariadb redis-server >/dev/null 2>&1 || true
+systemctl enable --now nginx mariadb redis-server cron >/dev/null 2>&1 || true  # cron runs sites' scheduled jobs (/etc/cron.d)
 
 # ------------------------------------------------------------
 step "Installing PHP $PHP_DEFAULT"
