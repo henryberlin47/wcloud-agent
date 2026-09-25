@@ -1,8 +1,6 @@
 import { randomBytes, createHash } from 'node:crypto';
-import path from 'node:path';
 import { wpCli } from './wp.js';
-import { spawnWorker, settle } from './files.js';
-import { webRoot } from './sites.js';
+import { installMuPlugin } from './cache.js';
 
 // ============================================================
 //  wplogin.js — one-click (passwordless) login to wp-admin
@@ -58,15 +56,9 @@ echo json_encode( array( 'user' => $u[0]->user_login, 'login' => site_url( 'wp-l
   if (out.error === 'no-admin') throw new Error('This site has no administrator account to sign in as.');
   if (r.code !== 0 || !out.login) throw new Error('WordPress on this site didn\'t respond — is it installed and working?');
 
-  // (Re)install the redeeming plugin as the SITE's user (never as root inside
-  // a directory the site controls). Rewritten every time, so it self-heals.
-  const root = webRoot(s.domain);
-  const file = path.join(out.mu, 'wcloud-login.php');
-  if (!file.startsWith(`${root}/`)) throw new Error('This site keeps its plugins outside its web root, so one-click login can\'t be set up.');
-  const w = await spawnWorker(s, 'write', { path: path.relative(root, file), max: 64 * 1024 });
-  w.stdin.end(MU_PLUGIN);
-  const wr = await settle(w);
-  if (!wr.ok) throw new Error(`The login helper couldn't be installed: ${wr.message}`);
+  // (Re)install the redeeming plugin as the SITE's user. Rewritten every
+  // time, so it self-heals.
+  await installMuPlugin(helpers, s, 'wcloud-login.php', MU_PLUGIN, out.mu);
 
   return { url: `${out.login}?wcloud_login=${token}`, user: out.user, expires_in: LINK_TTL_S };
 }

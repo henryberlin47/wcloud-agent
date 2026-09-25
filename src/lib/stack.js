@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import { run, pathExists } from './sys.js';
 import { logger } from './log.js';
 
@@ -41,6 +42,7 @@ export async function ensurePhp(helpers, v) {
     ...PHP_EXTS.map((e) => `php${v}-${e}`)], { env: APT_ENV, timeout: 900_000 });
   if (r.code !== 0) throw new Error(`PHP ${v} could not be installed on this server.`);
   await writePlaceholderPool(v);
+  await writeOpcacheIni(v);
   await run(helpers, 'systemctl', ['enable', '--now', fpmService(v)], { timeout: 60_000 });
   await run(helpers, 'systemctl', ['restart', fpmService(v)], { timeout: 60_000 });
   ok(`PHP ${v} installed`);
@@ -64,6 +66,49 @@ async function writePlaceholderPool(v) {
     'pm.max_children = 1',
     '',
   ].join('\n'));
+}
+
+// OPcache for a PHP version's FPM (shared by every site on that version).
+//  • validate_permission/validate_root: without them, one site's PHP can
+//    load ANOTHER site's already-compiled files (e.g. its wp-config.php, and
+//    so its DB password) straight from the shared cache — the classic
+//    shared-hosting leak. With them, a cached file is only served to a process
+//    that could read the file itself.
+//  • sized to the server: RAM/8, between 128 and 512 MB.
+//  • timestamps still checked (every 2s): edits from the file manager, plugin
+//    updates and deploys take effect without a PHP reload.
+function opcacheIni() {
+  const mb = Math.min(512, Math.max(128, Math.floor(os.totalmem() / 1024 / 1024 / 8)));
+  return [
+    '; Managed by wcloud (src/lib/stack.js) — rewritten when the agent starts.',
+    'opcache.enable=1',
+    `opcache.memory_consumption=${mb}`,
+    'opcache.interned_strings_buffer=32',
+    'opcache.max_accelerated_files=100000',
+    'opcache.validate_timestamps=1',
+    'opcache.revalidate_freq=2',
+    'opcache.validate_permission=1',
+    'opcache.validate_root=1',
+    'opcache.save_comments=1',
+    '',
+  ].join('\n');
+}
+const opcacheIniPath = (v) => `/etc/php/${v}/fpm/conf.d/90-wcloud-opcache.ini`;
+async function writeOpcacheIni(v) {
+  const want = opcacheIni();
+  const have = await fs.readFile(opcacheIniPath(v), 'utf8').catch(() => null);
+  if (have === want) return false;
+  await fs.writeFile(opcacheIniPath(v), want, { mode: 0o644 });
+  return true;
+}
+
+// Called at agent start: every installed version gets the current OPcache
+// settings (so existing servers pick up a change on the next agent update);
+// only versions whose file changed are reloaded.
+export async function ensurePhpTuning(helpers) {
+  for (const v of await installedPhp()) {
+    if (await writeOpcacheIni(v)) await run(helpers, 'systemctl', ['reload-or-restart', fpmService(v)], { quiet: true, timeout: 60_000 });
+  }
 }
 
 // --- MariaDB (root via unix socket; SQL on stdin, so no password hits argv) --

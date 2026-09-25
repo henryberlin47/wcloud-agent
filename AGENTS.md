@@ -327,6 +327,40 @@ www-data, the group that can read every site).
 
 ---
 
+## 6b. Caching
+
+- **Page cache per WordPress site** — `spec.cache`: `fastcgi` (default for new
+  sites) | `wprocket` | `off` (sites from before the field existed read as
+  `off`). Rendered by `sites.js`: `fastcgi` adds an http-level
+  `fastcgi_cache_path /var/cache/wcloud/<d>` zone (name hashed from its whole
+  definition — nginx refuses to reload, and silently keeps the OLD config, when
+  a zone name comes back with a different path/size) + skip rules (POST, query
+  strings, logged-in/comment/cart cookies, wp-admin/wp-json/feeds/carts) and
+  `X-Cache` header; `wprocket` makes `location /` try WP Rocket's cached file
+  first under the same skip rules. `/var/cache/wcloud` must be 0711 (a 0700
+  parent made every cached request 500).
+- **Clearing**: `applySite` clears a site's page cache on ANY change (HTTPS,
+  address, mode, PHP version…); `syncWpAddress` too. Content changes: the
+  `wcloud-cache.php` must-use plugin touches `<site>/tmp/wcloud-purge`; the
+  agent's watcher (`cache.startPurgeWatcher`, 3s) clears that site — the cache
+  dir is nginx's, so a site can't clear it itself. Purge op + plugin op clear it.
+- **Redis object cache** on by default for new WordPress sites (deploy installs
+  + enables Redis Object Cache); `cache` op `{ mode?, objectCache? }` switches
+  both. Live state: `cache.objectCacheActive` (drop-in marker, O_NOFOLLOW read).
+- **OPcache** — `stack.ensurePhpTuning` (agent start + every new PHP version)
+  writes `90-wcloud-opcache.ini`: `validate_permission`/`validate_root` ON (else
+  one site's PHP can load another's cached wp-config.php), memory RAM/8 (128–512
+  MB), timestamps revalidated every 2s.
+- **Agent start = reconcile** (queued `reconcile` job): OPcache settings + every
+  site re-applied from its spec (no-op if current) — template changes reach
+  every site on update.
+- **PHP version switch ordering** (`applySite`): reload the OLD version, wait
+  until it has unlinked the shared socket path (it does so ~½s after `reload`
+  returns), THEN reload the new one and wait for its socket. Otherwise the old
+  master deletes the new socket and the site 502s.
+
+---
+
 ## 7. Config / env (`src/config.js`)
 
 All config is env-driven. Required: `AGENT_TOKEN` (≥32 chars — the agent refuses to

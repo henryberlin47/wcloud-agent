@@ -11,6 +11,8 @@ import { runBackup } from './backup.js';
 import { runRestore } from './restore.js';
 import { runPhp } from './php.js';
 import { runPlugin } from './plugin.js';
+import { runCache } from './cache.js';
+import { CACHE_MODES } from '../lib/sites.js';
 import { PLUGIN_NAME, UPLOAD_NAME } from '../lib/plugins.js';
 import { SITE_TYPES } from '../lib/sites.js';
 import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
@@ -86,6 +88,8 @@ const deploy = {
     const type = p.type == null ? 'wordpress' : p.type;
     if (!SITE_TYPES.includes(type)) errors.push(`type must be one of: ${SITE_TYPES.join(', ')}`);
     const php = p.php == null || p.php === '' ? DEFAULT_PHP : p.php;
+    const cache = p.cache == null ? 'fastcgi' : p.cache;
+    if (!CACHE_MODES.includes(cache)) errors.push(`cache must be one of: ${CACHE_MODES.join(', ')}`);
     if (!PHP_VERSIONS.includes(php)) errors.push(`php must be one of: ${PHP_VERSIONS.join(', ')}`);
 
     const cert = typeof p.cert === 'string' ? p.cert.trim() : '';
@@ -109,7 +113,7 @@ const deploy = {
     // certificate replaces Let's Encrypt.
     const issueSsl = !cert && p.issueSsl !== false;
 
-    return { ok: errors.length === 0, errors, clean: { domain: p.domain, type, php, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww, issueSsl, ...(cert ? { cert, key } : {}) } };
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, type, php, cache, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww, issueSsl, ...(cert ? { cert, key } : {}) } };
   },
   async run(job, helpers, p) {
     await runDeploy(job, helpers, p);
@@ -173,6 +177,33 @@ const pluginOp = {
   },
   async run(job, helpers, p) {
     await runPlugin(job, helpers, p);
+  },
+};
+
+// ============================================================
+//  cache — page cache mode + Redis object cache (see cache.js)
+// ============================================================
+const cacheOp = {
+  name: 'cache',
+  // params: { domain, mode?: "fastcgi"|"wprocket"|"off", objectCache?: boolean }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    const clean = { domain: p.domain };
+    if (p.mode != null) {
+      if (!CACHE_MODES.includes(p.mode)) errors.push(`mode must be one of: ${CACHE_MODES.join(', ')}`);
+      clean.mode = p.mode;
+    }
+    if (p.objectCache != null) {
+      if (typeof p.objectCache !== 'boolean') errors.push('objectCache must be true or false');
+      clean.objectCache = p.objectCache;
+    }
+    if (clean.mode == null && clean.objectCache == null) errors.push('nothing to change (mode or objectCache)');
+    return { ok: errors.length === 0, errors, clean };
+  },
+  async run(job, helpers, p) {
+    await runCache(job, helpers, p);
   },
 };
 
@@ -488,7 +519,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { deploy, php: phpOp, plugin: pluginOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { deploy, php: phpOp, plugin: pluginOp, cache: cacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

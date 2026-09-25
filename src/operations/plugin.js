@@ -2,6 +2,7 @@ import { removePath } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import { requireSpec, siteTmp } from '../lib/sites.js';
 import { wpCli } from '../lib/wp.js';
+import { clearPageCache } from '../lib/cache.js';
 
 // ============================================================
 //  plugin — install / activate / deactivate / update / delete plugins
@@ -50,6 +51,7 @@ export async function runPlugin(job, helpers, p) {
       if (p.upload) await removePath(src);
     }
     ok(p.activate ? 'Plugin installed and activated' : 'Plugin installed');
+    if (s.cache === 'fastcgi') await clearPageCache(s.domain); // pages may render differently now
     done(p.upload ? 'Plugin installed' : `${p.slug} installed`);
     return;
   }
@@ -70,5 +72,6 @@ export async function runPlugin(job, helpers, p) {
     default:
       throw new Error(`unknown plugin action ${p.action}`);
   }
+  if (s.cache === 'fastcgi') await clearPageCache(s.domain); // pages may render differently now
   done(`${past} ${which}`);
 }

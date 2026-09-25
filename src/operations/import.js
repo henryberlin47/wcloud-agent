@@ -3,11 +3,12 @@ import { randomBytes } from 'node:crypto';
 import { run, pathExists, removePath, userIds } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import {
-  SITE_TYPES, readSpec, createSite, deleteSite, applySslConf, syncWpAddress, webRoot, siteTmp,
+  SITE_TYPES, CACHE_MODES, readSpec, createSite, deleteSite, applySslConf, syncWpAddress, webRoot, siteTmp,
 } from '../lib/sites.js';
 import { wpCli, clearWpCaches, safePrefix } from '../lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
 import { issueHttp } from '../lib/acme.js';
+import { installCachePlugin } from '../lib/cache.js';
 
 // Unpredictable, atomically-created staging dir (mkdtemp: 0700 root, never
 // reuses an existing path). Only root touches it; the one file a site's wp-cli
@@ -144,6 +145,7 @@ export async function runRestoreFromLocal(job, helpers, {
     try { src = JSON.parse(await fs.readFile(`${tmpDir}/wcloud-site.json`, 'utf8')); } catch { /* older archive */ }
     const type = SITE_TYPES.includes(src.type) ? src.type : 'wordpress';
     const php = PHP_VERSIONS.includes(src.php) ? src.php : DEFAULT_PHP;
+    const cache = CACHE_MODES.includes(src.cache) ? src.cache : 'fastcgi';
 
     // Source table prefix, from the archived wp-config.php.
     let tablePrefix = 'wp_';
@@ -161,7 +163,7 @@ export async function runRestoreFromLocal(job, helpers, {
 
     step(type === 'wordpress' ? `Create the WordPress site (PHP ${php})` : 'Create the static site');
     const s = await createSite(helpers, {
-      domain, type, php, enableWww, canonical,
+      domain, type, php, cache, enableWww, canonical,
       wp: { install: false, tablePrefix }, // the archive brings WordPress itself
     });
     siteCreated = true;
@@ -253,6 +255,10 @@ export async function runRestoreFromLocal(job, helpers, {
     if (type === 'wordpress') {
       step('Set the WordPress address');
       await syncWpAddress(helpers, await readSpec(domain));
+    }
+    // The archive may predate the page cache (or come from another host).
+    if (type === 'wordpress' && cache === 'fastcgi') {
+      await installCachePlugin(helpers, await readSpec(domain)).catch((e) => warn(`Page cache helper not installed: ${e.message}`));
     }
 
     log(`Restore completed: ${domain}`);

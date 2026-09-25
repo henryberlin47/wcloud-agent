@@ -20,9 +20,10 @@ import { run } from './lib/sys.js';
 import { listTopLevel, putObject, deleteObject, statObject, explainSpacesError } from './lib/spaces.js';
 import { readSiteSsl } from './lib/certinfo.js';
 import { readChallenge } from './lib/acme.js';
-import { listSites, readSpec, publicSpec } from './lib/sites.js';
+import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
 import { readWpVersion, readDbCredentials } from './lib/wp.js';
-import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService } from './lib/stack.js';
+import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning } from './lib/stack.js';
+import { startPurgeWatcher, objectCacheActive } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
 import { createPmaLink } from './lib/pma.js';
@@ -239,7 +240,8 @@ async function siteParam(req, res, next) {
 }
 
 // --- one site's settings (type, PHP version, www, HTTPS) ----------------------
-app.get('/api/sites/:domain', siteParam, (req, res) => res.json(publicSpec(req.site)));
+app.get('/api/sites/:domain', siteParam, async (req, res) =>
+  res.json({ ...publicSpec(req.site), objectCache: await objectCacheActive(req.site) }));
 
 // --- start an operation -----------------------------------------------------
 // POST /api/op/:type   body = operation params
@@ -619,6 +621,19 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'internal_error' });
 });
 
+// Bring the server in line with this agent version: current OPcache settings
+// for every PHP version, and every site re-rendered from its spec (a no-op
+// for sites whose config is already current) — so template improvements reach
+// every site on update. One broken site never stops the others. Queued as a
+// job, so it never races an operation on the same site.
+async function reconcile(job, helpers) {
+  await ensurePhpTuning(helpers).catch((e) => helpers.err(`PHP tuning: ${e.message}`));
+  for (const s of await listSites()) {
+    try { await applySite(helpers, s); }
+    catch (e) { helpers.err(`Could not re-apply ${s.domain}: ${e.message}`); }
+  }
+}
+
 const onListen = () => {
   console.log(
     `[agent] ${config.serverName} listening on ${config.tls ? 'https' : 'http'}://${config.host}:${config.port} ` +
@@ -627,6 +642,8 @@ const onListen = () => {
   );
   if (!config.tls) console.warn('[agent] WARNING: no TLS certificate (/etc/wcloud/agent.crt) — serving plain HTTP; the bearer token crosses the network unencrypted.');
   enroll(); // self-register with the portal if PORTAL_ENROLL_URL/ENROLL_TOKEN are set
+  enqueue('reconcile', {}, reconcile);
+  startPurgeWatcher();
 };
 const server = config.tls
   ? https.createServer({ key: config.tls.key, cert: config.tls.cert, minVersion: 'TLSv1.2' }, app).listen(config.port, config.host, onListen)

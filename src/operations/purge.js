@@ -1,8 +1,9 @@
 import { logger } from '../lib/log.js';
 import { requireSpec } from '../lib/sites.js';
 import { clearWpCaches } from '../lib/wp.js';
+import { clearPageCache } from '../lib/cache.js';
 
-// Purge a site's caches on demand: WP Rocket page cache + object cache.
+// Purge a site's caches on demand: server page cache, WP Rocket, object cache.
 export async function runPurge(job, helpers, p, opts = {}) {
   const { step, ok, warn } = logger(helpers, opts);
   const domain = p.domain;
@@ -10,6 +11,7 @@ export async function runPurge(job, helpers, p, opts = {}) {
   if (s.type !== 'wordpress') throw new Error(`${domain} is a static site — there's no cache to clear.`);
 
   step('Clear the site caches');
+  if (s.cache === 'fastcgi' && (await clearPageCache(domain))) ok('Server page cache cleared');
   const r = await clearWpCaches(helpers, s);
   // Both failing means wp-cli itself is broken — worth failing the job over.
   // Rocket alone failing is normal (plugin inactive) and already disk-cleaned.

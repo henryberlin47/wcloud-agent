@@ -30,6 +30,29 @@ import { setupWordPress, pinWpUrls } from './wp.js';
 
 export const SITE_TYPES = ['wordpress', 'static'];
 
+// Page cache per WordPress site (spec.cache): 'fastcgi' = nginx caches PHP's
+// HTML (per-site zone below, cleared by lib/cache.js); 'wprocket' = nginx
+// serves WP Rocket's cached files directly; 'off'. Sites from before this
+// field existed read as 'off' — nothing changes under them silently.
+export const CACHE_MODES = ['fastcgi', 'wprocket', 'off'];
+export const PAGE_CACHE_ROOT = '/var/cache/wcloud'; // parent /var/cache is the distro's 0755
+export const pageCacheDir = (d) => `${PAGE_CACHE_ROOT}/${d}`;
+// The zone's name is derived from its whole definition: nginx refuses to
+// reload (and silently keeps the OLD config) when an existing zone name comes
+// back with a different path or size, so any such change gets a new name.
+const cacheZoneArgs = 'levels=1:2 max_size=512m inactive=7d use_temp_path=off';
+const cacheZoneSize = '10m';
+const cacheZone = (d) => `wc_${createHash('sha256').update(`${pageCacheDir(d)} ${cacheZoneArgs} ${cacheZoneSize}`).digest('hex').slice(0, 12)}`;
+const cacheMode = (s) => (s.type === 'wordpress' && CACHE_MODES.includes(s.cache) ? s.cache : 'off');
+
+// Empty a site's page cache (the dir itself stays: nginx owns it).
+export async function clearPageCache(domain) {
+  let entries = [];
+  try { entries = await fs.readdir(pageCacheDir(domain)); } catch { return false; }
+  for (const e of entries) await removePath(`${pageCacheDir(domain)}/${e}`);
+  return true;
+}
+
 // phpMyAdmin: installed once per server by init.sh, served per WordPress site.
 export const PMA_DIR = '/usr/share/wcloud-pma';
 export const PMA_PATH = '/.wcloud-pma/';
@@ -78,12 +101,26 @@ export async function listSites() {
 // What the portal sees (all of it is non-secret).
 export const publicSpec = (s) => ({
   domain: s.domain, type: s.type, php: s.php || null, enableWww: s.enableWww,
-  canonical: s.canonical, ssl: s.ssl, created_at: s.created_at,
+  canonical: s.canonical, ssl: s.ssl, cache: s.type === 'wordpress' ? cacheMode(s) : null, created_at: s.created_at,
 });
 
 // --- rendering ----------------------------------------------------------------
 
 const server = (lines) => ['server {', ...lines.map((l) => (l ? `    ${l}` : '')), '}'].join('\n');
+
+// Never serve a cached page to someone it isn't for: logged-in users,
+// commenters, carts/checkouts, admin, APIs, feeds, POSTs and query strings.
+// (A response that sets a cookie is never stored either — nginx default.)
+function cacheSkipRules() {
+  return [
+    '# Page cache: when NOT to use it.',
+    'set $skip_cache 0;',
+    'if ($request_method = POST) { set $skip_cache 1; }',
+    'if ($query_string != "") { set $skip_cache 1; }',
+    'if ($request_uri ~* "/wp-admin/|/wp-json/|/xmlrpc.php|wp-.*\\.php|/feed/|index\\.php|sitemap(_index)?\\.xml|/cart/|/checkout/|/my-account/|/addons/") { set $skip_cache 1; }',
+    'if ($http_cookie ~* "comment_author|wordpress_[a-f0-9]+|wp-postpass|wordpress_no_cache|wordpress_logged_in|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session") { set $skip_cache 1; }',
+  ];
+}
 
 function siteBody(s) {
   const d = s.domain;
@@ -109,11 +146,22 @@ function siteBody(s) {
     ];
   }
   // wordpress. Regex locations match in order: the denies must come first.
+  const mode = cacheMode(s);
   return [
     ...common,
     'index index.php index.html;',
+    ...(mode === 'off' ? [] : cacheSkipRules()),
+    ...(mode === 'wprocket' ? [
+      '# WP Rocket: serve its cached page straight from disk when there is one.',
+      'set $rocket_https "";',
+      'if ($https = "on") { set $rocket_https "-https"; }',
+      'set $rocket_file "/wp-content/cache/wp-rocket/$host${uri}index$rocket_https.html";',
+      'if ($skip_cache = 1) { set $rocket_file "/wcloud-no-rocket-cache"; }',
+    ] : []),
     'location ~* ^/wp-content/uploads/.*\\.php$ { deny all; }',
-    'location / { try_files $uri $uri/ /index.php?$args; }',
+    mode === 'wprocket'
+      ? 'location / { try_files $rocket_file $uri $uri/ /index.php?$args; }'
+      : 'location / { try_files $uri $uri/ /index.php?$args; }',
     'location ~ \\.php$ {',
     '    try_files $uri =404;',
     '    include fastcgi_params;',
@@ -122,6 +170,17 @@ function siteBody(s) {
     '    fastcgi_read_timeout 600s;',
     '    fastcgi_buffers 16 16k;',
     '    fastcgi_buffer_size 32k;',
+    ...(mode === 'fastcgi' ? [
+      `    fastcgi_cache ${cacheZone(d)};`,
+      '    fastcgi_cache_key "$scheme$request_method$host$request_uri";',
+      '    fastcgi_cache_valid 200 301 302 1h;',
+      '    fastcgi_cache_bypass $skip_cache;',
+      '    fastcgi_no_cache $skip_cache;',
+      '    fastcgi_cache_use_stale error timeout updating invalid_header http_500 http_503;',
+      '    fastcgi_cache_background_update on;',
+      '    fastcgi_cache_lock on;',
+      '    add_header X-Cache $upstream_cache_status always;',
+    ] : []),
     '}',
     assets('/index.php?$args'),
     '',
@@ -155,6 +214,11 @@ export function renderVhost(s, { https }) {
 
   const out = [`# Managed by wcloud from ${specPath(d)} — regenerated on every change.`,
     `# Put custom rules in ${siteDir(d)}/conf/nginx/*.conf instead of editing this file.`];
+  // http-level (this file is included inside http {}): the site's own cache
+  // zone, so it can be cleared on its own (lib/cache.js).
+  if (cacheMode(s) === 'fastcgi') {
+    out.push(`fastcgi_cache_path ${pageCacheDir(d)} keys_zone=${cacheZone(d)}:${cacheZoneSize} ${cacheZoneArgs};`);
+  }
   if (https) {
     out.push(server(['listen 80;', 'listen [::]:80;', names, acme,
       `location / { return 301 https://${canon || '$host'}$request_uri; }`]));
@@ -222,6 +286,17 @@ export async function applySite(helpers, s, { certs, prevPhp } = {}) {
     await stage(fullchainPath(d), nl(certs.fullchain), 0o600);
     await stage(keyPath(d), nl(certs.key), 0o600);
   }
+  if (cacheMode(s) === 'fastcgi') {
+    // nginx's workers write the cache; nothing a site controls lives here.
+    // The shared parent must be traversable (0711) — a 0700 parent made
+    // nginx fail every cached request with a 500.
+    await fs.mkdir(PAGE_CACHE_ROOT, { recursive: true });
+    await fs.chmod(PAGE_CACHE_ROOT, 0o711);
+    await fs.mkdir(pageCacheDir(d), { recursive: true, mode: 0o700 });
+    const www = await userIds('www-data');
+    await fs.chown(pageCacheDir(d), www.uid, www.gid);
+    await fs.chmod(pageCacheDir(d), 0o700);
+  }
   const https = s.ssl && (!!certs || (await pathExists(fullchainPath(d))));
   await fs.mkdir(SPEC_DIR, { recursive: true, mode: 0o700 });
   await stage(specPath(d), JSON.stringify(s, null, 2) + '\n', 0o600);
@@ -257,14 +332,26 @@ export async function applySite(helpers, s, { certs, prevPhp } = {}) {
     throw new Error('The new settings were rejected by the web server, so the previous settings were restored and nothing was reloaded. The site is unaffected.');
   }
 
-  // Old version first (it lets go of the socket), then the new one.
-  for (const v of poolVersions) await run(helpers, 'systemctl', ['reload-or-restart', fpmService(v)], { timeout: 60_000 });
-  // A php-fpm reload returns before the new pool's socket exists: wait for it,
-  // or the site's first requests after "ready" get a 502.
+  // php-fpm reloads are asynchronous: `systemctl reload` returns before the
+  // old master has dropped a removed pool — and it then UNLINKS that pool's
+  // socket path, ~½s later. On a version switch (same socket path) the new
+  // version must therefore only bind once the old one has let go, or the old
+  // master deletes the NEW socket and the site 502s until the next reload.
+  const waitFor = async (want) => {
+    for (let i = 0; i < 50 && (await pathExists(sockPath(d))) !== want; i++) await sleep(200);
+  };
+  if (prevPhp && prevPhp !== s.php && poolVersions.includes(prevPhp)) {
+    await run(helpers, 'systemctl', ['reload-or-restart', fpmService(prevPhp)], { timeout: 60_000 });
+    await waitFor(false);
+  }
   if (poolVersions.includes(s.php)) {
-    for (let i = 0; i < 50 && !(await pathExists(sockPath(d))); i++) await sleep(200);
+    await run(helpers, 'systemctl', ['reload-or-restart', fpmService(s.php)], { timeout: 60_000 });
+    await waitFor(true); // …and the first requests after "ready" must not 502
   }
   if (changed.some((e) => !e.path.startsWith('/etc/php/') && e.path !== specPath(d))) await nginxReload(helpers);
+  // Any change (HTTPS, address, cache mode, PHP version…) can change what a
+  // page renders: pages cached under the old config go.
+  await clearPageCache(d);
   return { changed: true };
 }
 
@@ -281,7 +368,9 @@ export async function syncWpAddress(helpers, s) {
   if (s.type !== 'wordpress') return true;
   const https = s.ssl && (await pathExists(fullchainPath(s.domain)));
   const host = !s.enableWww || s.canonical === 'root' ? s.domain : s.canonical === 'www' ? `www.${s.domain}` : undefined;
-  return pinWpUrls(helpers, s, { scheme: https ? 'https' : 'http', host });
+  const r = await pinWpUrls(helpers, s, { scheme: https ? 'https' : 'http', host });
+  await clearPageCache(s.domain); // cached pages carry the old address
+  return r;
 }
 
 // --- create / delete ------------------------------------------------------------
@@ -323,7 +412,10 @@ export async function createSite(helpers, o) {
   if (r.code !== 0) throw new Error(`The site's system user could not be created.`);
 
   const s = { domain: d, type: o.type, php, user, enableWww: o.enableWww, canonical: o.canonical, ssl: false, created_at: new Date().toISOString() };
-  if (s.type === 'wordpress') s.redisDb = await freeRedisDb();
+  if (s.type === 'wordpress') {
+    s.redisDb = await freeRedisDb();
+    s.cache = CACHE_MODES.includes(o.cache) ? o.cache : 'fastcgi';
+  }
   try {
     const { uid, gid } = await userIds(user);
     const wwwGid = (await userIds('www-data')).gid;
@@ -379,6 +471,7 @@ export async function deleteSite(helpers, domain, spec = null) {
     await dropRedisUser(helpers, user, s.redisDb);
   }
   await removePath(siteDir(domain));
+  await removePath(pageCacheDir(domain));
   for (const f of [phpLogPath(domain), `/var/log/nginx/${domain}.access.log`, `/var/log/nginx/${domain}.error.log`]) await removePath(f);
   if (ids && ids.uid >= 1000) {
     const del = await run(helpers, 'userdel', [user], { timeout: 30_000 });
