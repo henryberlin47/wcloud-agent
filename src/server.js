@@ -24,7 +24,7 @@ import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
 import { readAgentLog } from './lib/agentlog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning } from './lib/stack.js';
-import { startPurgeWatcher, objectCacheActive } from './lib/cache.js';
+import { startPurgeWatcher, objectCacheActive, wpRocketStatus } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
 import { createPmaLink } from './lib/pma.js';
@@ -427,6 +427,13 @@ app.get('/api/sites/:domain/indexing', siteParam, wpOnly, async (req, res) => {
   const r = await (await wpCli(NOOP_HELPERS, req.site))(['option', 'get', 'blog_public'], { quiet: true, timeout: 60_000 });
   if (r.code !== 0) return res.status(502).json({ error: 'wp_failed', message: 'WordPress on this site didn\'t respond — is it installed and working?' });
   res.json({ indexing: r.stdout.trim() !== '0' });
+});
+
+// Is WP Rocket ready to be served by nginx? (the cache op refuses 'wprocket' otherwise)
+app.get('/api/sites/:domain/wprocket', siteParam, wpOnly, async (req, res) => {
+  const st = await wpRocketStatus(NOOP_HELPERS, req.site);
+  if (st.error) return res.status(502).json({ error: 'wp_failed', message: st.error });
+  res.json(st);
 });
 
 // A site's logs: the tail of access / error / php, optionally filtered.

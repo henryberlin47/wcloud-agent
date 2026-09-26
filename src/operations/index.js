@@ -99,6 +99,8 @@ const deploy = {
     const php = p.php == null || p.php === '' ? DEFAULT_PHP : p.php;
     const cache = p.cache == null ? 'fastcgi' : p.cache;
     if (!CACHE_MODES.includes(cache)) errors.push(`cache must be one of: ${CACHE_MODES.join(', ')}`);
+    // A brand-new site has no WP Rocket yet — choose it later, once it's set up (cache op).
+    if (cache === 'wprocket') errors.push('WP Rocket caching needs WP Rocket installed and set up first — deploy with fastcgi or off, then switch');
     if (!PHP_VERSIONS.includes(php)) errors.push(`php must be one of: ${PHP_VERSIONS.join(', ')}`);
 
     const cert = typeof p.cert === 'string' ? p.cert.trim() : '';

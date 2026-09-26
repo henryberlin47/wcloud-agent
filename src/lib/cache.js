@@ -178,6 +178,32 @@ export async function objectCacheActive(s) {
   }
 }
 
+// Can nginx serve WP Rocket's cache for this site? Only when WP Rocket is
+// installed AND active AND its page cache is set up: WP_CACHE on and WP
+// Rocket's advanced-cache.php drop-in in place (it writes both on activation).
+// Asked through wp-cli as the site's user. → { installed, active, version,
+// ready, problem } — problem is a sentence for the user when not ready;
+// { error } when WordPress itself didn't answer.
+const ROCKET_PHP = `$f = WP_CONTENT_DIR . '/advanced-cache.php';
+echo "\n" . json_encode(array(
+  'installed' => file_exists(WP_PLUGIN_DIR . '/wp-rocket/wp-rocket.php'),
+  'active' => defined('WP_ROCKET_VERSION'),
+  'version' => defined('WP_ROCKET_VERSION') ? WP_ROCKET_VERSION : null,
+  'wpCache' => defined('WP_CACHE') && WP_CACHE,
+  'dropin' => is_file($f) && strpos((string) file_get_contents($f, false, null, 0, 8192), 'WP_ROCKET') !== false,
+));`;
+export async function wpRocketStatus(helpers, s) {
+  const r = await (await wpCli(helpers, s))(['eval', ROCKET_PHP], { quiet: true, timeout: 60_000 });
+  let st = null;
+  try { st = JSON.parse(r.stdout.trim().split('\n').pop()); } catch { /* below */ }
+  if (r.code !== 0 || !st) return { error: 'WordPress on this site didn\'t respond — is it installed and working?' };
+  const problem = !st.installed ? 'WP Rocket isn\'t installed on this site. Install and activate it first (Plugins tab).'
+    : !st.active ? 'WP Rocket is installed but not active. Activate it first (Plugins tab).'
+    : !st.wpCache || !st.dropin ? `WP Rocket is active but its page cache isn't set up (${[!st.wpCache && 'WP_CACHE is off', !st.dropin && 'its advanced-cache.php is missing'].filter(Boolean).join(', ')}). Open WP Rocket's settings in wp-admin and save them once (or deactivate and reactivate it), then try again.`
+    : null;
+  return { installed: !!st.installed, active: !!st.active, version: st.version || null, ready: !problem, problem };
+}
+
 // Turn the Redis object cache on/off (plugin + its drop-in). The site's
 // wp-config.php already carries its own Redis login and database (wp.js).
 export async function setObjectCache(helpers, s, on) {

@@ -443,7 +443,13 @@ www-data, the group that can read every site).
   strings, logged-in/comment/cart cookies, wp-admin/wp-json/feeds/carts) and
   `X-Cache` header; `wprocket` makes `location /` try WP Rocket's cached file
   first under the same skip rules. `/var/cache/wcloud` must be 0711 (a 0700
-  parent made every cached request 500).
+  parent made every cached request 500). The `cache` op only accepts
+  `wprocket` when `cache.wpRocketStatus()` says ready — WP Rocket installed,
+  active (`WP_ROCKET_VERSION`), `WP_CACHE` on and its `advanced-cache.php`
+  drop-in present (one `wp eval` as the site user) — and fails with what's
+  missing otherwise; `GET /api/sites/:d/wprocket` returns the same
+  `{ installed, active, version, ready, problem }`. Deploy refuses
+  `cache: wprocket` (a new site can't have WP Rocket yet).
 - **Clearing**: `applySite` clears a site's page cache on ANY change (HTTPS,
   address, mode, PHP version…); `syncWpAddress` too. Content changes: the
   `wcloud-cache.php` must-use plugin touches `<site>/tmp/wcloud-purge`; the
