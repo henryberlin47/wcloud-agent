@@ -4,6 +4,7 @@ import config from '../config.js';
 import { run, pathExists, userIds } from './sys.js';
 import { logger } from './log.js';
 import { phpBin, createDatabase, createRedisUser } from './stack.js';
+import { wordpressCore } from './wpcore.js';
 
 // ============================================================
 //  wp.js — WordPress on a wcloud site (s = the site spec, see sites.js)
@@ -87,8 +88,18 @@ export async function setupWordPress(helpers, s, { adminUser, adminPassword, ins
   if (!install) return;
 
   const wp = await wpCli(helpers, s);
-  const dl = await wp(['core', 'download'], { timeout: 300_000 });
-  if (dl.code !== 0) throw new Error('WordPress could not be downloaded — check that this server can reach wordpress.org.');
+  // The server's shared, verified copy (lib/wpcore.js), unpacked AS the site's
+  // user — wp-cli's own download only if that isn't available.
+  let core = null;
+  try { core = await wordpressCore(); } catch (e) { warn(`No local WordPress copy (${e.message}) — downloading it for this site`); }
+  const unpacked = core && (await run(helpers, 'tar', ['-xzf', core.path, '--strip-components=1', '--no-same-owner', '-C', htdocs(s)],
+    { as: { uid, gid, home: tmp(s) }, timeout: 120_000 })).code === 0;
+  if (unpacked) ok(`WordPress ${core.version} ${core.fresh ? 'downloaded and verified (kept for the next sites)' : 'from this server\'s copy — no download'}`);
+  else {
+    if (core) warn('Could not unpack the local WordPress copy — downloading it for this site');
+    const dl = await wp(['core', 'download'], { timeout: 300_000 });
+    if (dl.code !== 0) throw new Error('WordPress could not be downloaded — check that this server can reach wordpress.org.');
+  }
   // No password on argv (readable by every local user via /proc): --prompt
   // reads it from stdin. Without one requested, a random one is set — the
   // owner sets their own with "Reset password".

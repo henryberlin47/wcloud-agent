@@ -311,6 +311,14 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   and IPv4), so the real code lives in `.errors`/`.cause`.
 - **certcheck.js** — `checkCustomCert(domain, cert, key, {www})`: in-memory (Node crypto) validation of a user certificate — PEM parses, key matches, `checkHost` covers the domain, not expired/not-yet-valid; www-coverage and self-signed are warnings. Shared by the ssl op (custom) and deploy. The portal runs the same rules (`server/utils/certcheck.ts`) for its live form check.
 - **log.js** — the step logger used by operations.
+- **wpcore.js** — `wordpressCore()`: the server's one copy of the latest
+  WordPress (`/var/cache/wcloud-wp/wordpress-<v>.tar.gz`, root 0755/0644, newest 2
+  kept), downloaded once per release and checked against wordpress.org's
+  published SHA-1. Deploys unpack it AS the site user (`setupWordPress`); only
+  the tiny version-check call goes out per deploy, and when wordpress.org is
+  unreachable the newest cached copy is used. Never writable by a site (a shared
+  wp-cli cache would let one site poison the next one's core). Any failure →
+  `wp core download` as before. Self-check: `node src/lib/wpcore.js`.
 - **sitelogs.js** — `readSiteLog(domain, access|error|php, {lines, q})`: the tail
   (last 4 MB window) of a site's log, filtered; opened `O_NOFOLLOW` (a symlinked
   log is refused, never read as root). `GET /api/sites/:d/logs`.
