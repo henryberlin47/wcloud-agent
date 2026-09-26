@@ -7,7 +7,7 @@ import {
 } from '../lib/sites.js';
 import { wpCli, clearWpCaches, safePrefix, setWpConstant } from '../lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
-import { issueHttp } from '../lib/acme.js';
+import { issueHttp, issueDnsCloudflare } from '../lib/acme.js';
 import { syncCachePlugin } from '../lib/cache.js';
 import { cleanJob, CRON_MAX, WP_CRON_EVERY } from '../lib/cron.js';
 import { cleanPhpSettings, cleanFpm } from '../lib/phpsettings.js';
@@ -116,12 +116,15 @@ export async function runImport(job, helpers, p) {
 // `${tmpDir}/export.tar.gz.enc` (plaintext `.tar.gz` renamed is fine too).
 // Owns tmpDir cleanup and rollback of a half-created site on failure.
 //
-// params: { tmpDir, domain, sourceDomain, includeSsl?, issueSsl?, encryptKey?, canonical?, enableWww? }
-// includeSsl → copy the source's certs; issueSsl → issue Let's Encrypt; both
-// false → no SSL (explicit "No SSL" choice from the portal).
+// params: { tmpDir, domain, sourceDomain, includeSsl?, issueSsl?, encryptKey?, canonical?, enableWww?, cfToken?, cfZoneId? }
+// cfToken + cfZoneId → Let's Encrypt over Cloudflare DNS first (auto-renewing,
+// works before DNS points here — e.g. a site moving in from another host);
+// includeSsl → copy the source's certs; issueSsl → issue Let's Encrypt; all
+// off → no SSL (explicit "No SSL" choice from the portal).
 export async function runRestoreFromLocal(job, helpers, {
   tmpDir, domain, sourceDomain,
   includeSsl = false, issueSsl = true, encryptKey = '', canonical = 'none', enableWww = true,
+  cfToken = null, cfZoneId = null,
   nested = false,
 }) {
   const { log, step, ok, warn, err, skip } = logger(helpers, { nested });
@@ -222,7 +225,16 @@ export async function runRestoreFromLocal(job, helpers, {
       }
     }
 
-    if (includeSsl) {
+    let cfIssued = false;
+    if (cfToken && cfZoneId) {
+      step('Issue the HTTPS certificate (Let\'s Encrypt via Cloudflare DNS)');
+      const r = await issueDnsCloudflare(helpers, domain, { www: enableWww, token: cfToken, zoneId: cfZoneId });
+      if (r.ok) { cfIssued = true; ok(`SSL issued for ${domain} — renews automatically`); }
+      else warn(`Cloudflare DNS validation failed${includeSsl ? ' — using the archived certificate instead' : ''}`);
+    }
+    if (cfIssued) {
+      // done
+    } else if (includeSsl) {
       step('Restore SSL certificates');
       const destLive = `/etc/letsencrypt/live/${domain}`;
       const destArchive = `/etc/letsencrypt/archive/${domain}`;

@@ -187,7 +187,11 @@ there), **backup** (build archive via the shared helper + S3-upload to Spaces)
 and **restore** (S3-download + the shared restore path; in-place restore first
 runs the full **delete** op). backup/restore take the user's Spaces creds per call
 in params and run with a longer per-op timeout (`AGENT_BACKUP_TIMEOUT_MS`, default
-12h). No shells are used — args are arrays, so domain values can't inject shell
+12h). restore (and `runRestoreFromLocal`) also take `cfToken` + `cfZoneId`: the
+certificate is then issued over Cloudflare DNS first (works before the domain
+points here — how sites moving in from RunCloud get HTTPS), falling back to
+the archived certificate. `lib/spaces.js` uses virtual-hosted style for
+DigitalOcean Spaces and path-style for any other S3-compatible endpoint. No shells are used — args are arrays, so domain values can't inject shell
 syntax.
 
 **ssl — mode-driven (`{ domain, mode, cert?, key?, cfToken?, cfZoneId? }`)**, never "always issue":

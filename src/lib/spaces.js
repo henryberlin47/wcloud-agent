@@ -29,7 +29,9 @@ export function s3Client({ endpoint, accessKeyId, secretAccessKey }) {
     endpoint: toUrl(endpoint),
     region: regionFromEndpoint(endpoint),
     credentials: { accessKeyId, secretAccessKey },
-    forcePathStyle: false, // Spaces uses virtual-hosted-style (<space>.<region>...)
+    // Spaces: virtual-hosted-style (<space>.<region>...). Other S3-compatible
+    // stores (MinIO, …) usually want path-style.
+    forcePathStyle: !/digitaloceanspaces\.com/i.test(String(endpoint)),
     maxAttempts: 5,        // transient 5xx/network retries, like rclone's
   });
 }

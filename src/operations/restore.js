@@ -18,7 +18,7 @@ import { downloadFile, explainSpacesError } from '../lib/spaces.js';
 // ============================================================
 
 // params: { domain, sourceDomain, includeSsl, encryptKey, canonical, enableWww,
-//           space, key, endpoint, accessKeyId, secretAccessKey }
+//           space, key, endpoint, accessKeyId, secretAccessKey, cfToken?, cfZoneId? }
 export async function runRestore(job, helpers, p) {
   const { step, ok, err } = logger(helpers);
   const domain = p.domain;
@@ -66,6 +66,7 @@ export async function runRestore(job, helpers, p) {
     encryptKey: p.encryptKey,
     canonical: p.canonical,
     enableWww: p.enableWww,
+    cfToken: p.cfToken, cfZoneId: p.cfZoneId,
     nested: true, // this op already numbered its own steps
   });
 }

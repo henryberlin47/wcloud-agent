@@ -661,7 +661,7 @@ const backup = {
 const restoreOp = {
   name: 'restore',
   timeout: BACKUP_TIMEOUT_MS,
-  // params: { domain, sourceDomain?, includeSsl?, encryptKey?, canonical?, enableWww?, space, key, endpoint, accessKeyId, secretAccessKey }
+  // params: { domain, sourceDomain?, includeSsl?, encryptKey?, canonical?, enableWww?, space, key, endpoint, accessKeyId, secretAccessKey, cfToken?, cfZoneId? }
   validate(p = {}) {
     const out = { ...p };
     if (typeof out.domain === 'string') out.domain = normDomain(out.domain);
@@ -673,6 +673,13 @@ const restoreOp = {
     let canonical = (out.canonical === 'www' || out.canonical === 'root' || out.canonical === 'none') ? out.canonical : 'none';
     const enableWww = out.enableWww !== false;
     if (canonical === 'www' && !enableWww) canonical = 'root';
+    // Cloudflare-managed DNS: certificate over DNS-01 (redacted in job views).
+    let cf = {};
+    if (out.cfToken != null) {
+      if (typeof out.cfToken !== 'string' || !/^[A-Za-z0-9_-]{30,200}$/.test(out.cfToken)) errors.push('cfToken is invalid');
+      if (typeof out.cfZoneId !== 'string' || !/^[a-f0-9]{32}$/.test(out.cfZoneId)) errors.push('cfZoneId is invalid');
+      cf = { cfToken: out.cfToken, cfZoneId: out.cfZoneId };
+    }
     return {
       ok: errors.length === 0,
       errors,
@@ -685,6 +692,7 @@ const restoreOp = {
         enableWww,
         space: out.space, key: out.key, endpoint: out.endpoint,
         accessKeyId: out.accessKeyId, secretAccessKey: out.secretAccessKey,
+        ...cf,
       },
     };
   },
