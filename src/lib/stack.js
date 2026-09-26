@@ -134,6 +134,23 @@ export async function createDatabase(helpers, name, password) {
   if (r.code !== 0) throw new Error('The site database could not be created.');
 }
 
+// Every database on this server: [{ name, size (bytes), tables }]. System
+// schemas left out. Sizes are MariaDB's own estimate (data + indexes).
+export async function listDatabases(helpers) {
+  const r = await run(helpers, 'mysql', ['--batch', '--skip-column-names'], {
+    stdin: `SELECT s.schema_name, COALESCE(SUM(t.data_length + t.index_length), 0), COUNT(t.table_name)
+      FROM information_schema.schemata s LEFT JOIN information_schema.tables t ON t.table_schema = s.schema_name
+      WHERE s.schema_name NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+      GROUP BY s.schema_name ORDER BY s.schema_name;\n`,
+    quiet: true, timeout: 60_000,
+  });
+  if (r.code !== 0) throw new Error('MariaDB did not answer');
+  return r.stdout.split('\n').filter(Boolean).map((l) => {
+    const [name, size, tables] = l.split('\t');
+    return { name, size: Number(size) || 0, tables: Number(tables) || 0 };
+  });
+}
+
 export async function dropDatabase(helpers, name) {
   const r = await sql(helpers, [
     `DROP DATABASE IF EXISTS \`${name}\`;`,

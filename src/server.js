@@ -23,7 +23,7 @@ import { readChallenge, startDnsRenewer } from './lib/acme.js';
 import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
 import { readAgentLog } from './lib/agentlog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
-import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning } from './lib/stack.js';
+import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning, listDatabases } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive, wpRocketStatus } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
@@ -443,6 +443,17 @@ app.get('/api/sites/:domain/logs', siteParam, async (req, res) => {
   const lines = Math.min(Math.max(parseInt(req.query.lines, 10) || 200, 10), 1000);
   const q = typeof req.query.q === 'string' ? req.query.q.slice(0, 200) : '';
   res.json(await readSiteLog(req.site.domain, type, { lines, q }));
+});
+
+// Databases on this server, each with the site it belongs to (a site's
+// database is named after its Linux user) — null = no site uses it (left over).
+app.get('/api/databases', async (req, res) => {
+  try {
+    const owner = new Map((await listSites()).filter((s) => s.user).map((s) => [s.user, s.domain]));
+    res.json({ databases: (await listDatabases(NOOP_HELPERS)).map((d) => ({ ...d, site: owner.get(d.name) || null })) });
+  } catch (e) {
+    res.status(502).json({ error: 'db_unavailable', message: e.message });
+  }
 });
 
 // The agent's own log (journal of wcloud.service): { entries: [{ time, level, message }], matched }.

@@ -130,6 +130,10 @@ as the source of truth for writing code** — the graph is only a map.
   Servers installed while the default was 1 have `AGENT_MAX_CONCURRENT=1` in
   `.env`; `config.migrateConcurrency()` rewrites that untouched default (the old
   comment + `=1`) to 3 once at startup — any other value is left alone.
+- `GET /api/databases` — every MariaDB database (system schemas left out) with
+  size (data + indexes, MariaDB's estimate), table count and the site it
+  belongs to (a site's database is named after its Linux user; `site: null` =
+  left over). `stack.listDatabases`, root over the unix socket, SQL on stdin.
 - `GET /api/agent-log?lines=&q=` — the agent's own journal (`journalctl -u wcloud -o json`,
   `src/lib/agentlog.js`) → `{ entries: [{ time, level, message }], matched }`, filtered
   over the last 5000 entries. `jobs.js` writes one line per job start/finish there
