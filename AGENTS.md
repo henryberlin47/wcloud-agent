@@ -118,8 +118,18 @@ as the source of truth for writing code** — the graph is only a map.
 - `POST /api/self-update` — refuses (409) while any job is queued/running (the restart would cut it off) or another update runs; `git fetch origin` + `reset --hard origin/main` + `npm install` — an npm failure resets back to the previous commit (new code + old deps would crash-loop on the next restart); respond `{ ok, updated, old_commit, new_commit, version }`, then restart via a *systemd-run 2s timer* (detached — the timer outlives the process that gets SIGTERM'd). Origin/branch hardcoded: this runs remote code as root, no request body ever reaches a shell.
 - `POST /api/backup-test`, `POST /api/backup-delete` — quick S3 calls against the Spaces creds passed **in the request body** (per user, per job). Creds live in the S3 client for one call only — never written to config, never logged. `backup-test` is a full round-trip: list (read), then write a tiny probe object and delete it. A read-only check passes on a Space the key can't write to, so the failure would otherwise surface only after a whole archive was built.
 - `GET /api/jobs`, `/api/jobs/:id`, `/logs`, `/stream` (SSE), `POST /:id/cancel` —
-  job status/logs/cancel. Jobs are **in-memory** (`src/jobs.js`), serialized
-  (`AGENT_MAX_CONCURRENT=1`), forgotten ~1h after finishing.
+  job status/logs/cancel. Jobs are **in-memory** (`src/jobs.js`), forgotten ~1h
+  after finishing. Up to `AGENT_MAX_CONCURRENT` (default 3) run at once:
+  `drain()` never starts two jobs on the same `params.domain`, and a job with
+  no domain (reconcile) runs alone. Server-wide sections take turns through
+  `sys.withLock(name, fn)` (in-process, NOT re-entrant): `'config'` =
+  `applySite`, `deleteSite`'s unload step, `nginxrules` commit, realip refresh,
+  acme `installCert`, PHP install's pool/restart step; `'apt'` = package
+  installs; `'acme'` = every acme.sh call (shared account.conf). New code that
+  writes nginx/PHP-FPM/cron config or reloads them must go through `'config'`.
+  Servers installed while the default was 1 have `AGENT_MAX_CONCURRENT=1` in
+  `.env`; `config.migrateConcurrency()` rewrites that untouched default (the old
+  comment + `=1`) to 3 once at startup — any other value is left alone.
 - `GET /api/agent-log?lines=&q=` — the agent's own journal (`journalctl -u wcloud -o json`,
   `src/lib/agentlog.js`) → `{ entries: [{ time, level, message }], matched }`, filtered
   over the last 5000 entries. `jobs.js` writes one line per job start/finish there

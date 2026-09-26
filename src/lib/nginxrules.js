@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises';
-import { run, removePath, nginxReload } from './sys.js';
+import { run, removePath, nginxReload, withLock } from './sys.js';
 import { siteDir, clearPageCache } from './sites.js';
 
 // ============================================================
@@ -44,7 +44,8 @@ async function nginxCheck(helpers) {
 
 // Apply edits { path: content | null } transactionally. Throws with nginx's
 // complaint when the result doesn't pass `nginx -t`.
-async function commit(helpers, d, edits) {
+const commit = (helpers, d, edits) => withLock('config', () => commitNow(helpers, d, edits));
+async function commitNow(helpers, d, edits) {
   const before = {};
   for (const p of Object.keys(edits)) before[p] = await read(p);
   const put = async (p, c) => { if (c === null) await removePath(p); else await fs.writeFile(p, c, { mode: 0o644 }); };

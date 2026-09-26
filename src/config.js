@@ -1,7 +1,7 @@
 // Centralised configuration. All values come from environment variables so
 // nothing sensitive is baked into the source. See .env.example.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { X509Certificate, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -27,6 +27,22 @@ try {
   }).toString().trim();
 } catch { /* not a git checkout, or git missing — leave blank */ }
 
+// One-time migration: servers set up before jobs could safely run in parallel
+// got AGENT_MAX_CONCURRENT=1 from .env.example, under its old comment. That
+// untouched default becomes the new one (3) — a value someone set themselves
+// (any other line) is left alone. systemd already loaded the old value, so
+// this process uses the new one directly.
+export function migrateConcurrency(envPath = fileURLToPath(new URL('../.env', import.meta.url))) {
+  const OLD = /^# Max concurrent operations\. 1 = serialize \(safest — avoids nginx\/DB races\)\.\r?\nAGENT_MAX_CONCURRENT=1[ \t]*$/m;
+  try {
+    const env = readFileSync(envPath, 'utf8');
+    if (!OLD.test(env)) return false;
+    writeFileSync(envPath, env.replace(OLD, '# Max concurrent operations (default 3). Same-site jobs and the server-wide\n# config/apt/acme.sh steps are serialized regardless; 1 = everything serial.\nAGENT_MAX_CONCURRENT=3'));
+    return true;
+  } catch { return false; }
+}
+if (migrateConcurrency()) process.env.AGENT_MAX_CONCURRENT = '3';
+
 const config = {
   // HTTP
   port: parseInt(process.env.AGENT_PORT || '8787', 10),
@@ -50,9 +66,10 @@ const config = {
   wwwDir: process.env.AGENT_WWW_DIR || '/var/www',
 
   // Job execution
-  // Max concurrent jobs. Deploys touch nginx/php-fpm/DB; running several at once
-  // risks races (nginx reloads, cron writes). Default 1 = serialize.
-  maxConcurrentJobs: parseInt(process.env.AGENT_MAX_CONCURRENT || '1', 10),
+  // Max concurrent jobs (default 3). Never two on the same site, and the
+  // server-wide parts (nginx/php-fpm/cron config + tests + reloads, apt,
+  // acme.sh) take turns — jobs.js drain() + sys.withLock. 1 = fully serial.
+  maxConcurrentJobs: Math.max(1, parseInt(process.env.AGENT_MAX_CONCURRENT || '3', 10) || 3),
 
   // How long to keep finished jobs (and their logs) in memory, ms.
   jobRetentionMs: parseInt(process.env.AGENT_JOB_RETENTION_MS || String(60 * 60 * 1000), 10),

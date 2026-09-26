@@ -16,7 +16,6 @@ const TERMINAL = new Set([STATE.SUCCEEDED, STATE.FAILED, STATE.TIMEOUT, STATE.CA
 
 const jobs = new Map();
 
-let running = 0;
 const queue = [];
 
 function makeJob(type, params) {
@@ -132,16 +131,33 @@ export function enqueue(type, params, runner, opts = {}) {
   return job;
 }
 
+// Up to maxConcurrentJobs at once, oldest first — but never two jobs on the
+// same site (each reads and rewrites that site's spec), and a job without a
+// site (reconcile: every site) runs alone. Server-wide sections inside jobs
+// (config writes + reloads, apt, acme.sh) take turns via sys.withLock.
+const active = new Set(); // running jobs
+const siteOf = (job) => job.params?.domain || null;
+function canStart(job) {
+  if (!active.size) return true;
+  const d = siteOf(job);
+  if (!d) return false;
+  for (const a of active) if (!siteOf(a) || siteOf(a) === d) return false;
+  return true;
+}
 function drain() {
-  while (running < config.maxConcurrentJobs && queue.length > 0) {
-    const job = queue.shift();
-    if (job.state === STATE.CANCELLED) continue;
+  for (let i = 0; i < queue.length && active.size < config.maxConcurrentJobs;) {
+    const job = queue[i];
+    if (job.state === STATE.CANCELLED) { queue.splice(i, 1); continue; }
+    // A site-less job waits for everything before it and holds back what's after.
+    if (!siteOf(job) && active.size) break;
+    if (!canStart(job)) { i++; continue; }
+    queue.splice(i, 1);
     void startJob(job);
   }
 }
 
 async function startJob(job) {
-  running += 1;
+  active.add(job);
   job.startedAt = Date.now();
   setState(job, STATE.RUNNING);
 
@@ -177,7 +193,7 @@ async function startJob(job) {
     }
   } finally {
     clearTimeout(timer);
-    running -= 1;
+    active.delete(job);
     drain();
   }
 }

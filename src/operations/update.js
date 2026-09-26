@@ -1,4 +1,4 @@
-import { systemctl } from '../lib/sys.js';
+import { systemctl, withLock } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import { requireSpec } from '../lib/sites.js';
 import { wpCli } from '../lib/wp.js';
@@ -51,7 +51,7 @@ export async function runUpdate(job, helpers, p) {
 
   // 3) Fresh code must not be served from OPcache. Reload is graceful.
   step('Reload PHP so the new code is used');
-  await systemctl(helpers, 'reload', fpmService(s.php));
+  await withLock('config', () => systemctl(helpers, 'reload', fpmService(s.php))); // never mid-way through another job's pool change
   ok(`PHP ${s.php} reloaded`);
 
   done(`WordPress is up to date — ${domain}`);

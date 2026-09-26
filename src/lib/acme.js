@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import config from '../config.js';
-import { run, pathExists, removePath } from './sys.js';
+import { run, pathExists, removePath, withLock } from './sys.js';
 import { logger } from './log.js';
 import { certDir, applySslConf, requireSpec, syncWpAddress, cfDnsTokenPath } from './sites.js';
 
@@ -35,6 +35,8 @@ import { certDir, applySslConf, requireSpec, syncWpAddress, cfDnsTokenPath } fro
 
 const ACME = '/etc/letsencrypt/acme.sh';
 const ACME_OPTS = ['--config-home', '/etc/letsencrypt/config'];
+// acme.sh one call at a time (shared account.conf) — sys.withLock.
+const acme = (helpers, args, opts) => withLock('acme', () => run(helpers, ACME, args, opts));
 const MANUAL_FLAG = '--yes-I-know-dns-manual-mode-enough-go-ahead-please';
 const CODE_DNS_MANUAL = 3;
 const STATE_DIR = '/var/lib/wcloud/ssl-challenge';
@@ -52,14 +54,14 @@ export const removeManualMarker = (domain) => removePath(manualMarkerPath(domain
 async function installCert(helpers, domain, { renew }) {
   const dir = certDir(domain);
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const inst = await run(helpers, ACME, [
+  const inst = await withLock('config', () => run(helpers, ACME, [
     ...ACME_OPTS, '--install-cert', '-d', domain, '--ecc',
     '--cert-file', `${dir}/cert.pem`,
     '--key-file', `${dir}/key.pem`,
     '--fullchain-file', `${dir}/fullchain.pem`,
     '--ca-file', `${dir}/ca.pem`,
     ...(renew ? ['--reloadcmd', 'systemctl reload nginx'] : []),
-  ], { quiet: true, timeout: 60_000 });
+  ], { quiet: true, timeout: 60_000 }));
   if (inst.code !== 0) {
     throw new Error('The certificate was issued but could not be installed on this server. See the details above.');
   }
@@ -76,16 +78,20 @@ async function installCert(helpers, domain, { renew }) {
 // (startDnsRenewer) instead.
 export async function issueDnsCloudflare(helpers, domain, { www = false, token, zoneId }) {
   const { err } = logger(helpers);
-  const r = await run(helpers, ACME, [...ACME_OPTS, '--issue', '--server', 'letsencrypt', '--dns', 'dns_cf',
-    '-d', domain, ...(www ? ['-d', `www.${domain}`] : []), '--keylength', 'ec-256', '--force'],
-  { env: { CF_Token: token, CF_Zone_ID: zoneId }, quiet: true, timeout: 600_000 });
-  await forgetAcmeCfToken();
+  // Issue + wipe the token acme.sh saved, together: no other acme.sh call in between.
+  const r = await withLock('acme', async () => {
+    const res = await run(helpers, ACME, [...ACME_OPTS, '--issue', '--server', 'letsencrypt', '--dns', 'dns_cf',
+      '-d', domain, ...(www ? ['-d', `www.${domain}`] : []), '--keylength', 'ec-256', '--force'],
+    { env: { CF_Token: token, CF_Zone_ID: zoneId }, quiet: true, timeout: 600_000 });
+    await forgetAcmeCfToken();
+    return res;
+  });
   if (r.code !== 0) {
     for (const l of `${r.stdout}\n${r.stderr}`.trim().split('\n').slice(-6)) err(`    ${stripAnsi(l)}`);
     return { ok: false, timedOut: !!r.timedOut };
   }
   await installCert(helpers, domain, { renew: false });
-  await run(helpers, ACME, [...ACME_OPTS, '--remove', '-d', domain, '--ecc'], { quiet: true, timeout: 60_000 });
+  await acme(helpers, [...ACME_OPTS, '--remove', '-d', domain, '--ecc'], { quiet: true, timeout: 60_000 });
   await fs.mkdir('/etc/wcloud/cf-dns', { recursive: true, mode: 0o700 });
   await fs.writeFile(cfDnsTokenPath(domain), JSON.stringify({ token, zoneId, www }), { mode: 0o600 });
   await removeManualMarker(domain);
@@ -101,7 +107,7 @@ async function forgetAcmeCfToken() {
 }
 
 // Renew Cloudflare-DNS certificates with 30 days or less left. `enqueue`
-// (jobs.js) serialises them with every other operation.
+// (jobs.js) runs them like any other operation (one job per site at a time).
 export function startDnsRenewer(enqueue, { listSites, readCertInfo, fullchainPath }) {
   const tick = async () => {
     for (const s of await listSites()) {
@@ -129,7 +135,7 @@ export function startDnsRenewer(enqueue, { listSites, readCertInfo, fullchainPat
 // bare domain rather than failing outright. Returns { ok, www, timedOut }.
 export async function issueHttp(helpers, domain, { www = false } = {}) {
   const { warn } = logger(helpers);
-  const issue = (withWww) => run(helpers, ACME, [...ACME_OPTS, '--issue', '--server', 'letsencrypt',
+  const issue = (withWww) => acme(helpers, [...ACME_OPTS, '--issue', '--server', 'letsencrypt',
     '-w', ACME_WEBROOT, '-d', domain, ...(withWww ? ['-d', `www.${domain}`] : []),
     '--keylength', 'ec-256', '--force'], { quiet: true, timeout: 300_000 });
 
@@ -225,7 +231,7 @@ export async function startManualDns(helpers, domain) {
   // Pin the key type: verify/install below always pass --ecc, so the order must
   // live in <D>_ecc no matter what this box's acme.sh default keylength is.
   step('Start DNS verification');
-  const r = await run(helpers, ACME, [...ACME_OPTS, '--issue', '--server', 'letsencrypt', '--dns', '-d', domain, '--keylength', 'ec-256', '--force', MANUAL_FLAG],
+  const r = await acme(helpers, [...ACME_OPTS, '--issue', '--server', 'letsencrypt', '--dns', '-d', domain, '--keylength', 'ec-256', '--force', MANUAL_FLAG],
     { quiet: true, timeout: 180_000 });
   if (r.code !== CODE_DNS_MANUAL) {
     err('The certificate authority did not return the DNS records to add.');
@@ -262,7 +268,7 @@ export async function verifyManualDns(helpers, domain) {
   }
 
   step('Check your DNS records');
-  const r = await run(helpers, ACME, [...ACME_OPTS, '--renew', '-d', domain, '--ecc', '--force', MANUAL_FLAG],
+  const r = await acme(helpers, [...ACME_OPTS, '--renew', '-d', domain, '--ecc', '--force', MANUAL_FLAG],
     { quiet: true, timeout: 300_000 });
   const out = `${r.stdout}\n${r.stderr}`;
 

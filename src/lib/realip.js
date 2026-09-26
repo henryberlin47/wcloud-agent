@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import net from 'node:net';
-import { nginxTest, nginxReload } from './sys.js';
+import { nginxTest, nginxReload, withLock } from './sys.js';
 import { REALIP_CONF } from './sites.js';
 
 // ============================================================
@@ -52,11 +52,13 @@ export async function refreshRealIpConf(helpers) {
   } catch { return; } // offline: keep what we have
   if (cidrs.length < 10 || !cidrs.every(isCidr)) return; // doesn't look like the real list
   const want = render(cidrs);
-  const have = await fs.readFile(REALIP_CONF, 'utf8').catch(() => '');
-  if (want === have) return;
-  await fs.writeFile(REALIP_CONF, want, { mode: 0o644 });
-  if (await nginxTest(helpers)) await nginxReload(helpers);
-  else await fs.writeFile(REALIP_CONF, have || render(BUILTIN), { mode: 0o644 });
+  await withLock('config', async () => {
+    const have = await fs.readFile(REALIP_CONF, 'utf8').catch(() => '');
+    if (want === have) return;
+    await fs.writeFile(REALIP_CONF, want, { mode: 0o644 });
+    if (await nginxTest(helpers)) await nginxReload(helpers);
+    else await fs.writeFile(REALIP_CONF, have || render(BUILTIN), { mode: 0o644 });
+  });
 }
 
 export function startRealIpRefresher(helpers) {

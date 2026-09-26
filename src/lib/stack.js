@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
-import { run, pathExists } from './sys.js';
+import { run, pathExists, withLock } from './sys.js';
 import { logger } from './log.js';
 
 // ============================================================
@@ -36,15 +36,21 @@ export async function ensurePhp(helpers, v) {
   if (await pathExists(`/usr/sbin/php-fpm${v}`)) return;
   const { info, ok } = logger(helpers);
   info(`PHP ${v} isn't installed on this server yet — installing it (a minute or two)`);
-  await run(helpers, 'apt-get', [...APT_LOCK, 'update', '-qq'], { env: APT_ENV, timeout: 300_000 });
-  const r = await run(helpers, 'apt-get', [...APT_LOCK, 'install', '-y', '-q',
-    '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold',
-    ...PHP_EXTS.map((e) => `php${v}-${e}`)], { env: APT_ENV, timeout: 900_000 });
+  // Two jobs wanting the same new version: the second waits, then finds it installed.
+  const r = await withLock('apt', async () => {
+    if (await pathExists(`/usr/sbin/php-fpm${v}`)) return { code: 0 };
+    await run(helpers, 'apt-get', [...APT_LOCK, 'update', '-qq'], { env: APT_ENV, timeout: 300_000 });
+    return run(helpers, 'apt-get', [...APT_LOCK, 'install', '-y', '-q',
+      '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold',
+      ...PHP_EXTS.map((e) => `php${v}-${e}`)], { env: APT_ENV, timeout: 900_000 });
+  });
   if (r.code !== 0) throw new Error(`PHP ${v} could not be installed on this server.`);
-  await writePlaceholderPool(v);
-  await writeOpcacheIni(v);
-  await run(helpers, 'systemctl', ['enable', '--now', fpmService(v)], { timeout: 60_000 });
-  await run(helpers, 'systemctl', ['restart', fpmService(v)], { timeout: 60_000 });
+  await withLock('config', async () => {
+    await writePlaceholderPool(v);
+    await writeOpcacheIni(v);
+    await run(helpers, 'systemctl', ['enable', '--now', fpmService(v)], { timeout: 60_000 });
+    await run(helpers, 'systemctl', ['restart', fpmService(v)], { timeout: 60_000 });
+  });
   ok(`PHP ${v} installed`);
 }
 
@@ -107,7 +113,9 @@ async function writeOpcacheIni(v) {
 // only versions whose file changed are reloaded.
 export async function ensurePhpTuning(helpers) {
   for (const v of await installedPhp()) {
-    if (await writeOpcacheIni(v)) await run(helpers, 'systemctl', ['reload-or-restart', fpmService(v)], { quiet: true, timeout: 60_000 });
+    await withLock('config', async () => {
+      if (await writeOpcacheIni(v)) await run(helpers, 'systemctl', ['reload-or-restart', fpmService(v)], { quiet: true, timeout: 60_000 });
+    });
   }
 }
 

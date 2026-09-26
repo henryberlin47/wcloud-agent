@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import config from '../config.js';
-import { run, pathExists, removePath, userIds, nginxTest, nginxReload, sleep } from './sys.js';
+import { run, pathExists, removePath, userIds, nginxTest, nginxReload, sleep, withLock } from './sys.js';
 import { logger } from './log.js';
 import { ensurePhp, installedPhp, fpmService, dropDatabase, dropRedisUser, REDIS_DBS } from './stack.js';
 import { setupWordPress, pinWpUrls } from './wp.js';
@@ -363,7 +363,9 @@ async function ensureSiteLog(file, user) {
   await fs.chown(file, uid, gid);
 }
 
-export async function applySite(helpers, s, { certs, prevPhp } = {}) {
+// One at a time server-wide (the 'config' lock, see sys.withLock): write → test → reload.
+export const applySite = (helpers, s, opts) => withLock('config', () => applySiteNow(helpers, s, opts));
+async function applySiteNow(helpers, s, { certs, prevPhp } = {}) {
   const d = s.domain;
   const edits = []; // { path, before, after (null = delete), mode }
   const stage = async (path, after, mode = 0o644) => edits.push({ path, before: await readOrNull(path), after, mode });
@@ -547,15 +549,17 @@ export async function deleteSite(helpers, domain, spec = null) {
   const { warn, err } = logger(helpers);
   const s = spec || (await readSpec(domain));
 
-  // 1) Stop serving: vhost + pools out, reload.
-  await removePath(vhostPath(domain));
-  const pools = [];
-  for (const v of await installedPhp()) {
-    if (await pathExists(poolPath(domain, v))) { await removePath(poolPath(domain, v)); pools.push(v); }
-  }
-  if (await nginxTest(helpers)) await nginxReload(helpers);
-  else err('The web server configuration is invalid after removing this site. Other sites keep running on the old configuration until it is fixed.');
-  for (const v of pools) await run(helpers, 'systemctl', ['reload-or-restart', fpmService(v)], { timeout: 60_000 });
+  // 1) Stop serving: vhost + pools out, reload (under the 'config' lock).
+  await withLock('config', async () => {
+    await removePath(vhostPath(domain));
+    const pools = [];
+    for (const v of await installedPhp()) {
+      if (await pathExists(poolPath(domain, v))) { await removePath(poolPath(domain, v)); pools.push(v); }
+    }
+    if (await nginxTest(helpers)) await nginxReload(helpers);
+    else err('The web server configuration is invalid after removing this site. Other sites keep running on the old configuration until it is fixed.');
+    for (const v of pools) await run(helpers, 'systemctl', ['reload-or-restart', fpmService(v)], { timeout: 60_000 });
+  });
 
   // 2) The site's user: stop everything it runs, drop its data, remove it.
   //    Only ever a regular (uid ≥ 1000) user we name — never a system account.

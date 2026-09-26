@@ -179,6 +179,24 @@ export function killPids(pids, signal = 'SIGTERM') {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Named in-process mutexes. Jobs run in parallel (AGENT_MAX_CONCURRENT), but
+// what touches server-wide state takes turns:
+//   'config' — writing nginx / PHP-FPM / cron config + `nginx -t` / `php-fpm -t`
+//              + reloads (lib/sites.js applySite, deleteSite, nginxrules,
+//              realip, installing a cert whose reload touches nginx): a test
+//              must never see another job's half-written files;
+//   'apt'    — package installs (dpkg);
+//   'acme'   — acme.sh (one shared account.conf, e.g. the dns_cf token).
+// Not re-entrant: never take a lock from inside the same lock.
+const locks = new Map();
+export function withLock(name, fn) {
+  const next = (locks.get(name) || Promise.resolve()).then(fn);
+  const tail = next.then(() => {}, () => {});
+  locks.set(name, tail);
+  tail.then(() => { if (locks.get(name) === tail) locks.delete(name); });
+  return next;
+}
+
 // --- service wrappers -------------------------------------------------------
 
 export async function systemctl(helpers, action, unit) {

@@ -96,7 +96,7 @@ sudo journalctl -u wcloud -f
 | `AGENT_PORT` | `8787` | no |
 | `AGENT_ALLOWED_IPS` | *(any)* | yes if host ≠ 127.0.0.1 — set to the **portal's egress IP(s)** |
 | `AGENT_WWW_DIR` | `/var/www` | no |
-| `AGENT_MAX_CONCURRENT` | `1` | no |
+| `AGENT_MAX_CONCURRENT` | `3` | no |
 | `AGENT_JOB_RETENTION_MS` | `3600000` (1h) | no |
 | `AGENT_JOB_TIMEOUT_MS` | `1200000` (20m) | no |
 | `PORTAL_ENROLL_URL` | *(none)* | no — enroll endpoint; set by the install command for self-registration |
@@ -155,8 +155,9 @@ SSE events: `hello` (on connect), `line` (`{t,stream,line}`), `state`
 
 - Jobs and logs are **in-memory** (default 1h retention). The portal is the
   durable record; an agent restart forgets history.
-- `AGENT_MAX_CONCURRENT` defaults to **1** to serialize operations (avoids
-  nginx/php-fpm races).
+- `AGENT_MAX_CONCURRENT` defaults to **3** jobs at once. Two jobs on the same
+  site never overlap, and the server-wide steps (nginx/PHP-FPM config + test +
+  reload, apt, acme.sh) take turns. `1` = fully serial.
 - Secrets in job params (matching `pass|secret|token|key`) are redacted in
   public job views.
 - **Self-enrollment** runs once on startup and writes an `.enrolled` marker so it
