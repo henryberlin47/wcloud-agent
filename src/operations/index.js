@@ -87,7 +87,8 @@ function reqSpaces(p, errors) {
 // ============================================================
 const deploy = {
   name: 'deploy',
-  // params: { domain, type?: "wordpress"|"static", php?, wp_user?, wp_password?, canonical?: "www"|"root"|"none", enableWww?, issueSsl?, cert?, key? }
+  // params: { domain, type?: "wordpress"|"static", php?, wp_user?, wp_password?, searchEngines?: boolean (WordPress, default true),
+  //          canonical?: "www"|"root"|"none", enableWww?, issueSsl?, cert?, key? }
   // cert + key (PEM) = install the user's own certificate instead of Let's Encrypt.
   validate(p = {}) {
     p = sanitize(p);
@@ -129,7 +130,7 @@ const deploy = {
       if (typeof p.cfZoneId !== 'string' || !/^[a-f0-9]{32}$/.test(p.cfZoneId)) errors.push('cfZoneId is invalid');
       cf = { cfToken: p.cfToken, cfZoneId: p.cfZoneId };
     }
-    return { ok: errors.length === 0, errors, clean: { domain: p.domain, type, php, cache, wp_user: wpUser, wp_password: wpPassword, canonical, enableWww, issueSsl, ...(cert ? { cert, key } : {}), ...cf } };
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, type, php, cache, wp_user: wpUser, wp_password: wpPassword, searchEngines: p.searchEngines !== false, canonical, enableWww, issueSsl, ...(cert ? { cert, key } : {}), ...cf } };
   },
   async run(job, helpers, p) {
     await runDeploy(job, helpers, p);

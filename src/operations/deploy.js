@@ -3,6 +3,7 @@ import { checkCustomCert } from '../lib/certcheck.js';
 import { createSite, applySslConf, syncWpAddress, requireSpec } from '../lib/sites.js';
 import { issueHttp, issueDnsCloudflare } from '../lib/acme.js';
 import { syncCachePlugin, setObjectCache } from '../lib/cache.js';
+import { wpCli } from '../lib/wp.js';
 
 // ============================================================
 //  deploy — create a site (WordPress or static) on this server
@@ -45,6 +46,13 @@ export async function runDeploy(job, helpers, p) {
       await setObjectCache(helpers, s0, true);
     } catch (e) {
       warn(`Caching couldn't be fully turned on (${e?.message || e}) — do it from the site page.`);
+    }
+    // WordPress's "Discourage search engines" (blog_public), same as the indexing op.
+    if (p.searchEngines === false) {
+      step('Ask search engines not to index the site');
+      const r = await (await wpCli(helpers, s0))(['option', 'update', 'blog_public', '0'], { timeout: 60_000 });
+      if (r.code === 0) ok('Search engines are asked not to index it (noindex)');
+      else warn('Couldn\'t turn off search engine indexing — do it from the site page before the site goes public.');
     }
   }
 

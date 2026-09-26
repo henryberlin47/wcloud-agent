@@ -158,7 +158,7 @@ Each descriptor has:
   against `DOMAIN_RE`. Never let unvalidated input reach a command.
 - `run(job, helpers, clean)` — the work.
 
-Current ops: **deploy** (`type` wordpress|static + `php` → `sites.createSite`, then HTTPS: Let's Encrypt via `issueSsl` (`acme.issueHttp`, or `acme.issueDnsCloudflare` when the portal passes `cfToken`+`cfZoneId` — Cloudflare-managed DNS, works behind the proxy), or the user's own `cert`+`key` — checked by `lib/certcheck.js` BEFORE the site is created, then installed with `applySslConf({certs})`),
+Current ops: **deploy** (`type` wordpress|static + `php` → `sites.createSite`, then HTTPS: Let's Encrypt via `issueSsl` (`acme.issueHttp`, or `acme.issueDnsCloudflare` when the portal passes `cfToken`+`cfZoneId` — Cloudflare-managed DNS, works behind the proxy), or the user's own `cert`+`key` — checked by `lib/certcheck.js` BEFORE the site is created, then installed with `applySslConf({certs})`), `searchEngines: false` (WordPress) sets `blog_public` 0 right after install — same setting as the **indexing** op,
 **php** (switch a site's PHP version: installs it on demand, moves the pool),
 **update** (`wp core update` + `update-db` + php-fpm reload), **delete** (custom
 cron/procs/locks, then `sites.deleteSite`; requires `confirm:true`), **ssl** (mode-driven, below),
