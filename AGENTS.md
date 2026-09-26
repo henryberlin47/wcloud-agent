@@ -190,7 +190,13 @@ in params and run with a longer per-op timeout (`AGENT_BACKUP_TIMEOUT_MS`, defau
 12h). restore (and `runRestoreFromLocal`) also take `cfToken` + `cfZoneId`: the
 certificate is then issued over Cloudflare DNS first (works before the domain
 points here — how sites moving in from RunCloud get HTTPS), falling back to
-the archived certificate. `lib/spaces.js` uses virtual-hosted style for
+the archived certificate. An archive whose `wcloud-site.json` says
+`source: "runcloud"` also gets `cache.retireLiteSpeedCache()` right after the DB
+import (before any other wp-cli run): LiteSpeed Cache's drop-ins
+(`object-cache.php` / `advanced-cache.php`, recognised by content) are deleted
+and the plugin deactivated with `--skip-plugins` — it only caches on a LiteSpeed
+server, and its object-cache drop-in points at RunCloud's cache server.
+`lib/spaces.js` uses virtual-hosted style for
 DigitalOcean Spaces and path-style for any other S3-compatible endpoint. No shells are used — args are arrays, so domain values can't inject shell
 syntax.
 

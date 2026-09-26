@@ -8,7 +8,7 @@ import {
 import { wpCli, clearWpCaches, safePrefix, setWpConstant } from '../lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
 import { issueHttp, issueDnsCloudflare } from '../lib/acme.js';
-import { syncCachePlugin } from '../lib/cache.js';
+import { syncCachePlugin, retireLiteSpeedCache } from '../lib/cache.js';
 import { cleanJob, CRON_MAX, WP_CRON_EVERY } from '../lib/cron.js';
 import { cleanPhpSettings, cleanFpm } from '../lib/phpsettings.js';
 
@@ -208,6 +208,21 @@ export async function runRestoreFromLocal(job, helpers, {
         await removePath(handed);
         if (importR.code !== 0) throw new Error('Database import failed');
         ok('Database imported');
+
+        // Coming from RunCloud (wcloud-site.json source): its LiteSpeed stack's
+        // cache plugin does nothing on nginx — first, before any other wp-cli
+        // run loads its object-cache drop-in.
+        if (src.source === 'runcloud') {
+          try {
+            const ls = await retireLiteSpeedCache(helpers, s);
+            if (ls.active || ls.removed.length) {
+              step('Turn off LiteSpeed Cache');
+              ok(`${ls.active ? 'Deactivated LiteSpeed Cache' : 'LiteSpeed Cache was already inactive'}${ls.removed.length ? ` and removed its ${ls.removed.map((f) => f.split('/').pop()).join(' + ')}` : ''} — it only works on a LiteSpeed server; wcloud's server page cache takes over`);
+            }
+          } catch (e) {
+            warn(`LiteSpeed Cache is still active (${e.message}) — deactivate it from the Plugins tab`);
+          }
+        }
 
         if (domainChanged) {
           step('Update site URLs');

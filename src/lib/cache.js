@@ -204,6 +204,39 @@ export async function wpRocketStatus(helpers, s) {
   return { installed: !!st.installed, active: !!st.active, version: st.version || null, ready: !problem, problem };
 }
 
+// LiteSpeed Cache only caches on a LiteSpeed web server. A site moving in from
+// one (RunCloud's OpenLiteSpeed stack) arrives with it active and with its
+// drop-ins in wp-content: on nginx it caches nothing, and its object-cache
+// drop-in points at a cache server that isn't here. Remove the drop-ins it
+// wrote (checked by content — read as root, so no symlinks, first 8 KB), then
+// deactivate it without loading any plugin. → { active, removed[] }
+const LSCACHE_DROPINS = ['object-cache.php', 'advanced-cache.php'];
+async function isLiteSpeedDropin(file) {
+  let fh;
+  try {
+    fh = await fs.open(file, FS.O_RDONLY | FS.O_NOFOLLOW);
+    if (!(await fh.stat()).isFile()) return false;
+    const { buffer, bytesRead } = await fh.read(Buffer.alloc(8192), 0, 8192, 0);
+    return /litespeed/i.test(buffer.subarray(0, bytesRead).toString('utf8'));
+  } catch {
+    return false;
+  } finally {
+    await fh?.close();
+  }
+}
+export async function retireLiteSpeedCache(helpers, s) {
+  const removed = [];
+  for (const f of LSCACHE_DROPINS) if (await isLiteSpeedDropin(`${webRoot(s.domain)}/wp-content/${f}`)) removed.push(`wp-content/${f}`);
+  if (removed.length) await settle(await spawnWorker(s, 'delete', { paths: removed }));
+  const wp = await wpCli(helpers, s);
+  const quiet = ['--skip-plugins', '--skip-themes'];
+  const active = (await wp(['plugin', 'is-active', 'litespeed-cache', ...quiet], { quiet: true })).code === 0;
+  if (active && (await wp(['plugin', 'deactivate', 'litespeed-cache', ...quiet], { quiet: true })).code !== 0) {
+    throw new Error('LiteSpeed Cache could not be deactivated');
+  }
+  return { active, removed };
+}
+
 // Turn the Redis object cache on/off (plugin + its drop-in). The site's
 // wp-config.php already carries its own Redis login and database (wp.js).
 export async function setObjectCache(helpers, s, on) {
