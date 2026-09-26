@@ -7,6 +7,7 @@ import { ensurePhp, installedPhp, fpmService, dropDatabase, dropRedisUser, REDIS
 import { setupWordPress, pinWpUrls } from './wp.js';
 import { ensureRealIpConf } from './realip.js';
 import { renderCron, cronFilePath, cronLogPath, ensureWrappers } from './cron.js';
+import { poolLines, nginxLimits, phpSettingsOf, fpmOf, PHP_DEFAULTS, FPM_DEFAULTS } from './phpsettings.js';
 
 // ============================================================
 //  sites.js — the site model: one spec file → everything else
@@ -168,6 +169,7 @@ export const publicSpec = (s) => ({
   domainRedirect: s.domainRedirect || null,
   crons: Array.isArray(s.crons) ? s.crons : [], wpCron: s.wpCron === 'server' ? 'server' : 'wordpress',
   wpCronEvery: s.wpCronEvery || 5, cfCache: !!s.cfCache,
+  ...(s.type === 'wordpress' ? { phpSettings: phpSettingsOf(s), phpDefaults: PHP_DEFAULTS, fpm: fpmOf(s), fpmDefaults: FPM_DEFAULTS } : {}),
   created_at: s.created_at,
 });
 
@@ -216,9 +218,11 @@ function siteBody(s) {
   }
   // wordpress. Regex locations match in order: the denies must come first.
   const mode = cacheMode(s);
+  const lim = nginxLimits(s); // follow the site's PHP upload size / time limits
   return [
     ...common,
     'index index.php index.html;',
+    `client_max_body_size ${lim.bodyMB}m;`,
     ...(mode === 'off' ? [] : cacheSkipRules()),
     // At server level, not in the PHP location: a location's own add_header
     // would stop the site's custom-rule headers from reaching PHP pages.
@@ -244,7 +248,7 @@ function siteBody(s) {
     '    include fastcgi_params;',
     '    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;',
     `    fastcgi_pass unix:${sockPath(d)};`,
-    '    fastcgi_read_timeout 600s;',
+    `    fastcgi_read_timeout ${lim.readTimeout}s;`,
     '    fastcgi_buffers 16 16k;',
     '    fastcgi_buffer_size 32k;',
     ...(mode === 'fastcgi' ? [
@@ -272,7 +276,7 @@ function siteBody(s) {
     '        include fastcgi_params;',
     `        fastcgi_param SCRIPT_FILENAME ${PMA_DIR}/$1;`,
     `        fastcgi_pass unix:${sockPath(d)};`,
-    '        fastcgi_read_timeout 600s;',
+    `        fastcgi_read_timeout ${lim.readTimeout}s;`,
     '    }',
     '}',
   ];
@@ -328,24 +332,13 @@ export function renderPool(s) {
     'listen.owner = www-data',
     'listen.group = www-data',
     'listen.mode = 0660',
-    // ondemand: an idle site costs no memory, which is what lets one server
-    // hold hundreds of sites.
-    'pm = ondemand',
-    'pm.max_children = 20',
-    'pm.process_idle_timeout = 30s',
-    'pm.max_requests = 500',
-    'request_terminate_timeout = 600s',
+    // Process manager + php_value lines: the site's own settings (lib/phpsettings.js).
+    ...poolLines(s),
     `php_admin_value[error_log] = ${phpLogPath(d)}`,
     'php_admin_flag[log_errors] = on',
     `php_admin_value[upload_tmp_dir] = ${tmp}`,
     `php_admin_value[sys_temp_dir] = ${tmp}`,
     `php_admin_value[session.save_path] = ${tmp}`,
-    'php_value[memory_limit] = 512M',
-    'php_value[max_execution_time] = 600',
-    'php_value[max_input_time] = 600',
-    'php_value[max_input_vars] = 3000',
-    'php_value[post_max_size] = 512M',
-    'php_value[upload_max_filesize] = 512M',
     '',
   ].join('\n');
 }

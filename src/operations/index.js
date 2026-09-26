@@ -18,6 +18,7 @@ import { runCron } from './cron.js';
 import { runCfCache } from './cfcache.js';
 import { cleanJob, WP_CRON_EVERY } from '../lib/cron.js';
 import { cleanRedirects, cleanDomainRedirect } from '../lib/sites.js';
+import { cleanPhpSettings, cleanFpm } from '../lib/phpsettings.js';
 import { RULE_MAX } from '../lib/nginxrules.js';
 import { CACHE_MODES } from '../lib/sites.js';
 import { PLUGIN_NAME, UPLOAD_NAME } from '../lib/plugins.js';
@@ -241,11 +242,12 @@ const indexingOp = {
 };
 
 // ============================================================
-//  siteconfig — real visitor IPs (Cloudflare) + redirects
+//  siteconfig — real visitor IPs (Cloudflare), redirects, PHP / PHP-FPM settings
 // ============================================================
 const siteconfigOp = {
   name: 'siteconfig',
-  // params: { domain, realIp?: boolean, redirects?: [{ from, to, code, regex, keepQuery }], domainRedirect?: { to, code, keepPath } | null }
+  // params: { domain, realIp?: boolean, redirects?: [{ from, to, code, regex, keepQuery }], domainRedirect?: { to, code, keepPath } | null,
+  //          phpSettings?: { memory_limit, … }, fpm?: { pm, max_children, … } } (whole sets; lib/phpsettings.js)
   validate(p = {}) {
     p = sanitize(p);
     const errors = [];
@@ -263,7 +265,15 @@ const siteconfigOp = {
       const r = cleanDomainRedirect(p.domainRedirect, p.domain);
       if (r.error) errors.push(r.error); else clean.domainRedirect = r.value;
     }
-    if (clean.realIp == null && clean.redirects == null && clean.domainRedirect === undefined) errors.push('nothing to change');
+    if (p.phpSettings != null) {
+      const r = cleanPhpSettings(p.phpSettings);
+      if (r.error) errors.push(r.error); else clean.phpSettings = r.value;
+    }
+    if (p.fpm != null) {
+      const r = cleanFpm(p.fpm);
+      if (r.error) errors.push(r.error); else clean.fpm = r.value;
+    }
+    if (clean.realIp == null && clean.redirects == null && clean.domainRedirect === undefined && !clean.phpSettings && !clean.fpm) errors.push('nothing to change');
     return { ok: errors.length === 0, errors, clean };
   },
   async run(job, helpers, p) {

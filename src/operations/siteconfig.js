@@ -6,7 +6,7 @@ import { saveRule, deleteRule } from '../lib/nginxrules.js';
 //  siteconfig / nginxrule — per-site nginx settings
 // ============================================================
 
-// params: { domain, realIp?, redirects?, domainRedirect? } — rendered into the vhost (tested
+// params: { domain, realIp?, redirects?, domainRedirect?, phpSettings?, fpm? } — rendered into the vhost / PHP pool (tested
 // transaction; the page cache is cleared by applySite).
 export async function runSiteconfig(job, helpers, p) {
   const { step, ok, done } = logger(helpers);
@@ -29,8 +29,13 @@ export async function runSiteconfig(job, helpers, p) {
       delete next.domainRedirect;
     }
   }
+  if (p.phpSettings || p.fpm) {
+    if (s.type !== 'wordpress') throw new Error(`${p.domain} is a static site — it doesn't run PHP.`);
+    if (p.phpSettings) { step('Save the PHP settings'); next.phpSettings = p.phpSettings; }
+    if (p.fpm) { step('Save the PHP-FPM process settings'); next.fpm = p.fpm; }
+  }
   await applySite(helpers, next);
-  ok('Web server updated');
+  ok(p.phpSettings || p.fpm ? 'PHP-FPM and nginx accepted it and were reloaded' : 'Web server updated');
   done(`Settings saved for ${p.domain}`);
 }
 

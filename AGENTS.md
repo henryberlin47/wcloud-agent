@@ -158,8 +158,9 @@ Current ops: **deploy** (`type` wordpress|static + `php` → `sites.createSite`,
 **update** (`wp core update` + `update-db` + php-fpm reload), **delete** (custom
 cron/procs/locks, then `sites.deleteSite`; requires `confirm:true`), **ssl** (mode-driven, below),
 **sslDnsVerify** (step 2 of manual DNS-01, below),
-**purge** (WP Rocket + object cache), **siteconfig** (`realIp` and/or
-`redirects` → spec → `applySite`; redirects validated by `sites.cleanRedirects`),
+**purge** (WP Rocket + object cache), **siteconfig** (`realIp`, `redirects`,
+`domainRedirect`, `phpSettings`, `fpm` → spec → `applySite`; validated by
+`sites.cleanRedirects` / `cleanDomainRedirect` / `phpsettings.cleanPhpSettings` / `cleanFpm`),
 **nginxrule** (named custom nginx rules: save/delete via `lib/nginxrules.js`),
 **cron** (a WordPress site's scheduled jobs: save/delete/run/wpcron, `lib/cron.js`),
 **cfcache** (Cloudflare cache purge credentials + helper plugin, `lib/cfcache.js`),
@@ -344,7 +345,8 @@ Driven by env the portal's install command injects (`init.sh` writes them to
 
 **`/etc/wcloud/sites/<domain>.json` is the source of truth** (root 0600):
 `{ domain, type, php, user, enableWww, canonical, ssl, redisDb, cache, realIp,
-redirects, sslDns, crons, wpCron, wpCronEvery, cfCache, created_at }`.
+redirects, domainRedirect, sslDns, crons, wpCron, wpCronEvery, cfCache, phpSettings,
+fpm, created_at }`.
 `redirects` = `[{ from, to, code: 301|302, regex, keepQuery }]`, rendered as
 `location = "from"` / `location ~ "from"` with `return code "to[$is_args$args]"`.
 `cleanRedirects` is the injection boundary: exact paths start with `/`, patterns
@@ -357,6 +359,20 @@ keepPath); the site body isn't rendered, only ACME challenges are answered so
 the certificate keeps renewing. `cleanDomainRedirect` is the boundary:
 absolute http(s) URL on another host (never the site itself or its www), no
 quotes / `$` / `;` / braces / backslashes / whitespace. Set via `siteconfig`.
+`phpSettings` / `fpm` (WordPress, `src/lib/phpsettings.js`) hold only the
+values that DIFFER from `PHP_SETTINGS` / `FPM_SETTINGS` defaults (memory_limit,
+max_execution_time, max_input_time, max_input_vars, post_max_size,
+upload_max_filesize, display_errors, date.timezone; pm ondemand|dynamic|static,
+max_children, start/min/max spare, process_idle_timeout, max_requests,
+request_terminate_timeout). `cleanPhpSettings` / `cleanFpm` are the boundary:
+whitelisted keys, typed values, upload ≤ post size, dynamic min ≤ start ≤ max
+spare ≤ max children. Rendered as `php_value`/`php_flag` only (never
+`php_admin_*`, so the isolation lines can't be loosened). The vhost follows
+them: `client_max_body_size` = the larger of post/upload size,
+`fastcgi_read_timeout` = max(600, max_execution_time, request_terminate_timeout).
+`publicSpec` returns the effective values plus `phpDefaults` / `fpmDefaults`;
+set via `siteconfig`; export/import carries them. Self-check:
+`node src/lib/phpsettings.js`.
 The nginx vhost (`/etc/nginx/sites-enabled/<d>.conf`) and PHP-FPM pool
 (`/etc/php/<v>/fpm/pool.d/<d>.conf`) are **rendered** from it — never edited in
 place, never parsed back. Every change goes through **`applySite(helpers, spec,

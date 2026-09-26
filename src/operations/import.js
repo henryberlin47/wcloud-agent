@@ -10,6 +10,7 @@ import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
 import { issueHttp } from '../lib/acme.js';
 import { syncCachePlugin } from '../lib/cache.js';
 import { cleanJob, CRON_MAX, WP_CRON_EVERY } from '../lib/cron.js';
+import { cleanPhpSettings, cleanFpm } from '../lib/phpsettings.js';
 
 // Unpredictable, atomically-created staging dir (mkdtemp: 0700 root, never
 // reuses an existing path). Only root touches it; the one file a site's wp-cli
@@ -272,6 +273,14 @@ export async function runRestoreFromLocal(job, helpers, {
         if (wpCron === 'server' && !(await setWpConstant(helpers, cur, 'DISABLE_WP_CRON', 'true'))) warn('Could not set DISABLE_WP_CRON — WordPress will also run its cron on visits');
         await applySite(helpers, { ...cur, crons, wpCron, wpCronEvery: WP_CRON_EVERY.includes(src.wpCronEvery) ? src.wpCronEvery : 5 });
         ok(`${crons.length} cron job${crons.length === 1 ? '' : 's'}${wpCron === 'server' ? ' + WordPress cron run by the server' : ''}`);
+      }
+      // PHP settings and FPM sizing travel too (dropped if they don't validate here).
+      const phpSettings = cleanPhpSettings(src.phpSettings || {}).value || {};
+      const fpm = cleanFpm(src.fpm || {}).value || {};
+      if (Object.keys(phpSettings).length || Object.keys(fpm).length) {
+        step('Restore the PHP settings');
+        await applySite(helpers, { ...(await readSpec(domain)), phpSettings, fpm });
+        ok('PHP and PHP-FPM settings restored');
       }
       // The archive's helper plugin may come from another setup — rewrite or drop it.
       await syncCachePlugin(helpers, await readSpec(domain)).catch((e) => warn(`Cache helper not installed: ${e.message}`));
