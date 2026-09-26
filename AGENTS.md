@@ -120,6 +120,11 @@ as the source of truth for writing code** — the graph is only a map.
 - `GET /api/jobs`, `/api/jobs/:id`, `/logs`, `/stream` (SSE), `POST /:id/cancel` —
   job status/logs/cancel. Jobs are **in-memory** (`src/jobs.js`), serialized
   (`AGENT_MAX_CONCURRENT=1`), forgotten ~1h after finishing.
+- `GET /api/agent-log?lines=&q=` — the agent's own journal (`journalctl -u wcloud -o json`,
+  `src/lib/agentlog.js`) → `{ entries: [{ time, level, message }], matched }`, filtered
+  over the last 5000 entries. `jobs.js` writes one line per job start/finish there
+  (`[job] <type> <domain> <state> in Ns: reason (id)`; failures on stderr) — the
+  step-by-step log stays on the job.
 
 ### Transport security (TLS pinning) + sandbox
 

@@ -21,6 +21,7 @@ import { listTopLevel, putObject, deleteObject, statObject, explainSpacesError }
 import { readSiteSsl } from './lib/certinfo.js';
 import { readChallenge, startDnsRenewer } from './lib/acme.js';
 import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
+import { readAgentLog } from './lib/agentlog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive } from './lib/cache.js';
@@ -435,6 +436,13 @@ app.get('/api/sites/:domain/logs', siteParam, async (req, res) => {
   const lines = Math.min(Math.max(parseInt(req.query.lines, 10) || 200, 10), 1000);
   const q = typeof req.query.q === 'string' ? req.query.q.slice(0, 200) : '';
   res.json(await readSiteLog(req.site.domain, type, { lines, q }));
+});
+
+// The agent's own log (journal of wcloud.service): { entries: [{ time, level, message }], matched }.
+app.get('/api/agent-log', async (req, res) => {
+  const lines = Math.min(Math.max(parseInt(req.query.lines, 10) || 200, 10), 2000);
+  const q = typeof req.query.q === 'string' ? req.query.q.slice(0, 200) : '';
+  res.json(await readAgentLog({ lines, q }));
 });
 
 // Named custom nginx rules (changed through the `nginxrule` op).

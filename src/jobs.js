@@ -92,6 +92,13 @@ function setState(job, state, reason = null) {
   job.state = state;
   if (reason) job.exitReason = reason;
   if (TERMINAL.has(state)) job.finishedAt = Date.now();
+  // One line per start/finish in the agent's own log (journalctl -u wcloud —
+  // the portal's server "Agent log" tab); the step-by-step log stays on the job.
+  if (state === STATE.RUNNING || TERMINAL.has(state)) {
+    const took = TERMINAL.has(state) && job.startedAt ? ` in ${((job.finishedAt - job.startedAt) / 1000).toFixed(1)}s` : '';
+    (state === STATE.SUCCEEDED || state === STATE.RUNNING ? console.log : console.error)(
+      `[job] ${job.type}${job.params?.domain ? ` ${job.params.domain}` : ''} ${state}${took}${reason ? `: ${reason}` : ''} (${job.id.slice(0, 8)})`);
+  }
   job._emitter.emit('state', { state, reason });
   if (TERMINAL.has(state)) scheduleCleanup(job);
 }
