@@ -605,7 +605,8 @@ const importOp = {
     if (out.sourcePin != null && out.sourcePin !== '' && !/^[A-Za-z0-9+/]{43}=$/.test(String(out.sourcePin))) {
       errors.push('sourcePin must be a base64 SHA-256 public-key pin');
     }
-    let canonical = (out.canonical === 'www' || out.canonical === 'root' || out.canonical === 'none') ? out.canonical : 'none';
+    // "keep" = the address the archived site had (runRestoreFromLocal reads it).
+    let canonical = ['www', 'root', 'none', 'keep'].includes(out.canonical) ? out.canonical : 'none';
     const enableWww = out.enableWww !== false;
     if (canonical === 'www' && !enableWww) canonical = 'root'; // can't redirect to a host we don't serve
     return {
@@ -675,7 +676,8 @@ const restoreOp = {
     reqDomain(errors, 'domain', out.domain);
     if (out.sourceDomain && !isDomain(out.sourceDomain)) errors.push('sourceDomain must be a valid domain');
     reqSpaces(out, errors);
-    let canonical = (out.canonical === 'www' || out.canonical === 'root' || out.canonical === 'none') ? out.canonical : 'none';
+    // "keep" = the address the archived site had (runRestoreFromLocal reads it).
+    let canonical = ['www', 'root', 'none', 'keep'].includes(out.canonical) ? out.canonical : 'none';
     const enableWww = out.enableWww !== false;
     if (canonical === 'www' && !enableWww) canonical = 'root';
     // Cloudflare-managed DNS: certificate over DNS-01 (redacted in job views).

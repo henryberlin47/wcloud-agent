@@ -149,6 +149,12 @@ export async function runRestoreFromLocal(job, helpers, {
     let src = {};
     try { src = JSON.parse(await fs.readFile(`${tmpDir}/wcloud-site.json`, 'utf8')); } catch { /* older archive */ }
     const type = SITE_TYPES.includes(src.type) ? src.type : 'wordpress';
+    // canonical "keep" (a restore): the address the site had — www or not.
+    if (canonical === 'keep') {
+      canonical = ['www', 'root', 'none'].includes(src.canonical) ? src.canonical : 'none';
+      enableWww = src.enableWww !== false;
+      if (canonical === 'www' && !enableWww) canonical = 'root';
+    }
     const php = PHP_VERSIONS.includes(src.php) ? src.php : DEFAULT_PHP;
     const cache = CACHE_MODES.includes(src.cache) ? src.cache : 'fastcgi';
 

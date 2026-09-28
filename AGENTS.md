@@ -199,7 +199,8 @@ cron/procs/locks, then `sites.deleteSite`; requires `confirm:true`), **ssl** (mo
 archive builder), **import** (restores an archive; `runRestoreFromLocal` in
 `import.js` is the shared restore body — decrypt/extract/DB/SSL/canonical all live
 there), **backup** (build archive via the shared helper + S3-upload to Spaces)
-and **restore** (S3-download + the shared restore path; in-place restore first
+and **restore** (S3-download + the shared restore path — `canonical: "keep"`
+(restore, import) takes the archived site's canonical/enableWww; in-place restore first
 runs the full **delete** op). backup/restore take the user's Spaces creds per call
 in params and run with a longer per-op timeout (`AGENT_BACKUP_TIMEOUT_MS`, default
 12h). restore (and `runRestoreFromLocal`) also take `cfToken` + `cfZoneId`: the
