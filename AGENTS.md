@@ -130,6 +130,17 @@ as the source of truth for writing code** — the graph is only a map.
   Servers installed while the default was 1 have `AGENT_MAX_CONCURRENT=1` in
   `.env`; `config.migrateConcurrency()` rewrites that untouched default (the old
   comment + `=1`) to 3 once at startup — any other value is left alone.
+- **Watchdog / self-healing** (`src/lib/watchdog.js`, every `AGENT_WATCHDOG_MS`,
+  default 60 s, `0` = off): checks what each service DOES — nginx answers on :80,
+  every site's PHP-FPM socket accepts (sites whose pool file exists), `mysqladmin
+  ping`, Redis `PING` (admin user), cron active, disk ≥5 % free (warn <10 %).
+  A failed check → `systemctl restart` + re-check. Never restarts nginx when
+  `nginx -t` fails (reports it); nginx/PHP heal under the `'config'` lock and a
+  round is skipped (warn) while `'config'`/`'apt'` are busy (`sys.lockBusy`); a
+  service restarted 3× in 30 min is left alone ("needs a look"). Heals log
+  `[watchdog] …` to the journal. `GET /api/health` (last round + heals),
+  `POST /api/health/check` (run now), `GET /api/stack` (summary: ok | warn |
+  error | unknown + problems — the portal's health sweep reads it).
 - `GET /api/databases` — every MariaDB database (system schemas left out) with
   size (data + indexes, MariaDB's estimate), table count and the site it
   belongs to (a site's database is named after its Linux user; `site: null` =
@@ -200,6 +211,10 @@ import (before any other wp-cli run): LiteSpeed Cache's drop-ins
 (`object-cache.php` / `advanced-cache.php`, recognised by content) are deleted
 and the plugin deactivated with `--skip-plugins` — it only caches on a LiteSpeed
 server, and its object-cache drop-in points at RunCloud's cache server.
+**Object cache (Redis) is on by default**: deploy turns it on, and every import
+/ restore / clone turns it on at the end unless the archive's
+`wcloud-site.json` says `objectCache: false` (export records whether it was
+on; RunCloud and older archives don't say → on). A failure only warns.
 Every WordPress site also carries the must-use **LiteSpeed Cache guard**
 (`cache.syncLiteSpeedGuard`, `wp-content/mu-plugins/wcloud-litespeed-guard.php`):
 filters `option_active_plugins` / `pre_update_option_active_plugins` (+ the

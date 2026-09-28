@@ -22,6 +22,7 @@ import { readSiteSsl } from './lib/certinfo.js';
 import { readChallenge, startDnsRenewer } from './lib/acme.js';
 import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
 import { readAgentLog } from './lib/agentlog.js';
+import { startWatchdog, checkNow, snapshot, summary } from './lib/watchdog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning, listDatabases } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard } from './lib/cache.js';
@@ -445,6 +446,12 @@ app.get('/api/sites/:domain/logs', siteParam, async (req, res) => {
   res.json(await readSiteLog(req.site.domain, type, { lines, q }));
 });
 
+// Stack health + self-healing (lib/watchdog.js). /api/stack is the one-line
+// summary the portal's health sweep stores per server.
+app.get('/api/health', async (req, res) => res.json(snapshot().checkedAt ? snapshot() : await checkNow()));
+app.post('/api/health/check', async (req, res) => res.json(await checkNow()));
+app.get('/api/stack', (req, res) => res.json(summary()));
+
 // Databases on this server, each with the site it belongs to (a site's
 // database is named after its Linux user) — null = no site uses it (left over).
 app.get('/api/databases', async (req, res) => {
@@ -707,6 +714,7 @@ const onListen = () => {
   startPurgeWatcher();
   startRealIpRefresher(NOOP_HELPERS);
   startDnsRenewer(enqueue, { listSites, readCertInfo, fullchainPath });
+  startWatchdog();
 };
 const server = config.tls
   ? https.createServer({ key: config.tls.key, cert: config.tls.cert, minVersion: 'TLSv1.2' }, app).listen(config.port, config.host, onListen)

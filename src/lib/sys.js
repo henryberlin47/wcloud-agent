@@ -189,6 +189,7 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 //   'acme'   — acme.sh (one shared account.conf, e.g. the dns_cf token).
 // Not re-entrant: never take a lock from inside the same lock.
 const locks = new Map();
+export const lockBusy = (name) => locks.has(name);
 export function withLock(name, fn) {
   const next = (locks.get(name) || Promise.resolve()).then(fn);
   const tail = next.then(() => {}, () => {});

@@ -179,6 +179,12 @@ async function redis(helpers, commands) {
     { env: { REDISCLI_AUTH: pass }, stdin: commands.join('\n') + '\n', quiet: true, timeout: 30_000 });
 }
 
+// Is Redis answering? (the watchdog)
+export async function redisPing(helpers) {
+  const r = await redis(helpers, ['PING']);
+  return r.code === 0 && /PONG/.test(r.stdout);
+}
+
 export async function createRedisUser(helpers, name, password, db) {
   const r = await redis(helpers, [
     `ACL SETUSER ${name} reset on >${password} ~${name}:* +@all -@dangerous +flushdb +info -select +select|${db}`,
