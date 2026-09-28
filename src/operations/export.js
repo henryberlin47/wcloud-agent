@@ -6,6 +6,7 @@ import { run, pathExists, removePath } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import { requireSpec, publicSpec, siteDir, siteTmp } from '../lib/sites.js';
 import { wpCli } from '../lib/wp.js';
+import { objectCacheActive } from '../lib/cache.js';
 import { makeStagingDir } from './import.js';
 
 // Temporary export archives and their one-time tokens.
@@ -33,8 +34,10 @@ export async function buildSiteArchive(helpers, domain, { includeSsl = false, en
   const s = await requireSpec(domain);
   const tmpDir = await makeStagingDir(helpers, 'export'); // root-only 0700
   const archivePath = `${tmpDir}.tar.gz`;
-  // Type + PHP version travel with the archive, so a restore rebuilds the same site.
-  await fs.writeFile(`${tmpDir}/wcloud-site.json`, JSON.stringify(publicSpec(s), null, 2));
+  // Type + PHP version (+ whether the object cache was on) travel with the
+  // archive, so a restore rebuilds the same site.
+  const objectCache = s.type === 'wordpress' ? await objectCacheActive(s) : false;
+  await fs.writeFile(`${tmpDir}/wcloud-site.json`, JSON.stringify({ ...publicSpec(s), objectCache }, null, 2));
 
   // 1) Dump the database. wp-cli runs as the site's user, so it writes into
   //    the site's own tmp dir; root then moves the dump into staging.
