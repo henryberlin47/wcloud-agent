@@ -24,7 +24,7 @@ import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
 import { readAgentLog } from './lib/agentlog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning, listDatabases } from './lib/stack.js';
-import { startPurgeWatcher, objectCacheActive, wpRocketStatus } from './lib/cache.js';
+import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
 import { createPmaLink } from './lib/pma.js';
@@ -691,6 +691,7 @@ async function reconcile(job, helpers) {
   for (const s of await listSites()) {
     try { await applySite(helpers, s); }
     catch (e) { helpers.err(`Could not re-apply ${s.domain}: ${e.message}`); }
+    await syncLiteSpeedGuard(helpers, s).catch((e) => helpers.err(`LiteSpeed Cache guard on ${s.domain}: ${e.message}`));
   }
 }
 

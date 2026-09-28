@@ -200,6 +200,16 @@ import (before any other wp-cli run): LiteSpeed Cache's drop-ins
 (`object-cache.php` / `advanced-cache.php`, recognised by content) are deleted
 and the plugin deactivated with `--skip-plugins` — it only caches on a LiteSpeed
 server, and its object-cache drop-in points at RunCloud's cache server.
+Every WordPress site also carries the must-use **LiteSpeed Cache guard**
+(`cache.syncLiteSpeedGuard`, `wp-content/mu-plugins/wcloud-litespeed-guard.php`):
+filters `option_active_plugins` / `pre_update_option_active_plugins` (+ the
+sitewide ones) so LiteSpeed Cache is never loaded or saved as active, drops
+its activation hook on an activation attempt (notice in wp-admin, WP-CLI
+warning — not an error, so `activate --all` finishes), replaces its Activate
+link, and removes its drop-ins (admin requests, hourly). Installed on deploy,
+import and by the startup reconcile (skipped when the file is already
+current). The `plugin` op refuses `activate` / `install --activate` of
+`litespeed-cache` up front.
 `lib/spaces.js` uses virtual-hosted style for
 DigitalOcean Spaces and path-style for any other S3-compatible endpoint. No shells are used — args are arrays, so domain values can't inject shell
 syntax.

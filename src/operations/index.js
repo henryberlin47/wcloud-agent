@@ -161,6 +161,9 @@ const phpOp = {
 //  plugin — manage a WordPress site's plugins (see plugin.js)
 // ============================================================
 const PLUGIN_ACTIONS = ['install', 'activate', 'deactivate', 'update', 'delete', 'auto-update-on', 'auto-update-off'];
+// Every WordPress site also carries a must-use guard that keeps it off
+// (lib/cache.js syncLiteSpeedGuard) — this just says so up front.
+const LSCACHE_REFUSED = 'LiteSpeed Cache only works on a LiteSpeed web server — wcloud sites run on nginx and use wcloud\'s server page cache, so it can\'t be activated here.';
 const pluginOp = {
   name: 'plugin',
   // params: { domain, action, plugins?: [name], all?, slug?, upload?, activate?, replace? }
@@ -181,6 +184,7 @@ const pluginOp = {
       } else errors.push('slug (a WordPress.org plugin slug) or upload is required');
       clean.activate = p.activate === true;
       clean.replace = p.replace === true;
+      if (clean.activate && clean.slug === 'litespeed-cache') errors.push(LSCACHE_REFUSED);
     } else if (action) {
       // update/activate/… accept all:true where wp-cli supports --all
       if (p.all === true && action !== 'delete') clean.all = true;
@@ -190,6 +194,7 @@ const pluginOp = {
           errors.push('plugins must be a list of plugin names');
         }
         clean.plugins = plugins;
+        if (action === 'activate' && plugins.includes('litespeed-cache')) errors.push(LSCACHE_REFUSED);
       }
     }
     return { ok: errors.length === 0, errors, clean };

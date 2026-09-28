@@ -2,7 +2,7 @@ import { logger } from '../lib/log.js';
 import { checkCustomCert } from '../lib/certcheck.js';
 import { createSite, applySslConf, syncWpAddress, requireSpec } from '../lib/sites.js';
 import { issueHttp, issueDnsCloudflare } from '../lib/acme.js';
-import { syncCachePlugin, setObjectCache } from '../lib/cache.js';
+import { syncCachePlugin, setObjectCache, syncLiteSpeedGuard } from '../lib/cache.js';
 import { wpCli } from '../lib/wp.js';
 
 // ============================================================
@@ -47,6 +47,7 @@ export async function runDeploy(job, helpers, p) {
     } catch (e) {
       warn(`Caching couldn't be fully turned on (${e?.message || e}) — do it from the site page.`);
     }
+    await syncLiteSpeedGuard(helpers, s0).catch((e) => warn(`LiteSpeed Cache guard not installed: ${e.message}`));
     // WordPress's "Discourage search engines" (blog_public), same as the indexing op.
     if (p.searchEngines === false) {
       step('Ask search engines not to index the site');

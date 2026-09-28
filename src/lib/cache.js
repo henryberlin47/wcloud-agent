@@ -237,6 +237,79 @@ export async function retireLiteSpeedCache(helpers, s) {
   return { active, removed };
 }
 
+// Keeps LiteSpeed Cache off for good on every WordPress site (a must-use
+// plugin: always loaded, can't be switched off in wp-admin). It only caches on
+// a LiteSpeed server; on nginx it does nothing useful and its drop-ins break
+// things. Never loaded even if the DB says active; activation (wp-admin, bulk,
+// WP-CLI) skips its activation hook and never lands in active_plugins — with a
+// notice/warning instead of an error, so "activate all" still does the rest;
+// its Activate link is replaced by an explanation; its drop-ins are removed
+// (admin requests, at most hourly). Installed on deploy/import and by the
+// startup reconcile (so an agent update reaches every site).
+export const LSCACHE_GUARD_FILE = 'wcloud-litespeed-guard.php';
+const LSCACHE_GUARD = `<?php
+/**
+ * Plugin Name: wcloud — LiteSpeed Cache guard
+ * Description: LiteSpeed Cache only works on a LiteSpeed web server. This site runs on nginx (wcloud) and uses wcloud's server page cache, so LiteSpeed Cache stays off.
+ * Managed by wcloud — it is put back if removed.
+ */
+defined( 'ABSPATH' ) || exit;
+
+const WCLOUD_LSCACHE = 'litespeed-cache/litespeed-cache.php';
+const WCLOUD_LSCACHE_WHY = 'LiteSpeed Cache only works on a LiteSpeed web server. This site runs on nginx (wcloud), which caches pages itself — turn caching on or off on the site page in wcloud.';
+
+// Never loaded, whatever the database says (e.g. restored from elsewhere).
+add_filter( 'option_active_plugins', function ( $v ) { return is_array( $v ) ? array_values( array_diff( $v, array( WCLOUD_LSCACHE ) ) ) : $v; } );
+add_filter( 'site_option_active_sitewide_plugins', function ( $v ) { if ( is_array( $v ) ) { unset( $v[ WCLOUD_LSCACHE ] ); } return $v; } );
+// Never saved as active.
+add_filter( 'pre_update_option_active_plugins', function ( $v ) { return is_array( $v ) ? array_values( array_diff( $v, array( WCLOUD_LSCACHE ) ) ) : $v; } );
+add_filter( 'pre_update_site_option_active_sitewide_plugins', function ( $v ) { if ( is_array( $v ) ) { unset( $v[ WCLOUD_LSCACHE ] ); } return $v; } );
+
+// Activation attempt: its activation hook must not run (it writes drop-ins).
+add_action( 'activate_plugin', function ( $plugin ) {
+	if ( WCLOUD_LSCACHE !== $plugin ) { return; }
+	remove_all_actions( 'activate_' . WCLOUD_LSCACHE );
+	if ( defined( 'WP_CLI' ) && WP_CLI ) {
+		WP_CLI::warning( 'LiteSpeed Cache was left inactive — ' . WCLOUD_LSCACHE_WHY );
+	} else {
+		set_transient( 'wcloud_lscache_blocked', 1, 120 );
+	}
+} );
+add_action( 'admin_notices', function () {
+	if ( get_transient( 'wcloud_lscache_blocked' ) ) {
+		delete_transient( 'wcloud_lscache_blocked' );
+		echo '<div class="notice notice-warning"><p><strong>LiteSpeed Cache was not activated.</strong> ' . esc_html( WCLOUD_LSCACHE_WHY ) . '</p></div>';
+	}
+} );
+// No Activate link for it.
+add_filter( 'plugin_action_links_' . WCLOUD_LSCACHE, function ( $links ) {
+	unset( $links['activate'] );
+	$links['wcloud'] = '<span style="color:#646970">Not available on wcloud (nginx)</span>';
+	return $links;
+} );
+// Its drop-ins, if they turn up (copied in by hand, an old backup).
+add_action( 'admin_init', function () {
+	if ( get_transient( 'wcloud_lscache_dropins_checked' ) ) { return; }
+	set_transient( 'wcloud_lscache_dropins_checked', 1, HOUR_IN_SECONDS );
+	foreach ( array( 'object-cache.php', 'advanced-cache.php' ) as $f ) {
+		$p = WP_CONTENT_DIR . '/' . $f;
+		if ( is_file( $p ) && ! is_link( $p ) && false !== stripos( (string) file_get_contents( $p, false, null, 0, 8192 ), 'litespeed' ) ) {
+			@unlink( $p );
+		}
+	}
+} );
+`;
+export async function syncLiteSpeedGuard(helpers, s) {
+  if (s.type !== 'wordpress') return;
+  // Already current (the usual case at startup) → no wp-cli round trip.
+  let fh;
+  try {
+    fh = await fs.open(`${webRoot(s.domain)}/wp-content/mu-plugins/${LSCACHE_GUARD_FILE}`, FS.O_RDONLY | FS.O_NOFOLLOW);
+    if ((await fh.readFile('utf8')) === LSCACHE_GUARD) return;
+  } catch { /* missing → install */ } finally { await fh?.close(); }
+  await installMuPlugin(helpers, s, LSCACHE_GUARD_FILE, LSCACHE_GUARD);
+}
+
 // Turn the Redis object cache on/off (plugin + its drop-in). The site's
 // wp-config.php already carries its own Redis login and database (wp.js).
 export async function setObjectCache(helpers, s, on) {

@@ -8,7 +8,7 @@ import {
 import { wpCli, clearWpCaches, safePrefix, setWpConstant } from '../lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
 import { issueHttp, issueDnsCloudflare } from '../lib/acme.js';
-import { syncCachePlugin, retireLiteSpeedCache } from '../lib/cache.js';
+import { syncCachePlugin, retireLiteSpeedCache, syncLiteSpeedGuard } from '../lib/cache.js';
 import { cleanJob, CRON_MAX, WP_CRON_EVERY } from '../lib/cron.js';
 import { cleanPhpSettings, cleanFpm } from '../lib/phpsettings.js';
 
@@ -311,6 +311,7 @@ export async function runRestoreFromLocal(job, helpers, {
       }
       // The archive's helper plugin may come from another setup — rewrite or drop it.
       await syncCachePlugin(helpers, await readSpec(domain)).catch((e) => warn(`Cache helper not installed: ${e.message}`));
+      await syncLiteSpeedGuard(helpers, await readSpec(domain)).catch((e) => warn(`LiteSpeed Cache guard not installed: ${e.message}`));
     }
 
     log(`Restore completed: ${domain}`);
