@@ -20,7 +20,10 @@ import config from '../config.js';
 // ============================================================
 
 export const CRON_MAX = 30;
-export const COMMAND_MAX = 2000;
+export const COMMAND_MAX = 700;
+// cron reads a line's command into 1000 bytes (MAX_COMMAND, end marker
+// included): a longer one is cut off, or cron skips the site's whole file.
+const CRON_CMD_MAX = 998;
 export const WP_CRON_EVERY = [1, 5, 15];
 export const cronLogPath = (d) => `/var/log/wcloud/${d}.cron.log`;
 // cron ignores /etc/cron.d names with dots — domain dots become underscores.
@@ -71,17 +74,28 @@ export function cleanJob(j, taken = []) {
 }
 
 // One cron line: run as the site user, in htdocs, logged with a header.
+// The command gets its own `sh -c`, as "Run now" runs it: a `# comment` or a
+// trailing `;` / `&` in it cannot swallow the closing `; }` and the log.
+// cron ends a command at a bare `%` and reads `\%` as `%`: every `%` gets a
+// backslash, unless it has one already (a command copied from a crontab).
 const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-function line(s, schedule, label, command) {
+function cronCmd(s, label, command) {
   const d = s.domain;
-  const body = `{ echo "=== $(date -u '+%F %T') UTC — ${label}"; ${command}; } >> ${q(cronLogPath(d))} 2>&1`;
-  return `${schedule} ${s.user} cd ${q(`${siteRoot(d)}/htdocs`)} && ${body}`.replace(/%/g, '\\%');
+  const body = `{ echo "=== $(date -u '+%F %T') UTC — ${label}"; /bin/sh -c ${q(command)}; } >> ${q(cronLogPath(d))} 2>&1`;
+  return `cd ${q(`${siteRoot(d)}/htdocs`)} && ${body}`.replace(/(\\*)%/g, (m, b) => (b.length % 2 ? m : `${b}\\%`));
 }
+const line = (s, schedule, label, command) => `${schedule} ${s.user} ${cronCmd(s, label, command)}`;
+
+/** Does the job fit in a cron line? What we put around the command, the domain and the escaping count too. */
+export const fitsCron = (s, j) => Buffer.byteLength(cronCmd(s, j.id, j.command)) <= CRON_CMD_MAX;
 
 /** The cron.d file for a site, or null when it has nothing scheduled. */
 export function renderCron(s) {
   if (s.type !== 'wordpress' || !s.php || !s.user) return null;
-  const jobs = (Array.isArray(s.crons) ? s.crons : []).filter((j) => j.enabled !== false);
+  // A job that doesn't fit is left out (saving one is refused): its line
+  // would break the file for every other job, and throwing here would block
+  // every other change to the site.
+  const jobs = (Array.isArray(s.crons) ? s.crons : []).filter((j) => j.enabled !== false && fitsCron(s, j));
   const every = WP_CRON_EVERY.includes(s.wpCronEvery) ? s.wpCronEvery : 5;
   const lines = [];
   if (s.wpCron === 'server') lines.push(line(s, every === 1 ? '* * * * *' : `*/${every} * * * *`, 'WordPress cron', 'wp cron event run --due-now --quiet'));

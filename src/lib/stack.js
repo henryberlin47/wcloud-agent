@@ -30,15 +30,26 @@ export async function installedPhp() {
   return out;
 }
 
+// Installed = dpkg has every package fully configured. The php-fpm binary
+// alone proves nothing: an install killed midway (cancel, timeout) leaves it
+// behind with extensions missing, and must be finished by the next attempt.
+async function phpReady(helpers, v) {
+  const r = await run(helpers, 'dpkg-query', ['-W', '-f=${db:Status-Status}\\n', ...PHP_EXTS.map((e) => `php${v}-${e}`)], { quiet: true, timeout: 15_000 });
+  return r.code === 0 && r.stdout.trim().split('\n').every((s) => s === 'installed');
+}
+
 // Install a PHP version (FPM + CLI + WordPress extensions) if it isn't there.
 export async function ensurePhp(helpers, v) {
   if (!PHP_VERSIONS.includes(v)) throw new Error(`PHP ${v} is not offered.`);
-  if (await pathExists(`/usr/sbin/php-fpm${v}`)) return;
+  if (await phpReady(helpers, v)) return;
   const { info, ok } = logger(helpers);
   info(`PHP ${v} isn't installed on this server yet — installing it (a minute or two)`);
   // Two jobs wanting the same new version: the second waits, then finds it installed.
   const r = await withLock('apt', async () => {
-    if (await pathExists(`/usr/sbin/php-fpm${v}`)) return { code: 0 };
+    if (await phpReady(helpers, v)) return { code: 0 };
+    // A killed install leaves dpkg interrupted, and apt refuses to run until
+    // this is done. The result is not checked: if it fails, the install fails too.
+    await run(helpers, 'dpkg', ['--force-confdef', '--force-confold', '--configure', '-a'], { env: APT_ENV, timeout: 300_000 });
     await run(helpers, 'apt-get', [...APT_LOCK, 'update', '-qq'], { env: APT_ENV, timeout: 300_000 });
     return run(helpers, 'apt-get', [...APT_LOCK, 'install', '-y', '-q',
       '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold',

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import config from '../config.js';
 import { run, pathExists, removePath, userIds, nginxTest, nginxReload, sleep, withLock } from './sys.js';
 import { logger } from './log.js';
-import { ensurePhp, installedPhp, fpmService, dropDatabase, dropRedisUser, REDIS_DBS } from './stack.js';
+import { ensurePhp, installedPhp, fpmService, listDatabases, dropDatabase, dropRedisUser, REDIS_DBS } from './stack.js';
 import { setupWordPress, pinWpUrls } from './wp.js';
 import { ensureRealIpConf } from './realip.js';
 import { renderCron, cronFilePath, cronLogPath, ensureWrappers } from './cron.js';
@@ -49,10 +49,17 @@ const cacheZone = (d) => `wc_${createHash('sha256').update(`${pageCacheDir(d)} $
 const cacheMode = (s) => (s.type === 'wordpress' && CACHE_MODES.includes(s.cache) ? s.cache : 'off');
 
 // Empty a site's page cache (the dir itself stays: nginx owns it).
+// nginx keeps writing into these dirs while they are removed
+// (use_temp_path=off): retry, and a dir that is STILL not empty only holds
+// pages rendered after the purge began — leave those, and always go on to
+// the next dir.
 export async function clearPageCache(domain) {
   let entries = [];
   try { entries = await fs.readdir(pageCacheDir(domain)); } catch { return false; }
-  for (const e of entries) await removePath(`${pageCacheDir(domain)}/${e}`);
+  for (const e of entries) {
+    await fs.rm(`${pageCacheDir(domain)}/${e}`, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+      .catch((err) => { if (err.code !== 'ENOTEMPTY') throw err; });
+  }
   return true;
 }
 
@@ -73,7 +80,7 @@ export const cfCachePath = (d) => `/etc/wcloud/cf-cache/${d}.json`;
 export const REDIRECT_MAX = 200;
 const REDIRECT_FROM_EXACT = /^\/[^\s"';{}\\]*$/;
 const REDIRECT_FROM_REGEX = /^[^\s"';{}]{1,300}$/;
-const REDIRECT_TO = /^(https?:\/\/[^\s"';{}\\$]+|\/[^\s"';{}\\$]*)([^\s"';{}\\]*)$/;
+const REDIRECT_TO = /^(?:https?:\/\/[^\s"';{}\\$]|\/)[^\s"';{}\\]*$/; // one run of characters: no backtracking
 export function cleanRedirects(list) {
   if (!Array.isArray(list)) return 'redirects must be a list';
   if (list.length > REDIRECT_MAX) return `up to ${REDIRECT_MAX} redirects`;
@@ -83,6 +90,9 @@ export function cleanRedirects(list) {
     const from = String(r?.from || '').trim();
     const to = String(r?.to || '').trim();
     const code = r?.code === 302 ? 302 : 301;
+    // Before any pattern runs: validation happens on the agent's one event
+    // loop, and nothing else limits how long a path or target is.
+    if (from.length > 2000 || to.length > 2000) return 'a redirect path or target can be at most 2000 characters';
     if (regex ? !REDIRECT_FROM_REGEX.test(from) : !REDIRECT_FROM_EXACT.test(from)) return `"${from}" isn't a valid ${regex ? 'pattern' : 'path (it must start with /)'}`;
     // Only $1…$9 may appear in the target — no other nginx variables.
     if (!REDIRECT_TO.test(to) || /\$(?![1-9])/.test(to) || (!regex && /\$/.test(to))) return `"${to}" isn't a valid target (a URL or a path starting with /${regex ? '; $1…$9 for captures' : ''})`;
@@ -355,12 +365,14 @@ const readOrNull = async (p) => ((await pathExists(p)) ? fs.readFile(p, 'utf8') 
 //   prevPhp: the version whose pool must go (PHP version switch)
 // A log file in root-owned /var/log/wcloud that the site's own user appends to
 // (no one else can place a symlink there, so creating it as root is safe).
-async function ensureSiteLog(file, user) {
-  if (await pathExists(file)) return;
+// Owner and mode are set every time: a file that root created first would
+// make every cron line of the site fail at its redirect, silently.
+export async function ensureSiteLog(file, user) {
   await fs.mkdir('/var/log/wcloud', { recursive: true, mode: 0o755 });
   await (await fs.open(file, 'a', 0o640)).close();
   const { uid, gid } = await userIds(user);
   await fs.chown(file, uid, gid);
+  await fs.chmod(file, 0o640);
 }
 
 // One at a time server-wide (the 'config' lock, see sys.withLock): write → test → reload.
@@ -437,18 +449,26 @@ async function applySiteNow(helpers, s, { certs, prevPhp } = {}) {
   const waitFor = async (want) => {
     for (let i = 0; i < 50 && (await pathExists(sockPath(d))) !== want; i++) await sleep(200);
   };
+  // The new files are on disk and tested: the reloads happen even if the job
+  // was cancelled or timed out meanwhile (run() would start nothing more).
+  // Otherwise the services keep the old config, and applying the same
+  // settings again finds nothing changed and reloads nothing.
+  const h = { ...helpers, signal: undefined };
   if (prevPhp && prevPhp !== s.php && poolVersions.includes(prevPhp)) {
-    await run(helpers, 'systemctl', ['reload-or-restart', fpmService(prevPhp)], { timeout: 60_000 });
+    await run(h, 'systemctl', ['reload-or-restart', fpmService(prevPhp)], { timeout: 60_000 });
     await waitFor(false);
   }
   if (poolVersions.includes(s.php)) {
-    await run(helpers, 'systemctl', ['reload-or-restart', fpmService(s.php)], { timeout: 60_000 });
+    await run(h, 'systemctl', ['reload-or-restart', fpmService(s.php)], { timeout: 60_000 });
     await waitFor(true); // …and the first requests after "ready" must not 502
   }
-  if (changed.some((e) => !e.path.startsWith('/etc/php/') && e.path !== specPath(d))) await nginxReload(helpers);
+  // A cron file concerns neither nginx nor what a page renders. (Re-rendered
+  // for every site when the line format changes: no reload, no empty caches.)
+  const cronOnly = changed.every((e) => e.path === cronFilePath(d) || e.path === specPath(d)) && changed.some((e) => e.path === cronFilePath(d));
+  if (changed.some((e) => !e.path.startsWith('/etc/php/') && e.path !== specPath(d) && e.path !== cronFilePath(d))) await nginxReload(h);
   // Any change (HTTPS, address, cache mode, PHP version…) can change what a
   // page renders: pages cached under the old config go.
-  await clearPageCache(d);
+  if (!cronOnly) await clearPageCache(d);
   return { changed: true };
 }
 
@@ -459,6 +479,15 @@ export async function applySslConf(helpers, domain, { certs, sslDns } = {}) {
   // Any other kind of certificate ends Cloudflare-DNS renewals for the site.
   await applySite(helpers, { ...s, ssl: true, sslDns: sslDns || undefined }, { certs });
   if (!sslDns) await removePath(cfDnsTokenPath(domain));
+  // A pair acme.sh wrote into certDir itself is outside the transaction: on a
+  // renewal / re-issue spec + vhost are unchanged, applySite reloads nothing and
+  // nginx would keep serving the old certificate from memory.
+  // Without the job's signal: a cancel landing here must not leave the new pair unloaded.
+  const h = { ...helpers, signal: undefined };
+  if (!certs) await withLock('config', async () => {
+    if (!(await nginxTest(h))) throw new Error('The certificate is installed, but the web server configuration did not pass its check, so it was not reloaded. The site keeps serving its previous certificate.');
+    await nginxReload(h);
+  });
   logger(helpers).ok('Web server reloaded with the new certificate');
 }
 
@@ -490,9 +519,12 @@ async function pickUser(domain) {
 }
 
 // Lowest Redis database no site uses (0 stays empty on purpose; see stack.js).
+// Sites are created in parallel and a new site's spec is only written at the
+// end, so a number stays reserved here until createSite is over.
+const reservedRedisDbs = new Set();
 async function freeRedisDb() {
   const used = new Set((await listSites()).map((x) => x.redisDb));
-  for (let i = 1; i < REDIS_DBS; i++) if (!used.has(i)) return i;
+  for (let i = 1; i < REDIS_DBS; i++) if (!used.has(i) && !reservedRedisDbs.has(i)) { reservedRedisDbs.add(i); return i; }
   return null; // full: the site runs without an object cache
 }
 
@@ -507,6 +539,11 @@ export async function createSite(helpers, o) {
   if (php) await ensurePhp(helpers, php);
 
   const user = await pickUser(d);
+  // The database gets the user's name, and a failed create drops that name
+  // again: one that was already there must never get that far.
+  if (o.type === 'wordpress' && (await listDatabases(helpers)).some((x) => x.name === user)) {
+    throw new Error(`A database named ${user} already exists on this server — remove or rename it first.`);
+  }
   const r = await run(helpers, 'useradd', ['--user-group', '--no-create-home', '--home-dir', siteDir(d), '--shell', '/usr/sbin/nologin', user], { timeout: 30_000 });
   if (r.code !== 0) throw new Error(`The site's system user could not be created.`);
 
@@ -537,8 +574,13 @@ export async function createSite(helpers, o) {
     }
     await applySite(helpers, s);
   } catch (e) {
-    await deleteSite(helpers, d, s).catch(() => {});
+    // Without the job's signal: after a cancel or a timeout run() starts
+    // nothing more, and the clean-up must still happen.
+    await deleteSite({ ...helpers, signal: undefined }, d, s)
+      .catch((e2) => logger(helpers).err(`The half-created site could not be fully removed (${e2.message}) — its files, system user or database may remain on the server.`));
     throw e;
+  } finally {
+    reservedRedisDbs.delete(s.redisDb); // the spec is on disk now, or the site is gone
   }
   return s;
 }
@@ -552,6 +594,10 @@ export async function deleteSite(helpers, domain, spec = null) {
   // 1) Stop serving: vhost + pools out, reload (under the 'config' lock).
   await withLock('config', async () => {
     await removePath(vhostPath(domain));
+    // The schedule too, before the site's processes are killed below: cron
+    // would start a new one in the half-removed site, and userdel refuses a
+    // user that still runs something.
+    await removePath(cronFilePath(domain));
     const pools = [];
     for (const v of await installedPhp()) {
       if (await pathExists(poolPath(domain, v))) { await removePath(poolPath(domain, v)); pools.push(v); }
@@ -576,7 +622,6 @@ export async function deleteSite(helpers, domain, spec = null) {
   await removePath(pageCacheDir(domain));
   await removePath(cfDnsTokenPath(domain));
   await removePath(cfCachePath(domain));
-  await removePath(cronFilePath(domain));
   for (const f of [phpLogPath(domain), cronLogPath(domain), `/var/log/nginx/${domain}.access.log`, `/var/log/nginx/${domain}.error.log`]) await removePath(f);
   if (ids && ids.uid >= 1000) {
     const del = await run(helpers, 'userdel', [user], { timeout: 30_000 });

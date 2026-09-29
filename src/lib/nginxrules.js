@@ -46,14 +46,24 @@ async function nginxCheck(helpers) {
 // complaint when the result doesn't pass `nginx -t`.
 const commit = (helpers, d, edits) => withLock('config', () => commitNow(helpers, d, edits));
 async function commitNow(helpers, d, edits) {
+  // Cancelled while waiting for the 'config' lock: write nothing. An Error like
+  // run() throws, because callers show e.message.
+  if (helpers.signal?.aborted) throw new Error(`cancelled (${helpers.signal.reason ?? 'aborted'})`);
   const before = {};
   for (const p of Object.keys(edits)) before[p] = await read(p);
   const put = async (p, c) => { if (c === null) await removePath(p); else await fs.writeFile(p, c, { mode: 0o644 }); };
+  const restore = async () => { for (const [p, c] of Object.entries(before)) await put(p, c); };
   await fs.mkdir(dir(d), { recursive: true });
-  for (const [p, c] of Object.entries(edits)) await put(p, c);
-  const err = await nginxCheck(helpers);
+  let err;
+  try {
+    for (const [p, c] of Object.entries(edits)) await put(p, c);
+    err = await nginxCheck(helpers);
+  } catch (e) {
+    await restore(); // cancel, timeout or a failed write: an untested rule must not stay on disk
+    throw e;
+  }
   if (err) {
-    for (const [p, c] of Object.entries(before)) await put(p, c);
+    await restore();
     throw new Error(`nginx rejected the rule, so nothing changed: ${err}`);
   }
   await nginxReload(helpers);

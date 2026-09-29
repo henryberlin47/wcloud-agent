@@ -20,10 +20,15 @@ const int = (min, max) => (v) => {
 };
 const bool = (v) => (typeof v === 'boolean' ? { v } : { error: 'on or off' });
 const oneOf = (list) => (v) => (list.includes(v) ? { v } : { error: list.join(', ') });
-let zones;
+// Any name the runtime can resolve, not only the ones it lists: Node lists the
+// old spellings (Asia/Saigon) while browsers offer the new ones
+// (Asia/Ho_Chi_Minh). PHP takes both. The charset keeps the pool line safe.
 const timezone = (v) => {
-  zones ||= new Set(['UTC', ...Intl.supportedValuesOf('timeZone')]);
-  return zones.has(v) ? { v } : { error: 'a time zone like UTC or Asia/Jakarta' };
+  try {
+    if (typeof v !== 'string' || !/^[A-Za-z][A-Za-z0-9_+/-]{0,63}$/.test(v)) throw 0;
+    new Intl.DateTimeFormat('en', { timeZone: v });
+    return { v };
+  } catch { return { error: 'a time zone like UTC or Asia/Jakarta' }; }
 };
 
 export const PHP_SETTINGS = {
@@ -108,12 +113,14 @@ export function poolLines(s) {
 }
 
 // nginx must let through what PHP accepts: body size and how long it waits.
+// 0 = no limit in PHP/FPM; nginx has no such value, so it waits the longest we allow.
+const secs = (v) => (v === 0 ? 3600 : v);
 export function nginxLimits(s) {
   const p = phpSettingsOf(s);
   const f = fpmOf(s);
   return {
     bodyMB: Math.max(toMB(p.post_max_size), toMB(p.upload_max_filesize)),
-    readTimeout: Math.max(600, p.max_execution_time, f.request_terminate_timeout),
+    readTimeout: Math.max(600, secs(p.max_execution_time), secs(f.request_terminate_timeout)),
   };
 }
 
@@ -127,10 +134,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   assert.deepEqual(cleanPhpSettings({ upload_max_filesize: '2G', post_max_size: '2G' }).value, { upload_max_filesize: '2G', post_max_size: '2G' });
   assert.ok(cleanPhpSettings({ 'date.timezone': 'Mars/Base' }).error);
   assert.equal(cleanPhpSettings({ 'date.timezone': 'Asia/Jakarta' }).value['date.timezone'], 'Asia/Jakarta');
+  assert.equal(cleanPhpSettings({ 'date.timezone': 'Asia/Ho_Chi_Minh' }).value['date.timezone'], 'Asia/Ho_Chi_Minh');
+  assert.ok(cleanPhpSettings({ 'date.timezone': 'UTC\nphp_admin_value[open_basedir]=/' }).error);
   assert.ok(cleanFpm({ pm: 'dynamic', start_servers: 10 }).error); // > max_spare 3
   assert.deepEqual(cleanFpm({ pm: 'dynamic', max_children: 40, start_servers: 4, min_spare_servers: 2, max_spare_servers: 8 }).value, { pm: 'dynamic', max_children: 40, start_servers: 4, min_spare_servers: 2, max_spare_servers: 8 });
   const lines = poolLines({ fpm: { pm: 'static', max_children: 8 }, phpSettings: { display_errors: true } });
   assert.ok(lines.includes('pm = static') && !lines.some((l) => l.startsWith('pm.process_idle')) && lines.includes('php_flag[display_errors] = on'));
   assert.deepEqual(nginxLimits({ phpSettings: { post_max_size: '2G', upload_max_filesize: '1G', max_execution_time: 900 } }), { bodyMB: 2048, readTimeout: 900 });
+  assert.equal(nginxLimits({ phpSettings: { max_execution_time: 0 }, fpm: { request_terminate_timeout: 0 } }).readTimeout, 3600);
+  assert.equal(nginxLimits({ fpm: { request_terminate_timeout: 0 } }).readTimeout, 3600);
   console.log('phpsettings ok');
 }
