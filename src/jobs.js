@@ -12,6 +12,9 @@ export const STATE = {
   CANCELLED: 'cancelled',
 };
 
+// ponytail: a runner ended this way may still finish its last step in the background; fine for the ops that hang (wp-cli, a worker).
+const ABORT_GRACE_MS = Number(process.env.AGENT_ABORT_GRACE_MS || 60_000);
+
 const TERMINAL = new Set([STATE.SUCCEEDED, STATE.FAILED, STATE.TIMEOUT, STATE.CANCELLED]);
 
 const jobs = new Map();
@@ -167,6 +170,14 @@ async function startJob(job) {
     job._abort.abort('timeout');
   }, job._timeout || config.jobTimeoutMs);
   timer.unref?.();
+  // Cancel and timeout only ask: a runner stuck on something that ignores the
+  // signal kept the job "running" forever — and every later job on its site
+  // queued behind it. After the grace it is ended regardless.
+  let grace;
+  const stuck = new Promise((resolve) => job._abort.signal.addEventListener('abort', () => {
+    grace = setTimeout(() => resolve('stuck'), ABORT_GRACE_MS);
+    grace.unref?.();
+  }, { once: true }));
 
   const helpers = {
     log: (line) => appendLog(job, line, 'stdout'),
@@ -175,7 +186,10 @@ async function startJob(job) {
   };
 
   try {
-    await job._runner(job, helpers);
+    if ((await Promise.race([job._runner(job, helpers), stuck])) === 'stuck') {
+      appendLog(job, `The operation did not stop within ${ABORT_GRACE_MS / 1000} s of being ${timedOut ? 'timed out' : 'cancelled'}, so it was ended. Check the site, then run it again.`, 'stderr');
+      throw new Error('did not stop');
+    }
     if (timedOut) {
       setState(job, STATE.TIMEOUT, 'operation exceeded time limit');
     } else {
@@ -193,6 +207,7 @@ async function startJob(job) {
     }
   } finally {
     clearTimeout(timer);
+    clearTimeout(grace);
     active.delete(job);
     drain();
   }

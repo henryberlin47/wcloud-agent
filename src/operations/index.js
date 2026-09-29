@@ -359,6 +359,7 @@ const cronOp = {
 // ============================================================
 const cfcacheOp = {
   name: 'cfcache',
+  timeout: 5 * 60_000, // seconds of work: a stuck one ends in minutes, not the default 20
   // params: { domain, enabled, cfToken?, cfZoneId?, hosts? }
   validate(p = {}) {
     p = sanitize(p);

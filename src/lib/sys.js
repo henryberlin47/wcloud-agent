@@ -86,10 +86,15 @@ export function run(helpers, command, args = [], opts = {}) {
     child.stdin.end();
 
     const settle = () => { if (timer) clearTimeout(timer); jobSignal?.removeEventListener('abort', onAbort); };
-    // A killed process whose pipes are still held open (a straggler outside the
-    // group) would delay 'close' indefinitely; once it has exited, stop waiting.
+    // A process that has exited while something it started still holds our
+    // pipes (a daemon a WordPress plugin launched, outside the group) would delay
+    // 'close' for as long as that runs — the job hung "Running". Once it has
+    // exited: stop waiting at once if it was killed, else after a short grace
+    // for the last output.
+    const drop = () => { child.stdout?.destroy(); child.stderr?.destroy(); };
     child.on('exit', () => {
-      if (killed || timedOut) { child.stdout?.destroy(); child.stderr?.destroy(); }
+      if (killed || timedOut) drop();
+      else setTimeout(drop, 2000).unref?.();
     });
     child.on('error', (e) => { settle(); reject(new Error(`spawn failed for ${cmd}: ${e.message}`)); });
     child.on('close', (code, signal) => {
