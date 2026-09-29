@@ -51,7 +51,8 @@ export async function runDelete(job, helpers, p, opts = {}) {
   done(`${domain} has been deleted`);
 }
 
-// Remove /tmp/<domain>_cron-*.lock without a shell glob.
+// Remove /tmp/<domain>_cron-*.lock without a shell glob. Plain unlink: any
+// site can make a name in /tmp, and root never deletes a tree there by path.
 async function removeGlobLocks(domain) {
   const prefix = `${domain}_cron-`;
   let files;
@@ -59,6 +60,6 @@ async function removeGlobLocks(domain) {
   await Promise.all(
     files
       .filter((f) => f.startsWith(prefix) && f.endsWith('.lock'))
-      .map((f) => removePath(`/tmp/${f}`))
+      .map((f) => fs.unlink(`/tmp/${f}`).catch(() => {}))
   );
 }

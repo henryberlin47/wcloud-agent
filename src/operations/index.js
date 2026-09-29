@@ -112,6 +112,9 @@ const deploy = {
     let wpUser = typeof p.wp_user === 'string' ? p.wp_user.trim() : '';
     let wpPassword = typeof p.wp_password === 'string' ? p.wp_password : '';
     if (wpUser.length > 60) errors.push('wp_user must be 60 characters or fewer');
+    // WordPress silently strips every other character (and doubled spaces) from
+    // a login: the account would not be the one the panel shows.
+    if (wpUser && !/^[A-Za-z0-9_.@-]+( [A-Za-z0-9_.@-]+)*$/.test(wpUser)) errors.push('wp_user may only contain letters, digits, single spaces and _ . - @');
     if (wpPassword.length > 200) errors.push('wp_password must be 200 characters or fewer');
     // Optional pair: a lone value without its partner is dropped rather than
     // erroring — a username without its password (or vice versa) means nothing.
@@ -179,7 +182,7 @@ const pluginOp = {
       if (typeof p.upload === 'string' && p.upload) {
         if (!UPLOAD_NAME.test(p.upload)) errors.push('upload must be a file from the upload endpoint');
         clean.upload = p.upload;
-      } else if (typeof p.slug === 'string' && /^[a-z0-9-]{1,100}$/.test(p.slug)) {
+      } else if (typeof p.slug === 'string' && /^(?!-)[a-z0-9-]{1,100}$/.test(p.slug)) {
         clean.slug = p.slug;
       } else errors.push('slug (a WordPress.org plugin slug) or upload is required');
       clean.activate = p.activate === true;
@@ -591,10 +594,10 @@ const importOp = {
       errors.push('sourceUrl must be an http(s) URL');
     }
 
-    // localArchive is copied from and then REMOVED — recursively, as root. It is
+    // localArchive is copied from and then REMOVED (unlink), as root. It is
     // only ever the agent's own export staging file handed back to us, so pin it
-    // to that shape; an unchecked value here is an arbitrary `rm -rf`.
-    const LOCAL_ARCHIVE_RE = /^\/tmp\/wcloud_export_[A-Za-z0-9]{6}\.tar\.gz(\.enc)?$/; // mkdtemp's 6-char suffix
+    // to that shape; an unchecked value here is an arbitrary file read + delete.
+    const LOCAL_ARCHIVE_RE = /^\/tmp\/wcloud_export_[A-Za-z0-9]{6,32}\.tar\.gz(\.enc)?$/; // 32 hex chars; 6 = an archive made before an agent update
     if (out.localArchive != null && out.localArchive !== '' && !LOCAL_ARCHIVE_RE.test(String(out.localArchive))) {
       errors.push('localArchive must be an export archive produced by this agent');
     }
@@ -667,7 +670,7 @@ const backup = {
 const restoreOp = {
   name: 'restore',
   timeout: BACKUP_TIMEOUT_MS,
-  // params: { domain, sourceDomain?, includeSsl?, encryptKey?, canonical?, enableWww?, space, key, endpoint, accessKeyId, secretAccessKey, cfToken?, cfZoneId? }
+  // params: { domain, sourceDomain?, includeSsl?, encryptKey?, canonical?, enableWww?, replace?, space, key, endpoint, accessKeyId, secretAccessKey, cfToken?, cfZoneId? }
   validate(p = {}) {
     const out = { ...p };
     if (typeof out.domain === 'string') out.domain = normDomain(out.domain);
@@ -697,6 +700,8 @@ const restoreOp = {
         encryptKey: typeof out.encryptKey === 'string' ? out.encryptKey : '',
         canonical,
         enableWww,
+        // false = the caller saw no site here: never delete one. Portals that don't send it: true.
+        replace: out.replace !== false,
         space: out.space, key: out.key, endpoint: out.endpoint,
         accessKeyId: out.accessKeyId, secretAccessKey: out.secretAccessKey,
         ...cf,

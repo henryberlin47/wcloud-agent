@@ -4,13 +4,20 @@ import { run, pathExists, removePath, userIds } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import {
   SITE_TYPES, CACHE_MODES, readSpec, createSite, deleteSite, applySite, applySslConf, syncWpAddress, webRoot, siteTmp,
+  REDIRECT_MAX, cleanRedirects, cleanDomainRedirect,
 } from '../lib/sites.js';
 import { wpCli, clearWpCaches, safePrefix, setWpConstant } from '../lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
 import { issueHttp, issueDnsCloudflare } from '../lib/acme.js';
 import { syncCachePlugin, retireLiteSpeedCache, syncLiteSpeedGuard, setObjectCache } from '../lib/cache.js';
-import { cleanJob, CRON_MAX, WP_CRON_EVERY } from '../lib/cron.js';
+import { cleanJob, fitsCron, CRON_MAX, WP_CRON_EVERY } from '../lib/cron.js';
 import { cleanPhpSettings, cleanFpm } from '../lib/phpsettings.js';
+import { saveRule, deleteRule } from '../lib/nginxrules.js';
+import { checkCustomCert } from '../lib/certcheck.js';
+
+// The custom nginx rule that keeps a WordPress site closed while its database
+// is being restored. Never one of the site's own rules (restore.js skips it).
+export const RESTORING_RULE = 'wcloud-restoring';
 
 // Unpredictable, atomically-created staging dir (mkdtemp: 0700 root, never
 // reuses an existing path). Only root touches it; the one file a site's wp-cli
@@ -26,6 +33,12 @@ export async function makeStagingDir(helpers, prefix) {
 // copied as links, not followed.)
 async function isRealDir(p) {
   try { return (await fs.lstat(p)).isDirectory(); } catch { return false; }
+}
+
+// The same for a file root is about to read: a link in the archive would make
+// it read whatever the link points at.
+async function isRealFile(p) {
+  try { return (await fs.lstat(p)).isFile(); } catch { return false; }
 }
 
 async function mustRun(helpers, cmd, args, what) {
@@ -77,7 +90,8 @@ export async function runImport(job, helpers, p) {
     if (p.sameServer && p.localArchive) {
       await mustRun(helpers, 'cp', ['--', p.localArchive, `${tmpDir}/export.tar.gz.enc`], 'Copying the archive');
       // Clean up the source archive after copying (same-server migration).
-      await removePath(p.localArchive);
+      // Plain unlink: the name is in world-writable /tmp, never a recursive delete.
+      await fs.unlink(p.localArchive).catch(() => {});
       ok('Archive copied');
     } else {
       const fetchR = await run(helpers, 'curl', [
@@ -88,10 +102,18 @@ export async function runImport(job, helpers, p) {
         // Another agent's self-signed certificate: trusted by its pinned public
         // key (curl still checks the pin with -k), never by "accept anything".
         ...(p.sourcePin ? ['-k', '--pinnedpubkey', `sha256//${p.sourcePin}`] : []),
-        '-sL', '--fail', '--create-dirs',
+        // No time limit on the download itself: a big archive takes as long as
+        // it takes, and the job's signal (cancel, the 12h op timeout) stops
+        // curl. Only a dead link gives up: no connection in 30s, or under
+        // 1 KB/s for 2 minutes.
+        '--connect-timeout', '30', '--speed-limit', '1024', '--speed-time', '120',
+        '-sSL', '--fail', '--create-dirs',
         '-o', `${tmpDir}/export.tar.gz.enc`,
         p.sourceUrl,
-      ], { timeout: 300_000 });
+        // quiet: the URL carries the one-time export token, and run() prints the
+        // command line into the job log on failure. curl's own reason (-S) is
+        // logged below.
+      ], { quiet: true });
       if (fetchR.code !== 0) {
         err(`Failed to fetch archive: ${fetchR.stderr.slice(-200)}`);
         throw new Error('Could not download the site archive from the source server.');
@@ -175,10 +197,14 @@ export async function runRestoreFromLocal(job, helpers, {
     step(type === 'wordpress' ? `Create the WordPress site (PHP ${php})` : 'Create the static site');
     const s = await createSite(helpers, {
       domain, type, php, cache, enableWww, canonical,
+      realIp: src.realIp !== false, // as the site had it; archives that don't say → on, like a new site
       wp: { install: false, tablePrefix }, // the archive brings WordPress itself
     });
     siteCreated = true;
     ok(`Site created — ${domain}`);
+    // Closed until the database is in: WordPress on an empty database serves
+    // its installer to anyone who asks.
+    if (type === 'wordpress') await saveRule(helpers, domain, { id: RESTORING_RULE, name: 'Restore in progress', content: 'return 503;', enabled: true });
 
     step('Restore the site files');
     const srcSite = `${tmpDir}/site`;
@@ -186,12 +212,17 @@ export async function runRestoreFromLocal(job, helpers, {
       const srcHtdocs = `${srcSite}/htdocs`;
       const dest = webRoot(domain);
       const from = (await isRealDir(srcHtdocs)) ? srcHtdocs : srcSite;
+      // createSite's placeholder must not outlive a restore (it would win over index.htm).
+      if (type === 'static') await removePath(`${dest}/index.html`);
       await mustRun(helpers, 'cp', ['-a', `${from}/.`, dest], 'Copying the site files');
       // The site keeps its own wp-config.php (non-standard sources leak one in).
       if (type === 'wordpress') await removePath(`${dest}/wp-config.php`);
       // The source's uids mean nothing here. (-R does not follow symlinks, so a
       // link in the tree can't redirect the chown.)
       await mustRun(helpers, 'chown', ['-R', `${s.user}:www-data`, dest], 'Setting file ownership');
+      // cp -a put the archive's mode on htdocs itself: back to what createSite
+      // set, so nginx reads through the group and other sites can't enter.
+      await fs.chmod(dest, 0o2750);
       ok('Site files restored');
     } else {
       warn('No site files found in archive');
@@ -200,18 +231,24 @@ export async function runRestoreFromLocal(job, helpers, {
     if (type === 'wordpress') {
       step('Restore the database');
       const sqlFile = `${tmpDir}/db.sql`;
-      if (await pathExists(sqlFile)) {
+      // lstat, not pathExists: chown/chmod follow links, so a symlinked db.sql
+      // would hand the link's TARGET (any root file) to the site's user.
+      const sqlStat = await fs.lstat(sqlFile).catch(() => null);
+      if (sqlStat && !sqlStat.isFile()) throw new Error('The archive\'s database dump is not a regular file — it was not imported.');
+      if (sqlStat) {
         // Hand the dump to the site through its own tmp dir: wp-cli runs as the
         // site's user and can't (and mustn't) read the root-only staging dir.
+        // Ownership is set while the file is still in staging: once it is in
+        // the site's tmp/ the site could swap what the name points at.
         const handed = `${siteTmp(domain)}/wcloud-import-${randomBytes(6).toString('hex')}.sql`;
-        await mustRun(helpers, 'mv', ['--', sqlFile, handed], 'Preparing the database dump');
         const { uid, gid } = await userIds(s.user);
-        await fs.chown(handed, uid, gid);
-        await fs.chmod(handed, 0o600);
+        await fs.chown(sqlFile, uid, gid);
+        await fs.chmod(sqlFile, 0o600);
+        await mustRun(helpers, 'mv', ['--', sqlFile, handed], 'Preparing the database dump');
 
         const wp = await wpCli(helpers, s);
         const importR = await wp(['db', 'import', handed]);
-        await removePath(handed);
+        await fs.unlink(handed).catch(() => {}); // in the site's tmp/: never a recursive delete as root
         if (importR.code !== 0) throw new Error('Database import failed');
         ok('Database imported');
 
@@ -232,9 +269,14 @@ export async function runRestoreFromLocal(job, helpers, {
 
         if (domainChanged) {
           step('Update site URLs');
-          // --precise does exact string match, avoiding partial hits in emails.
+          // The domain only where a host name starts: not inside another name
+          // (walmart.com for art.com) and not as the domain of an e-mail
+          // address (admin@source) — accounts and form recipients keep their
+          // mailbox. %2F may come before it, so URL-encoded links are rewritten
+          // too. --regex runs in PHP, so serialized data is handled as before.
           // --all-tables covers options, usermeta, postmeta, custom tables.
-          const replaceR = await wp(['search-replace', sourceDomain, domain, '--all-tables', '--precise', '--report-changed-only']);
+          const from = `(?:(?<![A-Za-z0-9@-])|(?<=%2[Ff]))${sourceDomain.replace(/\./g, '\\.')}(?![A-Za-z0-9-])`;
+          const replaceR = await wp(['search-replace', from, domain, '--regex', '--all-tables', '--report-changed-only']);
           if (replaceR.code !== 0) warn('URL search-replace had issues — may need manual review');
           else ok(`URLs updated: ${sourceDomain} → ${domain}`);
         }
@@ -244,6 +286,9 @@ export async function runRestoreFromLocal(job, helpers, {
       } else {
         warn('No database dump found in archive');
       }
+      // Open again — before the certificate step: the rule would also answer
+      // Let's Encrypt's check with a 503.
+      await deleteRule(helpers, domain, RESTORING_RULE);
     }
 
     let cfIssued = false;
@@ -251,11 +296,32 @@ export async function runRestoreFromLocal(job, helpers, {
       step('Issue the HTTPS certificate (Let\'s Encrypt via Cloudflare DNS)');
       const r = await issueDnsCloudflare(helpers, domain, { www: enableWww, token: cfToken, zoneId: cfZoneId });
       if (r.ok) { cfIssued = true; ok(`SSL issued for ${domain} — renews automatically`); }
-      else warn(`Cloudflare DNS validation failed${includeSsl ? ' — using the archived certificate instead' : ''}`);
+      else warn(`Cloudflare DNS validation failed${includeSsl ? ' — trying the archived certificate' : ''}`);
+    }
+    // An archived certificate is only installed when it works here: it names
+    // THIS domain (a restore to another domain would serve the source's
+    // certificate, which every browser refuses), its key is its own and it has
+    // not expired — nginx accepts all of those. Never when the archived site
+    // had HTTPS off: that keeps the certificate on disk, so it is in the backup
+    // (RunCloud and older archives don't say → as before). Refused or not in
+    // the archive: a new one is issued below, when that was asked for.
+    const archivedCert = `${tmpDir}/ssl/live/fullchain.pem`;
+    const archivedKey = `${tmpDir}/ssl/live/key.pem`;
+    const httpsWasOff = includeSsl && src.ssl === false;
+    let copySsl = includeSsl && !cfIssued && !httpsWasOff && (await isRealFile(archivedCert));
+    if (copySsl) {
+      try {
+        checkCustomCert(domain, await fs.readFile(archivedCert, 'utf8'),
+          (await isRealFile(archivedKey)) ? await fs.readFile(archivedKey, 'utf8') : '', { www: enableWww });
+      } catch (e) {
+        copySsl = false;
+        // The reason only: the rest is advice for someone pasting a certificate.
+        warn(`The archived certificate was not installed: ${e.message.split('. ')[0]}`);
+      }
     }
     if (cfIssued) {
       // done
-    } else if (includeSsl) {
+    } else if (copySsl) {
       step('Restore SSL certificates');
       const destLive = `/etc/letsencrypt/live/${domain}`;
       const destArchive = `/etc/letsencrypt/archive/${domain}`;
@@ -277,13 +343,16 @@ export async function runRestoreFromLocal(job, helpers, {
       } catch {
         warn('The archived certificate could not be enabled — the site is restored on HTTP. Issue HTTPS from the site page.');
       }
+    } else if (httpsWasOff) {
+      skip('SSL — HTTPS was off on the archived site; it stays off');
     } else if (issueSsl) {
       step('Issue SSL certificate');
       const r = await issueHttp(helpers, domain, { www: enableWww });
       if (r.ok) ok(`SSL issued for ${domain}`);
       else warn('SSL failed (DNS/propagation?) — issue it from the site page later');
     } else {
-      skip('SSL — "No SSL" selected');
+      // includeSsl here = the archived certificate was refused above, not a choice.
+      skip(includeSsl ? 'SSL — the site is restored on HTTP; issue HTTPS from the site page' : 'SSL — "No SSL" selected');
     }
 
     // After the DB import, so the imported home/siteurl don't win.
@@ -297,8 +366,10 @@ export async function runRestoreFromLocal(job, helpers, {
       const cur = await readSpec(domain);
       const crons = [];
       for (const j of (Array.isArray(src.crons) ? src.crons : []).slice(0, CRON_MAX)) {
-        const { job: c } = cleanJob(j, crons.map((x) => x.id));
-        if (c) crons.push(c);
+        const { job: c, error } = cleanJob(j, crons.map((x) => x.id));
+        if (error) warn(`The cron job "${String(j?.name || '').slice(0, 60)}" was left out: ${error}`);
+        else if (c && !fitsCron(cur, c)) warn(`The cron job "${c.name}" was left out: its command is too long for cron — put it in a script file and schedule the script`);
+        else if (c) crons.push(c);
       }
       const wpCron = src.wpCron === 'server' ? 'server' : 'wordpress';
       if (crons.length || wpCron === 'server') {
@@ -327,12 +398,31 @@ export async function runRestoreFromLocal(job, helpers, {
       }
     }
 
+    // Redirects travel with the site (both site types), checked entry by entry
+    // like new ones. Last, so a whole-domain redirect can't get in the way of
+    // the steps above — and that one belongs to the domain: a copy under
+    // another domain doesn't take it.
+    const redirects = (Array.isArray(src.redirects) ? src.redirects : []).slice(0, REDIRECT_MAX)
+      .flatMap((r) => { const c = cleanRedirects([r]); return Array.isArray(c) ? c : []; });
+    const domainRedirect = (!domainChanged && src.domainRedirect && cleanDomainRedirect(src.domainRedirect, domain).value) || null;
+    if (redirects.length || domainRedirect) {
+      step('Restore the redirects');
+      // A refusal must not cost the restored site: warn, keep going.
+      try {
+        await applySite(helpers, { ...(await readSpec(domain)), redirects, ...(domainRedirect ? { domainRedirect } : {}) });
+        ok(`${redirects.length} redirect${redirects.length === 1 ? '' : 's'}${domainRedirect ? ` + the whole domain → ${domainRedirect.to}` : ''}`);
+      } catch (e) {
+        warn(`The redirects could not be restored (${e.message}) — add them again on the Redirects & rules tab`);
+      }
+    }
+
     log(`Restore completed: ${domain}`);
   } catch (e) {
     if (siteCreated) {
       warn('Restore failed — removing the half-created site');
       try {
-        await deleteSite(helpers, domain);
+        // Without the job's signal: after a cancel or a timeout nothing would run.
+        await deleteSite({ ...helpers, signal: undefined }, domain);
         ok('Half-created site removed');
       } catch {
         err(`Failed to clean up ${domain} — delete it from the site page.`);
