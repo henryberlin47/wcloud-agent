@@ -23,12 +23,16 @@ export const forgetCfCache = (domain) => removePath(cfCachePath(domain));
 
 const lastPurge = new Map(); // domain → ms: WordPress can fire bursts of changes
 
-/** Purge the site's hostnames from Cloudflare. → { ok, error? }. Never throws. */
+/**
+ * Purge the site's hostnames from Cloudflare. → { ok, error?, skipped? }. Never throws.
+ * skipped: too soon after the last purge — nothing was sent, the caller asks
+ * again later (lib/cache.js watcher). Only a purge that worked counts as the
+ * last one: a failed one must not hold back the next.
+ */
 export async function purgeCloudflare(domain, { force = false } = {}) {
   let c;
   try { c = JSON.parse(await fs.readFile(cfCachePath(domain), 'utf8')); } catch { return { ok: false, error: 'Cloudflare cache is not set up for this site.' }; }
   if (!force && Date.now() - (lastPurge.get(domain) || 0) < 10_000) return { ok: true, skipped: true };
-  lastPurge.set(domain, Date.now());
   try {
     const r = await fetch(`${config.cloudflareApi}/zones/${c.zoneId}/purge_cache`, {
       method: 'POST',
@@ -37,7 +41,10 @@ export async function purgeCloudflare(domain, { force = false } = {}) {
       signal: AbortSignal.timeout(20_000),
     });
     const j = await r.json().catch(() => ({}));
-    if (r.ok && j.success !== false) return { ok: true };
+    if (r.ok && j.success !== false) {
+      lastPurge.set(domain, Date.now());
+      return { ok: true };
+    }
     const msg = j.errors?.[0]?.message || `HTTP ${r.status}`;
     return { ok: false, error: r.status === 401 || r.status === 403 ? `Cloudflare refused the purge (${msg}) — the token needs Zone → Cache Purge: Purge.` : `Cloudflare: ${msg}` };
   } catch (e) {

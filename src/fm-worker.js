@@ -85,6 +85,8 @@ const ops = {
     const old = await fsp.stat(p).catch(() => null);
     if (old && !old.isFile()) throw fail('EISDIR', 'A folder with that name already exists.');
     const tmp = path.join(path.dirname(p), `.${path.basename(p)}.wcloud-${randomBytes(4).toString('hex')}`);
+    // The agent sends TERM when the upload is aborted: leave no partial file behind.
+    process.once('SIGTERM', () => { try { fs.rmSync(tmp, { force: true }); } catch {} process.exit(1); });
     let n = 0;
     const max = Number(a.max) || Infinity;
     try {

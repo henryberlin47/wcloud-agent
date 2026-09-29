@@ -17,6 +17,8 @@ export const LOG_TYPES = {
   cron: (d) => cronLogPath(d),
 };
 const WINDOW = 4 * 1024 * 1024;
+// The line lib/cron.js writes before each run's output.
+const CRON_HEADER = /^=== \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC — /;
 
 export async function readSiteLog(domain, type, { lines = 200, q = '' } = {}) {
   const path = LOG_TYPES[type](domain);
@@ -36,7 +38,18 @@ export async function readSiteLog(domain, type, { lines = 200, q = '' } = {}) {
     if (start > 0) all = all.slice(1); // first line is cut
     all = all.filter(Boolean);
     const needle = q.toLowerCase();
-    const hits = needle ? all.filter((l) => l.toLowerCase().includes(needle)) : all;
+    const has = (l) => l.toLowerCase().includes(needle);
+    let hits = all;
+    if (needle && type === 'cron') {
+      // A run is its header plus the output under it: keep whole runs, so a
+      // match on the job shows its output and a match in the output keeps its header.
+      const runs = [];
+      for (const l of all) {
+        if (CRON_HEADER.test(l) || !runs.length) runs.push([l]);
+        else runs[runs.length - 1].push(l);
+      }
+      hits = runs.filter((r) => r.some(has)).flat();
+    } else if (needle) hits = all.filter(has);
     return { lines: hits.slice(-lines), size: st.size, truncated: start > 0, matched: hits.length };
   } finally {
     await fh.close();

@@ -55,10 +55,18 @@ echo json_encode( array( 'user' => $u[0]->user_login, 'login' => site_url( 'wp-l
   try { out = JSON.parse((r.stdout || '').trim().split('\n').pop()); } catch { /* wp-cli failed */ }
   if (out.error === 'no-admin') throw new Error('This site has no administrator account to sign in as.');
   if (r.code !== 0 || !out.login) throw new Error('WordPress on this site didn\'t respond — is it installed and working?');
+  // The link carries a login token and is opened from the portal: it only
+  // ever goes to this site's own host, never to one the site's code names.
+  let u;
+  try { u = new URL(out.login); } catch { /* not a URL */ }
+  if (!u || !['http:', 'https:'].includes(u.protocol) || ![s.domain, `www.${s.domain}`].includes(u.host)) {
+    throw new Error('WordPress on this site reports a login address that isn\'t on this domain — check its address under Settings → General.');
+  }
+  u.searchParams.set('wcloud_login', token);
 
   // (Re)install the redeeming plugin as the SITE's user. Rewritten every
   // time, so it self-heals.
   await installMuPlugin(helpers, s, 'wcloud-login.php', MU_PLUGIN, out.mu);
 
-  return { url: `${out.login}?wcloud_login=${token}`, user: out.user, expires_in: LINK_TTL_S };
+  return { url: u.href, user: out.user, expires_in: LINK_TTL_S };
 }

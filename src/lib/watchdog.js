@@ -1,6 +1,6 @@
 import net from 'node:net';
 import fs from 'node:fs/promises';
-import { run, withLock, lockBusy } from './sys.js';
+import { run, withLock, lockBusy, pathExists } from './sys.js';
 import { installedPhp, fpmService, redisPing } from './stack.js';
 import { listSites } from './sites.js';
 
@@ -14,8 +14,10 @@ import { listSites } from './sites.js';
 // service, then re-check. Safeguards:
 //  - nginx is never restarted with a config that fails `nginx -t` (it would
 //    stay down) — that's reported instead;
-//  - nginx / PHP-FPM heal under the 'config' lock, and a round is skipped while
-//    a config change or package install is in progress;
+//  - nothing is healed while a config change or package install is in
+//    progress; nginx / PHP-FPM heal under the 'config' lock and are checked
+//    again once it is theirs (the change before them may have left all well);
+//  - a service that is starting, reloading or stopping is left to finish;
 //  - a service restarted GIVE_UP times within WINDOW_MS is left alone
 //    ("needs a look") rather than restarted in a loop.
 // Heals are logged to the agent's journal (portal: server → Agent log).
@@ -31,7 +33,10 @@ const H = { log: () => {}, err: () => {} };
 const state = { checkedAt: null, checks: [], heals: [] };
 const restarts = new Map(); // key → [timestamps]
 
-const unitActive = async (unit) => (await run(H, 'systemctl', ['is-active', unit], { quiet: true, timeout: 10_000 })).stdout.trim() === 'active';
+const unitState = async (unit) => (await run(H, 'systemctl', ['is-active', unit], { quiet: true, timeout: 10_000 })).stdout.trim();
+const unitActive = async (unit) => ['active', 'reloading'].includes(await unitState(unit)); // reloading = still serving
+// systemd states on the way to another one → the word shown for them.
+const MOVING = { activating: 'starting', reloading: 'reloading', deactivating: 'stopping' };
 const connects = (opts, ms = 3000) => new Promise((resolve) => {
   const s = net.connect(opts);
   const done = (ok) => { s.destroy(); resolve(ok); };
@@ -52,13 +57,16 @@ async function checksFor() {
     // versions has a spec but (for a moment) no pool — not a failure.
     const socks = [];
     for (const s of sites.filter((x) => x.type === 'wordpress' && x.php === v)) {
-      if (await fs.access(`/etc/php/${v}/fpm/pool.d/${s.domain}.conf`).then(() => true, () => false)) socks.push({ domain: s.domain, path: `/run/php/wcloud-${s.domain}.sock` });
+      const pool = `/etc/php/${v}/fpm/pool.d/${s.domain}.conf`;
+      if (await pathExists(pool)) socks.push({ domain: s.domain, path: `/run/php/wcloud-${s.domain}.sock`, pool });
     }
     list.push({ key: `php${v}`, label: `PHP ${v} (FPM)`, unit: fpmService(v), lock: 'config',
       probe: async () => {
         if (!(await unitActive(fpmService(v)))) return 'not running';
         const dead = [];
-        for (const k of socks) if (!(await connects({ path: k.path }, 2000))) dead.push(k.domain);
+        // The pool is looked at again: it may have been removed (site deleted
+        // or moved to another version) since the list was made.
+        for (const k of socks) if (!(await connects({ path: k.path }, 2000)) && (await pathExists(k.pool))) dead.push(k.domain);
         return dead.length ? `not answering for ${dead.slice(0, 3).join(', ')}${dead.length > 3 ? ` and ${dead.length - 3} more` : ''}` : null;
       } });
   }
@@ -84,6 +92,10 @@ async function checksFor() {
 }
 
 async function heal(c, problem) {
+  // Starting, reloading or stopping: a restart now would cut that short
+  // (MariaDB in crash recovery would begin again). systemd ends it by itself.
+  const moving = MOVING[await unitState(c.unit)];
+  if (moving) return { status: 'warn', detail: `${problem} — ${moving}, checking again next round` };
   const now = Date.now();
   const recent = (restarts.get(c.key) || []).filter((t) => now - t < WINDOW_MS);
   if (recent.length >= GIVE_UP) return { status: 'error', detail: `${problem} — restarted ${recent.length}× in 30 min without lasting; needs a look` };
@@ -94,10 +106,17 @@ async function heal(c, problem) {
       return { status: 'error', detail: `${problem}, and its config doesn't pass nginx -t (${why.slice(0, 160)}) — not restarted` };
     }
   }
-  recent.push(now);
-  restarts.set(c.key, recent);
-  const restart = () => run(H, 'systemctl', ['restart', c.unit], { quiet: true, timeout: 90_000 });
+  // Checked again once the lock is ours: the change that held it (a PHP version
+  // switch, a site being deleted) may have left everything healthy. Only a
+  // restart that happens counts toward GIVE_UP.
+  const restart = async () => {
+    if (!(await c.probe())) return null;
+    recent.push(Date.now());
+    restarts.set(c.key, recent);
+    return run(H, 'systemctl', ['restart', c.unit], { quiet: true, timeout: 90_000 });
+  };
   const r = c.lock ? await withLock(c.lock, restart) : await restart();
+  if (!r) return { status: 'ok', detail: null };
   await new Promise((res) => setTimeout(res, 2000));
   const after = r.code === 0 ? await c.probe() : 'restart failed';
   const ok = !after;
@@ -112,7 +131,8 @@ let running = null;
 export function checkNow() {
   running ||= (async () => {
     // Mid config change / package install: services may be down on purpose.
-    const busy = lockBusy('config') || lockBusy('apt');
+    // Asked when a check fails, not once per round: a change can begin mid-round.
+    const busy = () => lockBusy('config') || lockBusy('apt');
     const out = [];
     for (const c of await checksFor()) {
       let problem = null;
@@ -121,7 +141,7 @@ export function checkNow() {
         const w = c.warn ? await c.warn().catch(() => null) : null;
         out.push({ key: c.key, label: c.label, status: w ? 'warn' : 'ok', detail: w });
       } else if (c.noHeal) out.push({ key: c.key, label: c.label, status: 'error', detail: problem });
-      else if (busy) out.push({ key: c.key, label: c.label, status: 'warn', detail: `${problem} — a change is in progress, checking again next round` });
+      else if (busy()) out.push({ key: c.key, label: c.label, status: 'warn', detail: `${problem} — a change is in progress, checking again next round` });
       else out.push({ key: c.key, label: c.label, ...(await heal(c, problem)) });
     }
     state.checks = out;

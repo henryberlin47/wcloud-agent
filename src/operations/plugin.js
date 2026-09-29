@@ -1,4 +1,4 @@
-import { removePath } from '../lib/sys.js';
+import fs from 'node:fs/promises';
 import { logger } from '../lib/log.js';
 import { requireSpec, siteTmp } from '../lib/sites.js';
 import { wpCli } from '../lib/wp.js';
@@ -48,7 +48,10 @@ export async function runPlugin(job, helpers, p) {
     try {
       await must(['plugin', 'install', src, ...(p.activate ? ['--activate'] : []), ...(p.replace ? ['--force'] : [])], 'Installing the plugin');
     } finally {
-      if (p.upload) await removePath(src);
+      // The site owns its tmp/: a plain unlink, never a recursive delete as
+      // root (it could be led into another directory). A failure here must
+      // not hide the install's own error.
+      if (p.upload) await fs.unlink(src).catch(() => {});
     }
     ok(p.activate ? 'Plugin installed and activated' : 'Plugin installed');
     if (s.cache === 'fastcgi') await clearPageCache(s.domain); // pages may render differently now

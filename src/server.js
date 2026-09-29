@@ -16,7 +16,7 @@ import { requireAuth } from './auth.js';
 import { operations, getOperation, normDomain, isDomain } from './operations/index.js';
 import { serveExport } from './operations/export.js';
 import { enqueue, getJob, listJobs, publicView, subscribe, cancelJob } from './jobs.js';
-import { run } from './lib/sys.js';
+import { run, withLock, nginxTest, nginxReload } from './lib/sys.js';
 import { listTopLevel, putObject, deleteObject, statObject, explainSpacesError } from './lib/spaces.js';
 import { readSiteSsl } from './lib/certinfo.js';
 import { readChallenge, startDnsRenewer } from './lib/acme.js';
@@ -25,7 +25,7 @@ import { readAgentLog } from './lib/agentlog.js';
 import { startWatchdog, checkNow, snapshot, summary } from './lib/watchdog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning, listDatabases } from './lib/stack.js';
-import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard } from './lib/cache.js';
+import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard, syncCachePlugin, wantsHelper } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
 import { createPmaLink } from './lib/pma.js';
@@ -417,7 +417,7 @@ app.get('/api/sites/:domain/plugins', siteParam, wpOnly, async (req, res) => {
 });
 
 app.get('/api/sites/:domain/plugins/search', siteParam, wpOnly, async (req, res) => {
-  const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 100) : '';
+  const q = typeof req.query.q === 'string' ? req.query.q.replace(/^[\s-]+/, '').trim().slice(0, 100) : '';
   if (!q) return res.status(400).json({ error: 'EINVAL', message: 'Type something to search for.' });
   try { res.json({ plugins: await searchPlugins(NOOP_HELPERS, req.site, q) }); }
   catch (e) { res.status(502).json({ error: 'search_failed', message: e.message }); }
@@ -475,6 +475,17 @@ app.get('/api/sites/:domain/nginx-rules', siteParam, async (req, res) => {
   res.json({ rules: await listRules(req.site.domain) });
 });
 
+// The client went away mid-upload: pipe() alone leaves the worker waiting on
+// stdin until the timeout. TERM lets it remove its temp file. Never end stdin
+// instead — the worker reads that as a complete file and saves the cut-off upload.
+// child.pid: a worker that failed to start has none, and a signal to "no pid"
+// goes to pid 0 — the agent's own process group.
+function stopOnAbort(req, child) {
+  const abort = () => { if (!req.complete && child.pid) child.kill('SIGTERM'); };
+  req.on('close', abort);
+  if (req.destroyed) abort(); // already gone while the worker was starting
+}
+
 // A plugin .zip → the site's PRIVATE tmp/ (never web-reachable), written as the
 // site's user. Returns { upload } for the `plugin` op's install action.
 app.put('/api/sites/:domain/plugins/upload', siteParam, wpOnly, async (req, res) => {
@@ -483,6 +494,7 @@ app.put('/api/sites/:domain/plugins/upload', siteParam, wpOnly, async (req, res)
   const child = await spawnWorker(req.site, 'write', { path: upload, max: 100 * 1024 * 1024 }, { root: siteTmp(req.site.domain) });
   child.stdin.on('error', () => {});
   req.pipe(child.stdin);
+  stopOnAbort(req, child);
   const r = await settle(child, { timeout: 30 * 60_000 });
   if (!r.ok) return fmFail(res, r);
   res.json({ upload, size: r.data?.size });
@@ -510,7 +522,7 @@ app.get('/api/sites/:domain/files/content', siteParam, async (req, res) => {
   const child = await spawnWorker(req.site, 'read', { path });
   res.set({ 'Content-Type': 'application/octet-stream', 'Content-Length': String(st.data.size), 'Cache-Control': 'no-store' });
   child.stdout.pipe(res);
-  res.on('close', () => { if (!res.writableFinished) child.kill('SIGKILL'); });
+  res.on('close', () => { if (!res.writableFinished && child.pid) child.kill('SIGKILL'); });
 });
 
 // Save / upload: the raw request body becomes the file (atomic replace).
@@ -519,6 +531,7 @@ app.put('/api/sites/:domain/files/content', siteParam, async (req, res) => {
   const child = await spawnWorker(req.site, 'write', { path: relPath(req.query.path), max: UPLOAD_MAX });
   child.stdin.on('error', () => {}); // the worker quit early (e.g. too big) — its error says why
   req.pipe(child.stdin);
+  stopOnAbort(req, child);
   const r = await settle(child, { timeout: 60 * 60_000 });
   if (!r.ok) return fmFail(res, r);
   res.json(r.data);
@@ -528,7 +541,9 @@ const FILE_OPS = ['mkdir', 'rename', 'move', 'copy', 'delete'];
 app.post('/api/sites/:domain/files/op', siteParam, async (req, res) => {
   const b = req.body || {};
   if (!FILE_OPS.includes(b.op)) return res.status(400).json({ error: 'EINVAL', message: 'Unknown file operation.' });
-  const paths = Array.isArray(b.paths) ? b.paths.filter((x) => typeof x === 'string').slice(0, 1000) : undefined;
+  const paths = Array.isArray(b.paths) ? b.paths.filter((x) => typeof x === 'string') : undefined;
+  // Refused, never cut short: the caller would report the whole selection as done.
+  if (paths && paths.length > 1000) return res.status(400).json({ error: 'EINVAL', message: 'Select up to 1000 items at a time.' });
   const args = { path: relPath(b.path), from: relPath(b.from), to: relPath(b.to), ...(paths ? { paths } : {}) };
   const r = await settle(await spawnWorker(req.site, b.op, args), { timeout: 30 * 60_000 });
   if (!r.ok) return fmFail(res, r);
@@ -699,7 +714,14 @@ async function reconcile(job, helpers) {
     try { await applySite(helpers, s); }
     catch (e) { helpers.err(`Could not re-apply ${s.domain}: ${e.message}`); }
     await syncLiteSpeedGuard(helpers, s).catch((e) => helpers.err(`LiteSpeed Cache guard on ${s.domain}: ${e.message}`));
+    // A lost or outdated cache helper is put back (without it nothing clears
+    // the page cache on content changes). Only where one is wanted: removing
+    // it starts a worker, too much for every other site at each start.
+    if (wantsHelper(s)) await syncCachePlugin(helpers, s).catch((e) => helpers.err(`Cache helper on ${s.domain}: ${e.message}`));
   }
+  // Certificates renewed by an older agent may be on disk but never loaded.
+  await withLock('config', async () => { if (await nginxTest(helpers)) await nginxReload(helpers); })
+    .catch((e) => helpers.err(`Web server reload: ${e.message}`));
 }
 
 const onListen = () => {
@@ -719,6 +741,9 @@ const onListen = () => {
 const server = config.tls
   ? https.createServer({ key: config.tls.key, cert: config.tls.cert, minVersion: 'TLSv1.2' }, app).listen(config.port, config.host, onListen)
   : app.listen(config.port, config.host, onListen);
+// Node cuts any request whose body takes over 5 minutes, even while it is being
+// read. Uploads are given up to 60 (the file manager's settle timeout).
+server.requestTimeout = 61 * 60_000;
 
 // Graceful shutdown
 for (const sig of ['SIGINT', 'SIGTERM']) {

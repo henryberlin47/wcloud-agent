@@ -31,10 +31,12 @@ export async function runPurge(job, helpers, p, opts = {}) {
   const r = await clearWpCaches(helpers, s);
   // Both failing means wp-cli itself is broken — worth failing the job over.
   // Rocket alone failing is normal (plugin inactive) and already disk-cleaned.
-  if (!r.rocketOk && !r.objectFlushed) {
+  if (!r.wpOk) {
     throw new Error(`Could not clear the caches for ${domain}. WordPress may not be responding on this site.`);
   }
-  r.rocketOk ? ok('Page cache cleared') : warn('WP Rocket is not active — cleared the cached files on disk instead');
+  // Without WP Rocket there is nothing to report unless nginx serves its files.
+  if (r.rocketOk) ok('Page cache cleared');
+  else if (s.cache === 'wprocket') warn('WP Rocket is not active — cleared the cached files on disk instead');
   r.objectFlushed ? ok('Object cache flushed') : warn('Object cache could not be flushed — it may not be enabled on this site');
   if (s.cfCache) await cloudflare();
 }

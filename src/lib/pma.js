@@ -1,6 +1,6 @@
 import { randomBytes, createHash } from 'node:crypto';
 import { run, pathExists, userIds } from './sys.js';
-import { applySite, siteTmp, fullchainPath, PMA_DIR, PMA_PATH } from './sites.js';
+import { siteTmp, fullchainPath, PMA_DIR, PMA_PATH } from './sites.js';
 import { readDbCredentials } from './wp.js';
 
 // ============================================================
@@ -35,9 +35,9 @@ export async function createPmaLink(helpers, s) {
   const creds = await readDbCredentials(helpers, s);
   if (!creds?.db_user) throw new Error('This site\'s database login couldn\'t be read from wp-config.php.');
 
-  // Vhosts rendered before phpMyAdmin existed don't serve /.wcloud-pma/ yet;
-  // re-applying is a no-op when they already do.
-  await applySite(helpers, s);
+  // The site is never re-applied here: this runs outside the job queue, and
+  // writing the spec it was given could undo a job that finished meanwhile.
+  // Every vhost serves /.wcloud-pma/ already (re-rendered when the agent starts).
 
   const token = randomBytes(32).toString('hex');
   const { uid, gid } = await userIds(s.user);

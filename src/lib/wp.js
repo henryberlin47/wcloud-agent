@@ -112,8 +112,9 @@ export async function setupWordPress(helpers, s, { adminUser, adminPassword, ins
 }
 
 // Set a WP user's password without it ever reaching argv (see setupWordPress).
+// No "password changed" e-mail from WordPress: the owner did this in the panel.
 export async function wpSetPassword(helpers, s, user, password) {
-  return (await wpCli(helpers, s))(['user', 'update', user, '--prompt=user_pass'], { stdin: `${password}\n` });
+  return (await wpCli(helpers, s))(['user', 'update', user, '--skip-email', '--prompt=user_pass'], { stdin: `${password}\n` });
 }
 
 // WordPress stores its address absolutely (home/siteurl). When that disagrees
@@ -155,7 +156,9 @@ export async function clearWpCaches(helpers, s) {
     'eval',
     'if (function_exists("rocket_clean_domain")) { rocket_clean_domain(); echo "WP Rocket cache cleared"; } else { echo "WP Rocket not active"; }',
   ]);
-  if (rocket.code !== 0) {
+  // wp-cli exits 0 when WP Rocket is inactive too: go by what the snippet printed.
+  const rocketOk = rocket.code === 0 && /cache cleared/.test(rocket.stdout);
+  if (!rocketOk) {
     // Remove the cached pages as the site's user (never as root inside a
     // directory the site controls).
     for (const dir of [`${htdocs(s)}/wp-content/cache/wp-rocket`, `${htdocs(s)}/app/cache/wp-rocket`]) {
@@ -163,7 +166,8 @@ export async function clearWpCaches(helpers, s) {
     }
   }
   const flush = await wp(['cache', 'flush'], { quiet: true });
-  return { rocketOk: rocket.code === 0, objectFlushed: flush.code === 0 };
+  // wpOk: wp-cli itself ran — false means WordPress isn't responding at all.
+  return { rocketOk, objectFlushed: flush.code === 0, wpOk: rocket.code === 0 || flush.code === 0 };
 }
 
 // WordPress core version, or null when this isn't a readable WordPress install.

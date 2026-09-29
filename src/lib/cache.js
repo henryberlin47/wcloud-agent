@@ -25,7 +25,7 @@ import { purgeCloudflare } from './cfcache.js';
 const MARKERS = { 'wcloud-purge': ['page', 'cf'], 'wcloud-purge-page': ['page'], 'wcloud-purge-cf': ['cf'] };
 export { clearPageCache }; // lives in sites.js (applySite clears on config changes)
 
-const wantsHelper = (s) => s.type === 'wordpress' && (s.cache === 'fastcgi' || !!s.cfCache);
+export const wantsHelper = (s) => s.type === 'wordpress' && (s.cache === 'fastcgi' || !!s.cfCache);
 
 // Poll each such site's tmp/ for the markers. lstat + unlink never follow a
 // symlink, so a site can't point this at anything else.
@@ -37,6 +37,10 @@ const wantsHelper = (s) => s.type === 'wordpress' && (s.cache === 'fastcgi' || !
 export function startPurgeWatcher() {
   let domains = [];
   let listedAt = 0;
+  // Sites whose Cloudflare purge was held back (too soon after the last one).
+  // Their marker is gone already, so it is asked again on every tick until it
+  // goes out: a burst of changes ends with one purge, never with none.
+  const owed = new Set();
   const tick = async () => {
     try {
       if (Date.now() - listedAt > 30_000) {
@@ -51,12 +55,14 @@ export function startPurgeWatcher() {
           await fs.unlink(f).catch(() => {});
           kinds.forEach((k) => what.add(k));
         }
+        if (owed.delete(d)) what.add('cf');
         if (!what.size) continue;
         const s = await readSpec(d);
         if (!s) continue;
         if (what.has('page') && s.cache === 'fastcgi') await clearPageCache(s.domain);
         if (what.has('cf') && s.cfCache) {
           const r = await purgeCloudflare(s.domain);
+          if (r.skipped) owed.add(d);
           if (!r.ok) console.error(`[agent] Cloudflare purge for ${s.domain}: ${r.error}`);
         }
       }
@@ -156,26 +162,39 @@ export async function installMuPlugin(helpers, s, file, content, muDir = null) {
 
 /** Install, rewrite or remove the helper plugin to match the site's spec. */
 export async function syncCachePlugin(helpers, s) {
-  if (wantsHelper(s)) return installMuPlugin(helpers, s, 'wcloud-cache.php', muHelper({ page: s.cache === 'fastcgi', cf: !!s.cfCache }));
+  if (wantsHelper(s)) {
+    // Already current (the usual case at startup) → no wp-cli round trip.
+    const want = muHelper({ page: s.cache === 'fastcgi', cf: !!s.cfCache });
+    const file = `${webRoot(s.domain)}/wp-content/mu-plugins/wcloud-cache.php`;
+    if ((await readHead(file, Buffer.byteLength(want) + 1)) === want) return;
+    return installMuPlugin(helpers, s, 'wcloud-cache.php', want);
+  }
   const w = await spawnWorker(s, 'delete', { paths: ['wp-content/mu-plugins/wcloud-cache.php'] });
   await settle(w); // gone already is fine
 }
 
-// Is the Redis object cache active? Its drop-in is wp-content/object-cache.php.
-// Read as root, so: no symlinks (O_NOFOLLOW), regular file only, first 4 KB.
-export async function objectCacheActive(s) {
-  if (s.type !== 'wordpress') return false;
+// First `n` bytes of a site-owned file, read as root: no symlinks (O_NOFOLLOW),
+// never waits on a FIFO (O_NONBLOCK — a blocked open holds one of the agent's
+// few fs threads for good), regular files only. null = not readable.
+async function readHead(file, n) {
   let fh;
   try {
-    fh = await fs.open(`${webRoot(s.domain)}/wp-content/object-cache.php`, FS.O_RDONLY | FS.O_NOFOLLOW);
-    if (!(await fh.stat()).isFile()) return false;
-    const { buffer, bytesRead } = await fh.read(Buffer.alloc(4096), 0, 4096, 0);
-    return /Redis Object Cache/i.test(buffer.subarray(0, bytesRead).toString('utf8'));
+    fh = await fs.open(file, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK);
+    if (!(await fh.stat()).isFile()) return null;
+    const { buffer, bytesRead } = await fh.read(Buffer.alloc(n), 0, n, 0);
+    return buffer.subarray(0, bytesRead).toString('utf8');
   } catch {
-    return false;
+    return null;
   } finally {
     await fh?.close();
   }
+}
+
+// Is the Redis object cache active? Its drop-in is wp-content/object-cache.php
+// (first 4 KB, see readHead).
+export async function objectCacheActive(s) {
+  return s.type === 'wordpress'
+    && /Redis Object Cache/i.test((await readHead(`${webRoot(s.domain)}/wp-content/object-cache.php`, 4096)) ?? '');
 }
 
 // Can nginx serve WP Rocket's cache for this site? Only when WP Rocket is
@@ -211,19 +230,7 @@ export async function wpRocketStatus(helpers, s) {
 // wrote (checked by content — read as root, so no symlinks, first 8 KB), then
 // deactivate it without loading any plugin. → { active, removed[] }
 const LSCACHE_DROPINS = ['object-cache.php', 'advanced-cache.php'];
-async function isLiteSpeedDropin(file) {
-  let fh;
-  try {
-    fh = await fs.open(file, FS.O_RDONLY | FS.O_NOFOLLOW);
-    if (!(await fh.stat()).isFile()) return false;
-    const { buffer, bytesRead } = await fh.read(Buffer.alloc(8192), 0, 8192, 0);
-    return /litespeed/i.test(buffer.subarray(0, bytesRead).toString('utf8'));
-  } catch {
-    return false;
-  } finally {
-    await fh?.close();
-  }
-}
+const isLiteSpeedDropin = async (file) => /litespeed/i.test((await readHead(file, 8192)) ?? '');
 export async function retireLiteSpeedCache(helpers, s) {
   const removed = [];
   for (const f of LSCACHE_DROPINS) if (await isLiteSpeedDropin(`${webRoot(s.domain)}/wp-content/${f}`)) removed.push(`wp-content/${f}`);
@@ -302,11 +309,9 @@ add_action( 'admin_init', function () {
 export async function syncLiteSpeedGuard(helpers, s) {
   if (s.type !== 'wordpress') return;
   // Already current (the usual case at startup) → no wp-cli round trip.
-  let fh;
-  try {
-    fh = await fs.open(`${webRoot(s.domain)}/wp-content/mu-plugins/${LSCACHE_GUARD_FILE}`, FS.O_RDONLY | FS.O_NOFOLLOW);
-    if ((await fh.readFile('utf8')) === LSCACHE_GUARD) return;
-  } catch { /* missing → install */ } finally { await fh?.close(); }
+  // One byte more than the guard is read: a longer file never compares equal.
+  const file = `${webRoot(s.domain)}/wp-content/mu-plugins/${LSCACHE_GUARD_FILE}`;
+  if ((await readHead(file, Buffer.byteLength(LSCACHE_GUARD) + 1)) === LSCACHE_GUARD) return;
   await installMuPlugin(helpers, s, LSCACHE_GUARD_FILE, LSCACHE_GUARD);
 }
 

@@ -6,7 +6,7 @@ import { wpCli } from './wp.js';
 // Everything goes through wp-cli as the site's own user (wp.wpCli).
 
 // Plugin "names" are wp-cli's identifiers: the folder (or single file) name.
-export const PLUGIN_NAME = /^[A-Za-z0-9._-]{1,100}$/;
+export const PLUGIN_NAME = /^(?!-)[A-Za-z0-9._-]{1,100}$/;
 // A zip the upload endpoint put in the site's tmp/ (see server.js).
 export const UPLOAD_NAME = /^wcloud-upload-[a-f0-9]{16}\.zip$/;
 
@@ -24,6 +24,10 @@ export async function listPlugins(helpers, s) {
 
 // WordPress.org directory search.
 export async function searchPlugins(helpers, s, q) {
+  // wp-cli reads --anything, anywhere on the command line, as an option
+  // (incl. the global --exec/--require): the term must never start with a dash.
+  q = String(q ?? '').replace(/^[\s-]+/, '').trim();
+  if (!q) throw new Error('Type something to search for.');
   const r = await (await wpCli(helpers, s))(['plugin', 'search', q, '--per-page=24', '--format=json',
     '--fields=name,slug,version,author,rating,num_ratings,active_installs,short_description'], { quiet: true, timeout: 60_000 });
   const list = r.code === 0 ? parse(r) : null;

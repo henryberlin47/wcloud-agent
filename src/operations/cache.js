@@ -34,6 +34,9 @@ export async function runCache(job, helpers, p) {
     await syncCachePlugin(helpers, next); // page cache and/or Cloudflare purges
     if (p.mode === 'fastcgi') ok('Pages are cleared from the cache automatically when content changes');
     else await clearPageCache(s.domain);
+  } else if (p.mode) {
+    // The same mode again changes nothing, but puts a lost helper plugin back.
+    await syncCachePlugin(helpers, s);
   }
 
   if (typeof p.objectCache === 'boolean') {

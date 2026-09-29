@@ -22,11 +22,16 @@ export const statusFor = (code) => STATUS[code] || 400;
 // private tmp/ for plugin uploads that must never be web-reachable.
 export async function spawnWorker(site, op, args = {}, { root = webRoot(site.domain) } = {}) {
   const { uid, gid } = await userIds(site.user);
-  return spawn(process.execPath, [WORKER, op, root, JSON.stringify(args)], {
+  const child = spawn(process.execPath, [WORKER, op, root, JSON.stringify(args)], {
     uid, gid, cwd: root,
     env: { PATH: '/usr/bin:/bin', HOME: siteTmp(site.domain), LANG: 'C.UTF-8' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+  // A failed spawn (the site's folder is gone, no free process slot) emits
+  // 'error': unhandled, that would stop the whole agent and its running jobs.
+  // 'close' still fires with a negative code, so settle() reports the failure.
+  child.on('error', () => {});
+  return child;
 }
 
 // Collect a worker's output. Resolves { ok, data | code, message }.
@@ -34,7 +39,10 @@ export function settle(child, { timeout = 60_000 } = {}) {
   return new Promise((resolve) => {
     let out = '';
     let err = '';
-    const t = setTimeout(() => child.kill('SIGKILL'), timeout);
+    const t = setTimeout(() => { if (child.pid) child.kill('SIGKILL'); }, timeout); // no pid = never started (kill would hit pid 0)
+    // Decoded as one stream: a character split across two chunks stays whole.
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { err += d; });
     child.on('close', (code) => {
