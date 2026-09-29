@@ -55,13 +55,19 @@ as the source of truth for writing code** — the graph is only a map.
 - **File manager** — `GET /api/sites/:domain/files?path=` (list),
   `GET …/files/content?path=` (raw bytes), `PUT …/files/content?path=` (raw
   `application/octet-stream` body → the file, atomic replace, ≤512 MB),
-  `POST …/files/op` (`mkdir` | `rename` | `move` | `copy` | `delete`). Paths are
+  `POST …/files/op` (`mkdir` | `rename` | `move` | `copy` | `delete`; at most
+  1000 `paths` — more is a 400 `EINVAL`, never cut short: the caller would
+  report the whole selection as done). Paths are
   relative to the site's `htdocs`. Every call spawns **`src/fm-worker.js` as the
   site's user** (uid/gid + clean env, `lib/files.js`) — the agent itself never
   touches site files for the file manager: it is root, and a site-planted
   symlink would turn "read this file" into "read any file". The worker also
   confines paths lexically (`path.resolve` against `/`, so `..` can't climb and
   `/`, `''`, `.` are exactly the root, which can't be deleted/renamed).
+  An upload the client abandons is stopped with SIGTERM to the worker (it
+  removes its temp file) — never by ending stdin, which the worker reads as a
+  complete file. `server.requestTimeout` is 61 min (uploads get 60): Node's
+  default cuts any request whose body takes over 5 min, even mid-read.
 - `POST /api/sites/:domain/wp-login` — **one-click login** (`lib/wplogin.js`):
   `{ url, user, expires_in }`, a single-use `wp-login.php?wcloud_login=<token>`
   link (2 min) for the first administrator. WordPress stores only the token's
@@ -69,6 +75,10 @@ as the source of truth for writing code** — the graph is only a map.
   (rewritten on every call, as the site user) deletes it before checking —
   single use even when invalid — then sets the auth cookie. The minting PHP
   goes to `wp eval-file -` on stdin, so the token never touches argv.
+  The link is built from the login address the site reports, but only when
+  that is http(s) on `<domain>` or `www.<domain>`: it carries a login token
+  and the portal opens it, so it never goes to a host the site's code names.
+  Anything else is a 502 with a plain message.
 - `POST /api/sites/:domain/pma-login` — **one-click phpMyAdmin** (`lib/pma.js`):
   `{ url, db, https, expires_in }`. phpMyAdmin is installed ONCE per server by
   `init.sh` (latest release, SHA-256 verified, `setup/` etc. removed) at
@@ -80,19 +90,26 @@ as the source of truth for writing code** — the graph is only a map.
   `{user,password,db,expires}` into the site's `tmp/wcloud-pma/` AS THE SITE
   USER (password on stdin), named by the token's SHA-256; the signon script
   deletes it before checking (single use), 2-minute expiry. `libraries/`,
-  `templates/`, `vendor/`, `sql/` are denied by nginx. The call re-applies the
-  site (older vhosts gain the location; no-op otherwise).
+  `templates/`, `vendor/`, `sql/` are denied by nginx. The call never
+  re-applies the site: it runs outside the job queue, and writing the spec it
+  was handed could undo a job that finished meanwhile (every vhost has the
+  location — the startup reconcile re-renders them).
 - **Plugins** (WordPress sites): `GET /api/sites/:domain/plugins` (live
   `wp plugin list`), `GET …/plugins/search?q=` (WordPress.org, from the server),
   `PUT …/plugins/upload` (raw .zip ≤100 MB → the site's PRIVATE `tmp/` as
   `wcloud-upload-<hex>.zip`, written by fm-worker as the site user — never
   web-reachable) → `{ upload }`. Changes are the **`plugin` op**
   (`operations/plugin.js`): `install` (WordPress.org `slug` or `upload`,
-  `activate`, `replace` → `--force`; the zip is always removed), `activate`,
+  `activate`, `replace` → `--force`; the zip is removed with `unlink` — left
+  in place if the site replaced it with a directory), `activate`,
   `deactivate`, `update` (names or `all`), `delete` (= `wp plugin uninstall
   --deactivate`, i.e. WordPress's own Delete incl. the uninstall routine),
-  `auto-update-on|off`. Plugin names are checked against `PLUGIN_NAME` (no
-  leading `--` can reach wp-cli); all wp-cli runs as the site user.
+  `auto-update-on|off`. wp-cli reads `--anything`, anywhere on its command
+  line, as an option (incl. the global `--exec` / `--require`), so nothing
+  handed to it may start with a dash: `PLUGIN_NAME` and the install `slug`
+  refuse a leading `-`, and the search term has leading whitespace/dashes
+  stripped (in the route and again in `searchPlugins`). All wp-cli runs as
+  the site user.
 - **Search engine visibility** (WordPress): `GET /api/sites/:domain/indexing`
   → `{ indexing }` (WordPress's `blog_public`, read live); the `indexing` op
   `{ domain, enabled }` sets it (same setting as Settings → Reading) and clears
@@ -105,26 +122,39 @@ as the source of truth for writing code** — the graph is only a map.
   `wp core version` (`src/lib/wpinfo.js`). 404 = not a readable WP install.
 - `GET /api/sites/:domain/ssl` — live SSL state, parsed **on demand** from the cert
   on disk (`/etc/letsencrypt/live/<domain>/fullchain.pem`): `{ enabled, source:
-  none|letsencrypt|letsencrypt-manual|custom, auto_renew, issuer, subject, sans[],
-   not_after, days_left, self_signed }`. Nothing is stored — the disk is the source
-   of truth (see §3, ssl).
+  none|letsencrypt|letsencrypt-dns|letsencrypt-manual|custom, auto_renew, issuer,
+  subject, sans[], not_after, days_left, self_signed }`. Nothing is stored — the
+  disk is the source of truth (see §3, ssl). `auto_renew` is true only when
+  something renews the certificate: `letsencrypt` with an acme.sh HTTP-01
+  (webroot) entry, or `letsencrypt-dns`. A Let's Encrypt certificate copied
+  from a backup or pasted has no entry: `source` stays `letsencrypt`,
+  `auto_renew` is false.
 - `GET /api/sites/:domain/ssl-challenge` — the pending manual DNS-01 challenge for
    a site (`{ domain, pending, started_at?, txt_records? }`), read from the state
-   file step 1 writes (`/var/lib/wcloud/ssl-challenge/<domain>.json`). `pending:
+   file step 1 writes (`/var/lib/wcloud/ssl-challenge/<domain>.json`, root 0600:
+   it also holds `vlist` and `prevConf`, a copy of the acme.sh entry step 1
+   overwrote (§3) — never returned by the route). `pending:
    false` when none. This is the **only** persistent per-site state (jobs die on
    restart); it exists so the two-step DNS flow survives page reloads and agent
-   restarts. Cleared by the verify step, a hard verify failure, and site delete.
+   restarts. Cleared by the verify step, a hard verify failure, any other
+   certificate being issued or installed (le-http, le-dns-cf, custom), expiry
+   after 7 days, and site delete.
 - `POST /api/op/:type` — validate + enqueue an operation → `{ jobId, state }`.
 - `POST /api/self-update` — refuses (409) while any job is queued/running (the restart would cut it off) or another update runs; `git fetch origin` + `reset --hard origin/main` + `npm install` — an npm failure resets back to the previous commit (new code + old deps would crash-loop on the next restart); respond `{ ok, updated, old_commit, new_commit, version }`, then restart via a *systemd-run 2s timer* (detached — the timer outlives the process that gets SIGTERM'd). Origin/branch hardcoded: this runs remote code as root, no request body ever reaches a shell.
 - `POST /api/backup-test`, `POST /api/backup-delete` — quick S3 calls against the Spaces creds passed **in the request body** (per user, per job). Creds live in the S3 client for one call only — never written to config, never logged. `backup-test` is a full round-trip: list (read), then write a tiny probe object and delete it. A read-only check passes on a Space the key can't write to, so the failure would otherwise surface only after a whole archive was built.
 - `GET /api/jobs`, `/api/jobs/:id`, `/logs`, `/stream` (SSE), `POST /:id/cancel` —
   job status/logs/cancel. Jobs are **in-memory** (`src/jobs.js`), forgotten ~1h
-  after finishing. Up to `AGENT_MAX_CONCURRENT` (default 3) run at once:
+  after finishing. Job views mask `result` like `params` (keys matching
+  `pass|secret|token|key|cert` → `***`), so a secret the caller must read back
+  has to travel in a field that is not masked: the export's one-time token is
+  read from the tail of `result.url` (`result.token` arrives as `***`).
+  Up to `AGENT_MAX_CONCURRENT` (default 3) run at once:
   `drain()` never starts two jobs on the same `params.domain`, and a job with
   no domain (reconcile) runs alone. Server-wide sections take turns through
   `sys.withLock(name, fn)` (in-process, NOT re-entrant): `'config'` =
   `applySite`, `deleteSite`'s unload step, `nginxrules` commit, realip refresh,
-  acme `installCert`, PHP install's pool/restart step; `'apt'` = package
+  acme `installCert`, the nginx reload in `applySslConf` and at the end of
+  reconcile, PHP install's pool/restart step; `'apt'` = package
   installs; `'acme'` = every acme.sh call (shared account.conf). New code that
   writes nginx/PHP-FPM/cron config or reloads them must go through `'config'`.
   Servers installed while the default was 1 have `AGENT_MAX_CONCURRENT=1` in
@@ -135,9 +165,13 @@ as the source of truth for writing code** — the graph is only a map.
   every site's PHP-FPM socket accepts (sites whose pool file exists), `mysqladmin
   ping`, Redis `PING` (admin user), cron active, disk ≥5 % free (warn <10 %).
   A failed check → `systemctl restart` + re-check. Never restarts nginx when
-  `nginx -t` fails (reports it); nginx/PHP heal under the `'config'` lock and a
-  round is skipped (warn) while `'config'`/`'apt'` are busy (`sys.lockBusy`); a
-  service restarted 3× in 30 min is left alone ("needs a look"). Heals log
+  `nginx -t` fails (reports it); nothing is healed (warn) while
+  `'config'`/`'apt'` are busy (`sys.lockBusy`, asked at each failed check — a
+  change can begin mid-round); nginx/PHP heal under the `'config'` lock and are
+  probed again once it is theirs (the change before them may have left all
+  well); a service that is starting, reloading or stopping is left to finish
+  (a restart would make MariaDB's crash recovery begin again); a service
+  restarted 3× in 30 min is left alone ("needs a look"). Heals log
   `[watchdog] …` to the journal. `GET /api/health` (last round + heals),
   `POST /api/health/check` (run now), `GET /api/stack` (summary: ok | warn |
   error | unknown + problems — the portal's health sweep reads it).
@@ -160,7 +194,9 @@ as the source of truth for writing code** — the graph is only a map.
   token — and the portal refuses any other certificate from then on. No
   cert files → plain HTTP with a loud warning (dev only).
 - `publicUrl()` (config.js) is the one place the agent's own URL is built
-  (enrollment, export download links).
+  (enrollment, export download links). The portal takes only the token from
+  an export's `result.url` and downloads from the source server's `base_url`,
+  so clone/move don't depend on `AGENT_ADVERTISE_URL`.
 - Server-to-server archive downloads (import `sourceUrl`) carry the source
   agent's `sourcePin`; curl checks it with `--pinnedpubkey` (`-k` only skips
   the CA chain — the pin is still enforced). No pin → normal CA verification,
@@ -194,19 +230,42 @@ cron/procs/locks, then `sites.deleteSite`; requires `confirm:true`), **ssl** (mo
 **nginxrule** (named custom nginx rules: save/delete via `lib/nginxrules.js`),
 **cron** (a WordPress site's scheduled jobs: save/delete/run/wpcron, `lib/cron.js`),
 **cfcache** (Cloudflare cache purge credentials + helper plugin, `lib/cfcache.js`),
-**resetPassword** (`wp user update --user_pass`),
+**resetPassword** (`wp user update --user_pass` for the administrator with the
+lowest ID — the account one-click login signs in as — addressed by ID,
+`--skip-email`),
 **export** (builds the archived site; `buildSiteArchive` in `export.js` is the shared
 archive builder), **import** (restores an archive; `runRestoreFromLocal` in
 `import.js` is the shared restore body — decrypt/extract/DB/SSL/canonical all live
 there), **backup** (build archive via the shared helper + S3-upload to Spaces)
 and **restore** (S3-download + the shared restore path — `canonical: "keep"`
 (restore, import) takes the archived site's canonical/enableWww; in-place restore first
-runs the full **delete** op). backup/restore take the user's Spaces creds per call
+runs the full **delete** op). restore takes `replace` (default true):
+`replace: false` means the caller saw no site at this domain, so no safety
+backup exists — when a site is there the op refuses before the download
+("already exists on this server — it was not replaced") and never runs the
+delete. backup/restore take the user's Spaces creds per call
 in params and run with a longer per-op timeout (`AGENT_BACKUP_TIMEOUT_MS`, default
 12h). restore (and `runRestoreFromLocal`) also take `cfToken` + `cfZoneId`: the
 certificate is then issued over Cloudflare DNS first (works before the domain
 points here — how sites moving in from RunCloud get HTTPS), falling back to
-the archived certificate. An archive whose `wcloud-site.json` says
+the archived certificate. The archived certificate (`includeSsl`) is only
+installed when it works here (`certcheck.checkCustomCert`: it covers the
+destination domain, the key is its own, it has not expired) — a restore to
+another domain would serve a certificate every browser refuses — and never
+when the archived site had HTTPS off (that keeps the certificate on disk, so
+it is in the backup): HTTPS stays off. Refused or missing: Let's Encrypt is
+issued when `issueSsl` is set, otherwise the site stays on HTTP.
+`redirects`, `domainRedirect` (same domain only — it belongs to the domain)
+and `realIp` travel with the archive, re-validated (`cleanRedirects` /
+`cleanDomainRedirect`, entry by entry; a refusal only warns). Custom nginx
+rules are never read from an archive: an in-place restore carries over the
+LIVE site's rules (`listRules` before the delete, `saveRule` after the
+restore; a rule nginx refuses now only warns). Until its database is in, a
+restored WordPress site is closed by the rule `wcloud-restoring`
+(`return 503;` — WordPress on an empty database serves its installer to
+anyone); it is removed before the certificate step (it would answer Let's
+Encrypt's check too) and never carried over.
+An archive whose `wcloud-site.json` says
 `source: "runcloud"` also gets `cache.retireLiteSpeedCache()` right after the DB
 import (before any other wp-cli run): LiteSpeed Cache's drop-ins
 (`object-cache.php` / `advanced-cache.php`, recognised by content) are deleted
@@ -233,34 +292,56 @@ syntax.
 **ssl — mode-driven (`{ domain, mode, cert?, key?, cfToken?, cfZoneId? }`)**, never "always issue":
 - `off` — `spec.ssl = false` and re-apply: the vhost is rendered without the 443
   server, **the certs stay on disk** (turning HTTPS back on is instant).
+  `spec.sslDns` and the Cloudflare token file are kept too.
 - `le-http` — `acme.issueHttp`: acme.sh HTTP-01 via the shared webroot
   `/var/www/html` (every vhost serves `/.well-known/acme-challenge/` from it, even
   when redirecting to HTTPS), `--install-cert` with a `--reloadcmd` so acme.sh's
   cron renews in place. www is included when served; if www fails (no DNS yet)
-  it retries for the bare domain.
+  it retries for the bare domain. The **canonical** op keeps the names in step:
+  www turned on → re-issued to cover it; www turned off → an auto-renewing
+  HTTP-01 certificate is re-issued for the bare domain only (acme.sh renews
+  with the names it saved, so a certificate still listing www would stop
+  renewing once www's DNS record is removed). Custom, manual-DNS,
+  Cloudflare-DNS and copied certificates are left alone; a failed re-issue
+  only warns.
 - `le-dns-manual` — **step 1 of the two-step manual DNS-01 flow** (provider-
   independent, for domains behind Cloudflare/proxies where HTTP-01 can't reach
-  the origin): `acme.sh --issue --dns -d D --force --yes-I-know...` prints the TXT
+  the origin): `acme.sh --issue --dns -d D --force --yes-I-know...` (+ `-d www.D`
+  when the site serves www: HTTPS is switched on for both names, one TXT
+  record per name) prints the TXT
   records, saves the ACME order, exits 3. The op stores them in the challenge
-  state file (§2) and returns `{ pending, txt_records }`; nothing on the box is
-  changed yet. **Step 2** is the `sslDnsVerify` op — the user has added the TXT
+  state file (§2) and returns `{ pending, txt_records }`. Step 1 rewrites the
+  domain's acme.sh entry to manual DNS, which stops renewal of an HTTP-01
+  certificate in place: the agent keeps a copy of the previous entry in the
+  challenge state (`prevConf`) and restores it when the flow ends without a
+  certificate. **Step 2** is the `sslDnsVerify` op — the user has added the TXT
   records at their DNS provider by then.
 - `le-dns-cf` — DNS-01 through the **Cloudflare API** (`acme.issueDnsCloudflare`):
   works behind the orange cloud and renews itself. The portal sends the owner's
   token for the domain's zone + the zone id. acme.sh's `dns_cf` runs with them in
-  env; its saved `SAVED_CF_*` copy is stripped from `account.conf` straight after,
-  and the acme.sh domain entry is removed (`--remove`) so its cron never renews it
+  env; acme.sh's saved copy is stripped from `account.conf` (`SAVED_CF_*`) and
+  from the domain's entry and its `.conf.removed` (`CF_*`) by file edits in a
+  `finally` — so also after a failed, cancelled or timed-out attempt, which
+  also gets the domain's previous entry back (the certificate in place keeps
+  renewing). On success the acme.sh domain entry is removed
+  (`forgetAcmeDomain`) so its cron never renews it
   with a token it no longer has. The agent keeps `{token, zoneId, www}` in
   `/etc/wcloud/cf-dns/<d>.json` (root 0600) and sets `spec.sslDns = 'cloudflare'`;
   `acme.startDnsRenewer` (every 12h) queues an `ssl-renew` job for such sites
-  with ≤30 days left. Any other mode (or deleting the site) removes the token file.
+  with ≤30 days left — it skips sites with HTTPS off (renewing would switch it
+  back on), and the job re-checks the spec before issuing (it may have waited
+  behind another job). Any other certificate mode (not `off`) or deleting the
+  site removes the token file.
   Live status: `source: letsencrypt-dns`, `auto_renew: true`.
 - `custom` — pasted fullchain + key. **Validated before anything is written**: both
   parse as PEM, the key's public key equals the cert's (public-key compare — covers
   RSA/EC/Ed25519), and the cert's SAN covers the domain. A bad pair never touches
   disk. Then `applySslConf(helpers, domain, { certs })` — the cert pair joins the
   same backup → nginx -t → rollback transaction, so a chain nginx rejects restores
-  the previous working cert (shared wiring, §5). `cert`/`key`
+  the previous working cert (shared wiring, §5). Once the pair is installed
+  the domain is taken off acme.sh's renewal list (`acme.forgetAcmeDomain`), so
+  its cron never renews a Let's Encrypt certificate over it; switching back to
+  le-http re-creates the entry. `cert`/`key`
   arrive in the authenticated body only, the key is written `600 root:root`, and
   neither is ever logged or echoed (job views redact both).
 
@@ -268,22 +349,37 @@ syntax.
 `Le_Vlist` (the saved ACME order) after *every* verification attempt, and a lost
 vlist means a new order = a new TXT the user must re-add. So the agent captures
 the vlist at step 1 and **restores it into the domain conf before every verify**
-— the same token stays valid for as long as propagation takes. `sslDnsVerify`
+— the same token stays valid for as long as propagation takes. The CA checks
+an order once and a failed check is final, so `sslDnsVerify` first looks the
+TXT records up itself (public resolvers; one it cannot reach decides
+nothing): a record not visible yet → **soft fail**, the CA is not asked —
+state + same TXT stay, the user retries. Then it
 runs `acme.sh --renew -d D --force --yes-I-know...`: exit 0 → `--install-cert`
 into `/etc/letsencrypt/live/<domain>/` (600 root:root) + `writeManualMarker` +
 `applySslConf` + clear state; exit 3 → a fresh order was created, new TXT
-records stored back in the state file; exit 1 with "DNS problem/NXDOMAIN" →
-**soft fail** (the CA can't see the record yet — state + same TXT stay, the user
-retries); any other failure → hard fail, state cleared. The resulting cert is
+records stored back in the state file; any other exit → hard fail =
+previous acme.sh entry restored + state cleared (`abortChallenge`; the entry
+is only put back while it is still step 1's — a certificate issued since owns
+it). Flows unfinished after 7 days (the CA drops the request) are aborted the
+same way by the 12h tick in `startDnsRenewer`, through an internal
+`ssl-challenge-expire` job. The resulting cert is
 flagged by the `.wcloud-ssl-manual` marker → `source: letsencrypt-manual`,
 `auto_renew: false` in the live status.
 
 **Cert/nginx wiring** — all certs (LE, custom, manual-DNS) live at
 `/etc/letsencrypt/live/<domain>/` (`fullchain.pem`, `key.pem`, `sites.certDir`).
 `sites.applySslConf(helpers, domain, {certs?})` = `applySite` with `ssl: true`
-(+ the cert pair joins the same transaction, §6). `src/lib/certinfo.js` reads
+(+ the cert pair joins the same transaction, §6). Without `certs` (the pair
+was written by acme.sh) it then runs `nginx -t` and reloads under the
+`'config'` lock: `applySite` cannot see cert-file changes — on a renewal or
+re-issue spec + vhost are unchanged, it reloads nothing and nginx would keep
+serving the old certificate from memory. It throws if the check fails.
+`src/lib/certinfo.js` reads
 the live state: `enabled` = the spec's `ssl` flag, `source` from the issuer (a
-`.wcloud-ssl-manual` marker flags non-renewing manual-DNS certs).
+`.wcloud-ssl-manual` marker flags non-renewing manual-DNS certs), `auto_renew`
+only when something renews the certificate (§2) — acme.sh's cron for a
+`letsencrypt` certificate with an HTTP-01 (webroot) entry, the agent's renewer
+for `letsencrypt-dns`.
 
 **Log format** — ops use `logger(helpers)` (`src/lib/log.js`). Commands are silent
 on success and dump `$ cmd` + last 15 lines only on failure. Output reads like a
@@ -338,14 +434,18 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   `renderVhost`/`renderPool`, `applySite` (the transaction), `createSite`,
   `deleteSite`, `applySslConf`, `syncWpAddress`.
 - **stack.js** — shared services: `PHP_VERSIONS`/`DEFAULT_PHP`, `ensurePhp`
-  (apt install on demand), MariaDB `createDatabase`/`dropDatabase` (SQL on
+  (apt install on demand; installed = dpkg reports every package configured,
+  so an install killed midway is finished by the next attempt), MariaDB
+  `createDatabase`/`dropDatabase` (SQL on
   stdin), Redis `createRedisUser`/`dropRedisUser`.
 - **wp.js** — WordPress on a site: `wpCli(helpers, spec)` (as the site user, with
   the site's PHP), `setupWordPress` (DB, Redis login, generated `wp-config.php`,
   core download + install), `pinWpUrls`, `clearWpCaches`, `readWpVersion`,
   `readDbCredentials` (live via `wp config get`; nothing stored).
-- **acme.js** — Let's Encrypt via acme.sh: `issueHttp` (auto-renewing HTTP-01)
-  and the manual DNS-01 two-step flow + its state file (see §3).
+- **acme.js** — Let's Encrypt via acme.sh: `issueHttp` (auto-renewing HTTP-01),
+  `issueDnsCloudflare` + `startDnsRenewer`, the manual DNS-01 two-step flow +
+  its state file, and `forgetAcmeDomain` (takes a domain off acme.sh's renewal
+  list) — see §3.
 - **certinfo.js** — live SSL state (see §3 "ssl").
 - **spaces.js** — DigitalOcean Spaces (S3) transfers via `@aws-sdk/client-s3`:
   `uploadFile` (multipart through lib-storage's `Upload`, so archives past S3's
@@ -369,8 +469,9 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   unreachable the newest cached copy is used. Never writable by a site (a shared
   wp-cli cache would let one site poison the next one's core). Any failure →
   `wp core download` as before. Self-check: `node src/lib/wpcore.js`.
-- **sitelogs.js** — `readSiteLog(domain, access|error|php, {lines, q})`: the tail
-  (last 4 MB window) of a site's log, filtered; opened `O_NOFOLLOW` (a symlinked
+- **sitelogs.js** — `readSiteLog(domain, access|error|php|cron, {lines, q})`: the
+  tail (last 4 MB window) of a site's log, filtered (a search in the cron log
+  keeps whole runs: header + output); opened `O_NOFOLLOW` (a symlinked
   log is refused, never read as root). `GET /api/sites/:d/logs`.
 - **realip.js** — `/etc/nginx/wcloud/cloudflare-realip.conf` (`set_real_ip_from`
   for every Cloudflare range + `real_ip_header CF-Connecting-IP`), included by a
@@ -384,23 +485,37 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   the site user (user field is ours, never input), `cd htdocs`, PATH starts
   with `/usr/local/lib/wcloud/php<v>` (wrappers: `php`/`wp` → the site's PHP),
   HOME/WP_CLI_CACHE_DIR in the site's tmp, output appended to
-  `/var/log/wcloud/<d>.cron.log` (Logs tab "cron"). `cleanJob`/`scheduleOk`
+  `/var/log/wcloud/<d>.cron.log` (Logs tab "cron"). The log is owned by the
+  site user, mode 0640: `sites.ensureSiteLog` sets owner and mode on every
+  call and "Run now" calls it before writing — a file root created first
+  would make every cron line of the site fail at its redirect, silently.
+  `cleanJob`/`scheduleOk`
   are the boundary: 5 numeric fields or @hourly/@daily/@weekly/@monthly, one-line
-  commands (a newline could add a root line), `%` escaped. "wpCron: server" =
+  commands (a newline could add a root line) of ≤700 characters, every `%`
+  escaped (unless it already is). The command runs in its own `/bin/sh -c`, so
+  a `# comment` or a trailing `;` in it cannot swallow the log redirect. cron
+  reads a command into 1000 bytes: a job whose line doesn't fit (`fitsCron`)
+  is refused on save and left out by render and import — its line would break
+  the file for every other job. "wpCron: server" =
   `DISABLE_WP_CRON` (`setWpConstant`) + `wp cron event run --due-now` every
   1/5/15 min. The cron op also `systemctl enable --now cron`. "Run now" runs
   the command exactly like cron and shows its output in the job log.
 - **cfcache.js** — Cloudflare purges for a site. The PORTAL writes the zone's
   Cache Rules; the agent keeps `{token, zoneId, hosts}` in
   `/etc/wcloud/cf-cache/<d>.json` (root 0600) and purges by host
-  (`purge_cache {hosts}`, 10 s debounce) — from the purge op (`only:
+  (`purge_cache {hosts}`, 10 s debounce: a purge held back is sent by the
+  watcher on a later tick, and only a purge that worked counts as the last
+  one) — from the purge op (`only:
   'cloudflare'` = just that), the cfcache op, and the watcher.
   `CLOUDFLARE_API` env overrides the API base (tests).
 - **nginxrules.js** — named custom nginx rules in `/var/www/<d>/conf/nginx/<id>.conf`
   (first line `# wcloud-name: <name>`; disabled = renamed `.conf.off`). Every
   save/delete is one transaction: write, `nginx -t`, restore the previous files
   on failure and throw nginx's own `[emerg]` line; success reloads nginx and
-  clears the page cache. `GET /api/sites/:d/nginx-rules` lists them.
+  clears the page cache. A cancel or timeout also restores the previous files
+  (an untested rule must not stay on disk), and a job cancelled while waiting
+  for the `'config'` lock writes nothing. `GET /api/sites/:d/nginx-rules`
+  lists them.
 
 ---
 
@@ -414,7 +529,9 @@ fpm, created_at }`.
 `location = "from"` / `location ~ "from"` with `return code "to[$is_args$args]"`.
 `cleanRedirects` is the injection boundary: exact paths start with `/`, patterns
 may not contain whitespace/quotes/`;{}`, targets are a URL or `/path`, and the
-only `$` allowed is `$1`…`$9` (patterns only). A pattern nginx can't compile
+only `$` allowed is `$1`…`$9` (patterns only); paths and targets are ≤2000
+characters, checked before any pattern runs (validation happens on the
+agent's one event loop). A pattern nginx can't compile
 fails `nginx -t` and the transaction rolls back.
 `domainRedirect` = `{ to, code: 301|302, keepPath }` | absent: the WHOLE domain
 (both hosts, http and https) goes to `to` in one hop (`+ $request_uri` when
@@ -432,7 +549,8 @@ whitelisted keys, typed values, upload ≤ post size, dynamic min ≤ start ≤ 
 spare ≤ max children. Rendered as `php_value`/`php_flag` only (never
 `php_admin_*`, so the isolation lines can't be loosened). The vhost follows
 them: `client_max_body_size` = the larger of post/upload size,
-`fastcgi_read_timeout` = max(600, max_execution_time, request_terminate_timeout).
+`fastcgi_read_timeout` = max(600, max_execution_time, request_terminate_timeout;
+a 0 — no limit in PHP/FPM — counts as 3600).
 `publicSpec` returns the effective values plus `phpDefaults` / `fpmDefaults`;
 set via `siteconfig`; export/import carries them. Self-check:
 `node src/lib/phpsettings.js`.
@@ -441,7 +559,11 @@ The nginx vhost (`/etc/nginx/sites-enabled/<d>.conf`) and PHP-FPM pool
 place, never parsed back. Every change goes through **`applySite(helpers, spec,
 {certs?, prevPhp?})`**: stage spec + rendered files (+ cert pair), write, `nginx
 -t` + `php-fpm<v> -t`, and on failure restore every file to its exact prior
-state (including absence); services reload only for files that changed. Fix a
+state (including absence); services reload only for files that changed. Once
+the new files are written and tested, the reloads run even if the job was
+cancelled or timed out meanwhile: the services would otherwise keep the old
+config, and applying the same settings again finds nothing changed and
+reloads nothing. Fix a
 template → re-apply → every site gets it.
 
 Per-site isolation (the point of owning the stack):
@@ -466,7 +588,12 @@ Per-site isolation (the point of owning the stack):
 Site types: `wordpress` (PHP) and `static` (htdocs only, no pool/DB). A new type
 (node, …) = a body in `renderVhost` + its setup in `createSite`. `createSite`
 removes everything it made if any step fails (it calls `deleteSite`, which is
-idempotent). PHP versions are installed on demand (`stack.ensurePhp`); the
+idempotent) — without the job's signal, so the rollback also runs after a
+cancel or timeout; the restore rollback (`runRestoreFromLocal`) does the same.
+A WordPress site is refused when a database with the site user's name already
+exists (the database gets that name, and a failed create drops it): nothing
+is created and nothing is dropped.
+PHP versions are installed on demand (`stack.ensurePhp`); the
 package's `www` pool is replaced by an inert placeholder (it would run as
 www-data, the group that can read every site).
 
@@ -504,7 +631,9 @@ www-data, the group that can read every site).
   MB), timestamps revalidated every 2s.
 - **Agent start = reconcile** (queued `reconcile` job): OPcache settings + every
   site re-applied from its spec (no-op if current) — template changes reach
-  every site on update.
+  every site on update. A lost or outdated cache helper plugin is put back
+  where one is wanted. It ends with one tested nginx reload (`nginx -t`, under
+  `'config'`), so certificates renewed on disk are loaded.
 - **PHP version switch ordering** (`applySite`): reload the OLD version, wait
   until it has unlinked the shared socket path (it does so ~½s after `reload`
   returns), THEN reload the new one and wait for its socket. Otherwise the old
@@ -537,7 +666,18 @@ loopback; set to the box's IP to accept portal calls), `AGENT_PORT` (8787),
   readable via /proc by the site) — `run({as})` builds a clean env.
 - **Anything a site can write is untrusted to root**: SQL dumps are handed over
   through the site's own `tmp/` (wp-cli runs as the site), cache files are
-  deleted as the site user, staging dirs are root-only.
+  deleted as the site user, staging dirs are root-only. Export checks the
+  dump with `lstat` once it has moved it into staging (the site wrote it, so
+  it may be a link). Root never deletes recursively inside a directory a site
+  controls: what wcloud leaves in a site's `tmp/` (`wcloud-upload-*.zip`,
+  `wcloud-import-*.sql`, `wcloud-export-*.sql`) is removed with a plain
+  `unlink`. Removal follows symlinks in every path component but the last, so
+  the export prune of `tmp` / `wp-content/cache` / `app/cache` in the staged
+  copy only removes where the parent is a real directory inside the staging
+  dir (`realpath` check). When root reads a file inside a directory a site
+  controls, it opens with `O_NOFOLLOW` and `O_NONBLOCK`, checks `isFile()` on
+  the handle and reads a bounded number of bytes (`cache.js` `readHead`) — a
+  FIFO would otherwise hold one of libuv's four fs threads for good.
 - **Jobs + install progress are in-memory**; an agent restart forgets jobs. The
   portal is the durable record and reconciles.
 - **Concurrency is 1 on purpose** — deploys touch nginx/php-fpm; parallel runs race.
@@ -545,6 +685,9 @@ loopback; set to the box's IP to accept portal calls), `AGENT_PORT` (8787),
   start once aborted and kills the child's whole **process group** (spawned
   `detached`; TERM then KILL), so grandchildren (php wp …) die too. S3 transfers take `{ signal }` (Upload.abort() also
   aborts the multipart server-side). Cancel ends as CANCELLED, timeout as TIMEOUT.
+  Work that must still happen after a cancel — the `createSite` / restore
+  rollback, `applySite`'s reloads, export's clean-up of its staging — passes
+  `{ ...helpers, signal: undefined }`.
 - **Secrets never ride argv.** WP passwords go through wp-cli `--prompt=…` on
   stdin; DB/Redis setup is SQL/commands on stdin with the admin password in env;
   argv is world-readable via /proc. `run()` also masks `--*pass*=` values in its
@@ -552,12 +695,21 @@ loopback; set to the box's IP to accept portal calls), `AGENT_PORT` (8787),
 - **Restore never trusts the archive.** Only real directories are copied out
   (`lstat` — a symlinked `site/htdocs` would copy e.g. /root into the web root);
   only `htdocs` + DB + cert files are used (never its nginx conf or a
-  `renewal.conf`); the table prefix must be a plain identifier; type/PHP from
+  `renewal.conf`); `db.sql` must be a regular file (`lstat` — a link or a
+  directory fails the restore: chown/chmod follow links and would hand the
+  link's target to the site's user) and is chowned/chmodded in the root-only
+  staging dir BEFORE it is handed to the site's `tmp/` (once there, the site
+  could swap what the name points at); the table prefix must be a plain
+  identifier; type/PHP from
   `wcloud-site.json` are checked against the allowed lists; tar extracts
   `--no-same-owner`. In-place restore downloads, decrypts and
   `gzip -t`s the archive BEFORE deleting the live site.
 - **Staging is private.** `makeStagingDir` (`mkdtemp`, 0700); archives are
   pre-created `O_EXCL` 0600 so a DB dump/keys are never world-readable in /tmp.
+  An archive's name is random on its own, never built from a name already in
+  /tmp (it is listable: a site that creates `<that name>.tar.gz` first makes
+  every export fail), and archives there are removed with `unlink`, never
+  recursively.
 - **Express 4 doesn't catch rejected async handlers** — one would crash the
   agent. `server.js` wraps `app.get/post/put/delete` so a rejection reaches the
   error handler (500 JSON) instead.
@@ -577,6 +729,10 @@ loopback; set to the box's IP to accept portal calls), `AGENT_PORT` (8787),
   the PHP location silently discarded every custom-rule header on PHP pages.
 - **Archive ops (export/import/backup/restore) share AGENT_BACKUP_TIMEOUT_MS** (12h)
   — export/import used to get the 20-minute default and large migrations died.
+  The import download has no time cap of its own, only stall detection (no
+  connection in 30 s, or under 1 KB/s for 2 min); the job's signal stops it.
+  The curl call is `quiet` because its URL carries the one-time export token
+  and `run()` prints the command line into the job log on failure.
 
 ---
 
