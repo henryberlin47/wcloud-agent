@@ -1,6 +1,7 @@
+import fs from 'node:fs/promises';
 import { run, pathExists } from './sys.js';
 import { fullchainPath, readSpec } from './sites.js';
-import { manualMarkerPath } from './acme.js';
+import { manualMarkerPath, findDomainConf } from './acme.js';
 
 // ============================================================
 //  certinfo.js — read live certificate state
@@ -8,9 +9,11 @@ import { manualMarkerPath } from './acme.js';
 // The cert on disk is the source of truth for a site's SSL state: nothing is
 // stored per-site, everything is parsed on demand with openssl.
 //
-// source:      none | letsencrypt | letsencrypt-manual | custom
-// auto_renew:  true only for letsencrypt (HTTP-01 via acme.sh, renewed by its cron).
-//              custom + manual-DNS certs lapse silently — the portal shows why.
+// source:      none | letsencrypt | letsencrypt-dns | letsencrypt-manual | custom
+// auto_renew:  true only when something renews it: letsencrypt with an HTTP-01
+//              entry in acme.sh (its cron) or letsencrypt-dns (the agent's
+//              renewer). Custom, manual-DNS and copied or pasted Let's Encrypt
+//              certs lapse silently — the portal shows why.
 
 // Parse subject/issuer/SAN/expiry from a PEM cert (quiet probe).
 // Returns null when the file is not a readable x509 cert.
@@ -53,12 +56,16 @@ export async function readSiteSsl(helpers, domain) {
   const manual = isLe && (await pathExists(manualMarkerPath(domain)));
   // letsencrypt-dns: issued + renewed through the Cloudflare API (acme.js).
   const source = isLe ? (spec?.sslDns === 'cloudflare' ? 'letsencrypt-dns' : manual ? 'letsencrypt-manual' : 'letsencrypt') : 'custom';
+  // acme.sh's cron only renews what it has an HTTP-01 (webroot) entry for. A
+  // Let's Encrypt cert copied from a backup or pasted has none.
+  const conf = source === 'letsencrypt' ? await findDomainConf(domain) : null;
+  const acmeRenews = !!conf && /^Le_Webroot='\//m.test(await fs.readFile(conf, 'utf8').catch(() => ''));
   return {
     ...base,
     // HTTPS turned off keeps the cert on disk (turning it back on is instant).
     enabled: !!spec?.ssl,
     source,
-    auto_renew: source === 'letsencrypt' || source === 'letsencrypt-dns',
+    auto_renew: (source === 'letsencrypt' && acmeRenews) || source === 'letsencrypt-dns',
     issuer: info.issuer,
     subject: info.subject,
     sans: info.sans,

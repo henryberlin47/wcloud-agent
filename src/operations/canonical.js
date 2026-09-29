@@ -10,6 +10,8 @@ import { readSiteSsl } from '../lib/certinfo.js';
 // The spec change re-renders the vhost (server_name + the 301 to the preferred
 // host) in one tested transaction. When www starts being served over HTTPS
 // with a Let's Encrypt cert that lacks it, the cert is re-issued to cover it;
+// when www is turned off, an auto-renewing cert is re-issued without it (its
+// renewal would fail once www's DNS record goes);
 // WordPress's address is re-pinned so nginx and WordPress can't redirect at
 // each other (see wp.pinWpUrls).
 // ============================================================
@@ -26,7 +28,7 @@ export async function runCanonical(job, helpers, p) {
 
   const www = `www.${domain}`;
   if (s.enableWww && s.ssl && (await pathExists(fullchainPath(domain))) && !(await certCovers(fullchainPath(domain), www))) {
-    if ((await readSiteSsl(helpers, domain)).source === 'letsencrypt') { // auto-renewing → ours to re-issue
+    if ((await readSiteSsl(helpers, domain)).source === 'letsencrypt') { // issued by Let's Encrypt over HTTP → ours to re-issue
       step(`Add ${www} to the certificate`);
       const r = await issueHttp(helpers, domain, { www: true });
       if (r.ok && r.www) ok(`Certificate now covers ${www}`);
@@ -39,6 +41,20 @@ export async function runCanonical(job, helpers, p) {
   if (s.type === 'wordpress') {
     step('Update the WordPress address');
     await syncWpAddress(helpers, s);
+  }
+  // www turned off: acme.sh renews with the names it saved, so a certificate
+  // that still lists www stops renewing once www's DNS record is gone. Only
+  // the one acme.sh renews over HTTP-01 — any other kind is not ours to replace.
+  // Last, and never fatal: the site already serves its new address, and a
+  // certificate request can take a minute.
+  if (!s.enableWww && s.ssl && (await pathExists(fullchainPath(domain))) && (await certCovers(fullchainPath(domain), www))) {
+    const cert = await readSiteSsl(helpers, domain);
+    if (cert.source === 'letsencrypt' && cert.auto_renew) {
+      step(`Remove ${www} from the certificate`);
+      const r = await issueHttp(helpers, domain, { www: false }).catch(() => ({ ok: false }));
+      if (r.ok) ok(`Certificate now covers ${domain} only`);
+      else warn(`Could not re-issue the certificate without ${www}. Keep ${www}'s DNS pointing here, or issue the certificate again from Manage SSL — otherwise its renewal will fail.`);
+    }
   }
 
   const shown = p.canonical === 'www' ? www : p.canonical === 'root' ? domain : `${domain} and ${www}`;

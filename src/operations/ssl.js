@@ -1,6 +1,6 @@
 import { logger } from '../lib/log.js';
 import { requireSpec, applySite, applySslConf, syncWpAddress, certDir } from '../lib/sites.js';
-import { issueHttp, issueDnsCloudflare, startManualDns, verifyManualDns, removeManualMarker } from '../lib/acme.js';
+import { issueHttp, issueDnsCloudflare, startManualDns, verifyManualDns, removeManualMarker, forgetAcmeDomain, clearChallenge } from '../lib/acme.js';
 import { checkCustomCert } from '../lib/certcheck.js';
 
 // ============================================================
@@ -17,12 +17,12 @@ import { checkCustomCert } from '../lib/certcheck.js';
 
 export async function runSsl(job, helpers, p) {
   const domain = p.domain;
-  await requireSpec(domain);
+  const s = await requireSpec(domain);
   switch (p.mode) {
     case 'off': return runSslOff(helpers, domain);
     case 'le-http': return runSslLeHttp(helpers, domain);
     case 'le-dns-manual': {
-      const state = await startManualDns(helpers, domain);
+      const state = await startManualDns(helpers, domain, { www: s.enableWww });
       job.result = { pending: true, txt_records: state.txt_records };
       return state;
     }
@@ -43,6 +43,7 @@ async function runSslOff(helpers, domain) {
   const { step, ok } = logger(helpers);
   step('Turn off HTTPS');
   const s = await requireSpec(domain);
+  await clearChallenge(domain); // a pending manual DNS verification would switch HTTPS back on
   if (!s.ssl) { ok(`HTTPS was already off for ${domain}`); return; }
   const next = { ...s, ssl: false };
   await applySite(helpers, next);
@@ -82,8 +83,12 @@ async function runSslCustom(helpers, domain, p) {
   // One transaction: if nginx rejects the new pair, the previous cert files
   // come back along with the config (installed 600 root:root in certDir).
   await applySslConf(helpers, domain, { certs: { fullchain: p.cert, key: p.key } });
+  // Only once the pair is in: acme.sh's cron must not renew a Let's Encrypt
+  // certificate over it (a rejected pair keeps the old one, still renewing).
+  await forgetAcmeDomain(helpers, domain);
   ok(`Installed in ${certDir(domain)}`);
   await removeManualMarker(domain);
+  await clearChallenge(domain); // a pending manual DNS verification is no longer wanted
   await syncWpAddress(helpers, await requireSpec(domain));
   done(`HTTPS is now using your certificate — ${domain}`);
 }
