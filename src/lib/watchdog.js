@@ -1,4 +1,5 @@
 import net from 'node:net';
+import os from 'node:os';
 import fs from 'node:fs/promises';
 import { run, withLock, lockBusy, pathExists } from './sys.js';
 import { installedPhp, fpmService, redisPing } from './stack.js';
@@ -87,6 +88,21 @@ async function checksFor() {
         const st = await fs.statfs('/');
         return st.bavail / st.blocks < 0.1 ? `${Math.round((st.bavail / st.blocks) * 100)}% free` : null;
       } },
+    // Warnings only: nothing to restart. The 5-minute load, so a short spike says nothing.
+    { key: 'cpu', label: 'CPU load', noHeal: true, probe: async () => null,
+      warn: async () => {
+        const cores = os.cpus().length || 1;
+        const load = os.loadavg()[1];
+        return load / cores >= 0.9 ? `${load.toFixed(1)} on ${cores} core${cores === 1 ? '' : 's'} for 5 minutes` : null;
+      } },
+    // MemAvailable counts memory the kernel can free (page cache), unlike "free".
+    { key: 'memory', label: 'Memory', noHeal: true, probe: async () => null,
+      warn: async () => {
+        const m = await fs.readFile('/proc/meminfo', 'utf8');
+        const kb = (k) => Number(m.match(new RegExp(`^${k}:\\s+(\\d+)`, 'm'))?.[1]);
+        const left = kb('MemAvailable') / kb('MemTotal');
+        return left < 0.1 ? `${Math.round((1 - left) * 100)}% used` : null;
+      } },
   );
   return list;
 }
@@ -153,7 +169,7 @@ export function checkNow() {
 
 export const snapshot = () => ({ enabled: WATCHDOG_MS > 0, intervalMs: WATCHDOG_MS, checkedAt: state.checkedAt, checks: state.checks, heals: state.heals.slice(0, 20) });
 
-/** { status: ok|warn|error|unknown, problems: [label: detail] } — for the portal's health sweep. */
+/** { status: ok|warn|error|unknown, problems: [label: detail], healed: [{ at, text }] } — for the portal's health sweep. */
 export function summary() {
   if (!state.checkedAt) return { status: 'unknown', problems: [] };
   const bad = state.checks.filter((c) => c.status === 'error');
@@ -161,6 +177,8 @@ export function summary() {
   return {
     status: bad.length ? 'error' : warn.length ? 'warn' : 'ok',
     problems: [...bad, ...warn].map((c) => `${c.label}: ${c.detail}`),
+    // What was down and is up again after a restart: never among the problems, so the portal can still tell.
+    healed: state.heals.filter((h) => h.ok).slice(0, 10).map((h) => ({ at: h.at, text: `${h.label}: ${h.problem} — restarted, healthy again` })),
     checkedAt: state.checkedAt,
   };
 }
