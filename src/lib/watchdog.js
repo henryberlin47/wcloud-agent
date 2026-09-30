@@ -5,6 +5,8 @@ import { run, withLock, lockBusy, pathExists } from './sys.js';
 import { installedPhp, fpmService, redisPing } from './stack.js';
 import { listSites } from './sites.js';
 
+const CPU_LOAD_WARN = Number(process.env.AGENT_CPU_LOAD_WARN || 5);
+
 // ============================================================
 //  watchdog.js — keep the server's stack healthy
 // ============================================================
@@ -88,12 +90,13 @@ async function checksFor() {
         const st = await fs.statfs('/');
         return st.bavail / st.blocks < 0.1 ? `${Math.round((st.bavail / st.blocks) * 100)}% free` : null;
       } },
-    // Warnings only: nothing to restart. The 5-minute load, so a short spike says nothing.
+    // Warnings only: nothing to restart. The 5-minute load, so a short spike says nothing;
+    // above AGENT_CPU_LOAD_WARN (default 5), whatever the number of cores.
     { key: 'cpu', label: 'CPU load', noHeal: true, probe: async () => null,
       warn: async () => {
         const cores = os.cpus().length || 1;
         const load = os.loadavg()[1];
-        return load / cores >= 0.9 ? `${load.toFixed(1)} on ${cores} core${cores === 1 ? '' : 's'} for 5 minutes` : null;
+        return load > CPU_LOAD_WARN ? `${load.toFixed(1)} on ${cores} core${cores === 1 ? '' : 's'} for 5 minutes` : null;
       } },
     // MemAvailable counts memory the kernel can free (page cache), unlike "free".
     { key: 'memory', label: 'Memory', noHeal: true, probe: async () => null,
