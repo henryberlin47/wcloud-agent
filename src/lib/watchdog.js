@@ -1,4 +1,5 @@
 import net from 'node:net';
+import tls from 'node:tls';
 import os from 'node:os';
 import fs from 'node:fs/promises';
 import { run, withLock, lockBusy, pathExists } from './sys.js';
@@ -48,12 +49,58 @@ const connects = (opts, ms = 3000) => new Promise((resolve) => {
   s.once('error', () => done(false));
 });
 
+// nginx can accept connections on its ports and still answer nothing: a site
+// then shows Cloudflare's 520 while "is the port open" says all is well. So
+// real requests, as up to SAMPLE of its sites (a different few each round):
+//   http   GET /.well-known/acme-challenge/… — answered by nginx itself (404);
+//   https  TLS with the site's name, then GET / — any status line is an answer
+//          (a slow PHP is PHP's problem: a timeout AFTER the handshake isn't
+//          counted). Reset, empty reply, failed handshake = no answer.
+// nginx is "not serving" only when NONE of them got an answer: one site's
+// broken certificate must not restart the web server for everyone.
+const SAMPLE = 3;
+const pick = (list, n) => [...list].sort(() => Math.random() - 0.5).slice(0, n);
+export const answers = (domain, secure, ms = 8000, port = secure ? 443 : 80) => new Promise((resolve) => {
+  let handshake = !secure;
+  const sock = secure
+    ? tls.connect({ host: '127.0.0.1', port, servername: domain, rejectUnauthorized: false }, () => { handshake = true; send(); })
+    : net.connect({ host: '127.0.0.1', port }, () => send());
+  let got = '';
+  const done = (ok) => { sock.destroy(); resolve(ok); };
+  const send = () => sock.write(`GET ${secure ? '/' : '/.well-known/acme-challenge/wcloud-probe'} HTTP/1.1\r\nHost: ${domain}\r\nUser-Agent: wcloud-watchdog\r\nConnection: close\r\n\r\n`);
+  sock.setTimeout(ms, () => done(handshake && secure)); // no status yet: only a stalled handshake (or plain HTTP) counts
+  sock.on('data', (d) => { got += d; if (/^HTTP\/1\.[01] \d{3}/.test(got)) done(true); });
+  sock.on('error', () => done(false));
+  sock.on('close', () => done(/^HTTP\/1\.[01] \d{3}/.test(got)));
+});
+async function nginxServes(sites) {
+  const live = sites.filter((s) => s.domain);
+  const https = pick(live.filter((s) => s.ssl), SAMPLE);
+  const http = pick(live.filter((s) => !s.ssl || !https.length), SAMPLE);
+  const tries = [...https.map((s) => [s.domain, true]), ...http.map((s) => [s.domain, false])];
+  if (!tries.length) return null; // no sites: the port check is all there is
+  const ok = await Promise.all(tries.map(([d, sec]) => answers(d, sec)));
+  if (ok.some(Boolean)) return null;
+  return `accepts connections but answers no request (tried ${tries.map(([d, sec]) => `${sec ? 'https' : 'http'}://${d}`).join(', ')})`;
+}
+
+// What nginx said before it is restarted: the restart clears the state that
+// shows why it stopped answering. Goes to the journal (portal: Agent log).
+async function nginxEvidence() {
+  const log = await run(H, 'tail', ['-n', '30', '/var/log/nginx/error.log'], { quiet: true, timeout: 10_000 }).catch(() => null);
+  const ps = await run(H, 'ps', ['-C', 'nginx', '-o', 'pid,stat,etime,rss,args'], { quiet: true, timeout: 10_000 }).catch(() => null);
+  return `--- nginx processes ---\n${ps?.stdout || '(none)'}--- last lines of /var/log/nginx/error.log ---\n${log?.stdout || '(unreadable)'}`;
+}
+
 // Each check: { key, label, unit?, heal: bool, probe: () => null | problem }
 async function checksFor() {
   const sites = await listSites();
   const list = [
     { key: 'nginx', label: 'Web server (nginx)', unit: 'nginx', lock: 'config',
-      probe: async () => (!(await unitActive('nginx')) ? 'not running' : !(await connects({ host: '127.0.0.1', port: 80 })) ? 'not answering on port 80' : null) },
+      probe: async () => (!(await unitActive('nginx')) ? 'not running'
+        : !(await connects({ host: '127.0.0.1', port: 80 })) ? 'not answering on port 80'
+        : nginxServes(sites)),
+      evidence: nginxEvidence },
   ];
   for (const v of await installedPhp()) {
     // Only sites whose pool is in place: one being deleted or moved between
@@ -130,6 +177,7 @@ async function heal(c, problem) {
   // restart that happens counts toward GIVE_UP.
   const restart = async () => {
     if (!(await c.probe())) return null;
+    if (c.evidence) console.error(`[watchdog] ${c.label}: ${problem} — before the restart:\n${await c.evidence().catch((e) => e.message)}`);
     recent.push(Date.now());
     restarts.set(c.key, recent);
     return run(H, 'systemctl', ['restart', c.unit], { quiet: true, timeout: 90_000 });
