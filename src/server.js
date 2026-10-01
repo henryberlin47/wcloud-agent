@@ -24,7 +24,7 @@ import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
 import { readAgentLog } from './lib/agentlog.js';
 import { startWatchdog, checkNow, snapshot, summary } from './lib/watchdog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
-import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning, listDatabases } from './lib/stack.js';
+import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning, ensureFileLimits, listDatabases } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard, syncCachePlugin, wantsHelper } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
@@ -709,6 +709,7 @@ app.use((err, req, res, next) => {
 // every site on update. One broken site never stops the others. Queued as a
 // job, so it never races an operation on the same site.
 async function reconcile(job, helpers) {
+  await ensureFileLimits(helpers).catch((e) => helpers.err(`Open-file limits: ${e.message}`));
   await ensurePhpTuning(helpers).catch((e) => helpers.err(`PHP tuning: ${e.message}`));
   for (const s of await listSites()) {
     try { await applySite(helpers, s); }

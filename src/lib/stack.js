@@ -122,6 +122,41 @@ async function writeOpcacheIni(v) {
 // Called at agent start: every installed version gets the current OPcache
 // settings (so existing servers pick up a change on the next agent update);
 // only versions whose file changed are reloaded.
+// nginx's master opens every site's two log files itself (and a second set
+// during a reload), and worker_rlimit_nofile only raises the WORKERS' limit: on
+// a server with a few hundred sites the master hit systemd's default of 1024 —
+// "Too many open files", reloads failed half-way and sites answered nothing
+// (Cloudflare 520) until nginx was restarted. PHP-FPM's master holds a socket
+// per pool and two pipes per child. Both get a systemd drop-in; a service that
+// still runs with the old limit is restarted once (nginx only after nginx -t).
+// ponytail: runs at agent start; a PHP version installed later gets it at the next start.
+const NOFILE = 65535;
+export async function ensureFileLimits(helpers) {
+  const { ok } = logger(helpers);
+  const units = ['nginx', ...(await installedPhp()).map(fpmService)];
+  const want = `# Managed by wcloud (agent lib/stack.js): every site's log files and sockets need far more than 1024.\n[Service]\nLimitNOFILE=${NOFILE}\n`;
+  let changed = false;
+  for (const u of units) {
+    const file = `/etc/systemd/system/${u}.service.d/wcloud-limits.conf`;
+    if ((await fs.readFile(file, 'utf8').catch(() => null)) === want) continue;
+    await fs.mkdir(`/etc/systemd/system/${u}.service.d`, { recursive: true });
+    await fs.writeFile(file, want, { mode: 0o644 });
+    changed = true;
+  }
+  if (changed) await run(helpers, 'systemctl', ['daemon-reload'], { quiet: true, timeout: 60_000 });
+  for (const u of units) {
+    const pid = (await run(helpers, 'systemctl', ['show', '-p', 'MainPID', '--value', u], { quiet: true, timeout: 15_000 })).stdout.trim();
+    const limits = pid && pid !== '0' ? await fs.readFile(`/proc/${pid}/limits`, 'utf8').catch(() => '') : '';
+    const soft = Number(limits.match(/^Max open files\s+(\d+)/m)?.[1]);
+    if (!soft || soft >= NOFILE) continue;
+    await withLock('config', async () => {
+      if (u === 'nginx' && (await run(helpers, 'nginx', ['-t'], { quiet: true, timeout: 30_000 })).code !== 0) return; // it would stay down
+      const r = await run(helpers, 'systemctl', ['restart', u], { quiet: true, timeout: 90_000 });
+      if (r.code === 0) ok(`${u}: open-file limit raised from ${soft} to ${NOFILE}`);
+    });
+  }
+}
+
 export async function ensurePhpTuning(helpers) {
   for (const v of await installedPhp()) {
     await withLock('config', async () => {
