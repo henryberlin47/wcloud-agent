@@ -29,6 +29,7 @@ import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuar
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
 import { createPmaLink } from './lib/pma.js';
+import { openTerminal, followTerminal, writeTerminal, resizeTerminal, closeTerminal } from './lib/terminal.js';
 import { listPlugins, searchPlugins } from './lib/plugins.js';
 import { siteTmp, fullchainPath } from './lib/sites.js';
 import { readSiteLog, LOG_TYPES } from './lib/sitelogs.js';
@@ -451,6 +452,33 @@ app.get('/api/sites/:domain/logs', siteParam, async (req, res) => {
 app.get('/api/health', async (req, res) => res.json(snapshot().checkedAt ? snapshot() : await checkNow()));
 app.post('/api/health/check', async (req, res) => res.json(await checkNow()));
 app.get('/api/stack', (req, res) => res.json(summary()));
+
+// Root terminal (lib/terminal.js) — the portal allows it to workspace owners.
+app.post('/api/terminal', (req, res) => {
+  try { res.json({ id: openTerminal(req.body || {}) }); }
+  catch (e) { res.status(e.status || 500).json({ error: 'terminal', message: e.message }); }
+});
+app.get('/api/terminal/:id/stream', (req, res) => {
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no' });
+  let ping, unsub;
+  const end = () => { clearInterval(ping); unsub?.(); };
+  unsub = followTerminal(req.params.id, {
+    data: (chunk) => res.write(`data: ${chunk.toString('base64')}\n\n`),
+    exit: (code) => { res.write(`event: exit\ndata: ${code ?? ''}\n\n`); res.end(); end(); },
+  });
+  if (!unsub) return res.status(404).json({ error: 'not_found', message: 'This terminal has ended.' });
+  res.flushHeaders?.();
+  ping = setInterval(() => res.write(': ping\n\n'), 25_000); // proxies (Cloudflare: 100 s) drop a silent stream
+  req.on('close', end);
+});
+app.post('/api/terminal/:id/input', (req, res) => {
+  const text = typeof req.body?.data === 'string' ? req.body.data : '';
+  if (text.length > 64 * 1024) return res.status(413).json({ error: 'too_large' });
+  if (!writeTerminal(req.params.id, text)) return res.status(404).json({ error: 'not_found', message: 'This terminal has ended.' });
+  res.json({ ok: true });
+});
+app.post('/api/terminal/:id/resize', async (req, res) => res.json({ ok: await resizeTerminal(req.params.id, req.body || {}) }));
+app.delete('/api/terminal/:id', (req, res) => res.json({ ok: closeTerminal(req.params.id) }));
 
 // Databases on this server, each with the site it belongs to (a site's
 // database is named after its Linux user) — null = no site uses it (left over).
