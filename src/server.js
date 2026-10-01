@@ -29,7 +29,7 @@ import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuar
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
 import { createPmaLink } from './lib/pma.js';
-import { openTerminal, followTerminal, writeTerminal, resizeTerminal, closeTerminal } from './lib/terminal.js';
+import { openTerminal, getTerminal, followTerminal, writeTerminal, resizeTerminal, closeTerminal } from './lib/terminal.js';
 import { listPlugins, searchPlugins } from './lib/plugins.js';
 import { siteTmp, fullchainPath } from './lib/sites.js';
 import { readSiteLog, LOG_TYPES } from './lib/sitelogs.js';
@@ -476,6 +476,14 @@ app.post('/api/terminal/:id/input', (req, res) => {
   if (text.length > 64 * 1024) return res.status(413).json({ error: 'too_large' });
   if (!writeTerminal(req.params.id, text)) return res.status(404).json({ error: 'not_found', message: 'This terminal has ended.' });
   res.json({ ok: true });
+});
+// Input as one long request: its body is written as the user types (the
+// portal's WebSocket relay) — no request per keystroke.
+app.post('/api/terminal/:id/stdin', (req, res) => {
+  if (!getTerminal(req.params.id)) return res.status(404).json({ error: 'not_found', message: 'This terminal has ended.' });
+  req.on('data', (chunk) => writeTerminal(req.params.id, chunk));
+  req.on('end', () => res.json({ ok: true }));
+  req.on('error', () => {});
 });
 app.post('/api/terminal/:id/resize', async (req, res) => res.json({ ok: await resizeTerminal(req.params.id, req.body || {}) }));
 app.delete('/api/terminal/:id', (req, res) => res.json({ ok: closeTerminal(req.params.id) }));
