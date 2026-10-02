@@ -611,6 +611,18 @@ app.get('/api/sites/:domain/ssl-challenge', async (req, res) => {
 // restart SIGTERMs us. Runs as root, so the origin/branch are hardcoded —
 // nothing from the request body ever reaches a shell.
 let selfUpdating = false;
+// Reboot the machine. Refused while a job runs (it would be cut off mid-way);
+// answered first, then the reboot 2 s later. The agent starts again on boot.
+app.post('/api/reboot', (req, res) => {
+  if (listJobs().some((j) => j.state === 'queued' || j.state === 'running')) {
+    return res.status(409).json({ ok: false, error: 'An operation is running on this server — reboot once it finishes.' });
+  }
+  if (selfUpdating) return res.status(409).json({ ok: false, error: 'The agent is updating — reboot once it finishes.' });
+  console.log(`[agent] reboot requested by the portal (${req.clientIp})`);
+  res.json({ ok: true });
+  setTimeout(() => run(NOOP_HELPERS, 'systemctl', ['reboot'], { quiet: true, timeout: 30_000 }).catch(() => {}), 2000);
+});
+
 app.post('/api/self-update', async (req, res) => {
   // The restart stops everything in the unit — a restore/delete/import would be
   // cut off mid-way (mysql, tar, wp-cli killed). ponytail: a job enqueued during the
