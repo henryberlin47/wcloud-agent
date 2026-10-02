@@ -281,11 +281,33 @@ systemctl enable --now nginx mariadb redis-server cron >/dev/null 2>&1 || true  
 
 # ------------------------------------------------------------
 step "Installing PHP $PHP_DEFAULT"
+# add-apt-repository asks Launchpad's API first (Python, IPv6 first): on a
+# server whose IPv6 has no route it times out — although apt itself works. The
+# same repository by hand: its signing key (checked against the fingerprint
+# Launchpad publishes for ~ondrej/php) and the source line.
+ONDREJ_FPR="B8DC7E53946656EFBCE4C1DD71DAEAAB4AD4CAB6"
+add_php_repo_by_hand() {
+  local codename key=/etc/apt/keyrings/ondrej-php.gpg tmp
+  codename=$(. /etc/os-release; echo "$VERSION_CODENAME")
+  tmp=$(mktemp)
+  curl -fsSL --retry 3 --max-time 60 "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x$ONDREJ_FPR" -o "$tmp" || { rm -f "$tmp"; return 1; }
+  # Only this exact key: a keyserver answer with anything else is refused.
+  gpg --show-keys --with-colons "$tmp" 2>/dev/null | grep -q "^fpr:::::::::$ONDREJ_FPR:" || { rm -f "$tmp"; return 1; }
+  mkdir -p /etc/apt/keyrings
+  gpg --dearmor < "$tmp" > "$key" && chmod 644 "$key"
+  rm -f "$tmp"
+  echo "deb [signed-by=$key] https://ppa.launchpadcontent.net/ondrej/php/ubuntu $codename main" > "/etc/apt/sources.list.d/ondrej-ubuntu-php-$codename.list"
+  apt_wait
+  apt-get -q -o DPkg::Lock::Timeout=600 update </dev/null >/dev/null
+}
 if ! grep -rqs "ondrej/php" /etc/apt/sources.list /etc/apt/sources.list.d/; then
   info "Adding the PHP package repository (ppa:ondrej/php)..."
   apt_wait
-  LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php </dev/null >/dev/null \
-    || die "Could not add the PHP package repository (ppa:ondrej/php)."
+  if ! LC_ALL=C.UTF-8 timeout 120 add-apt-repository -y ppa:ondrej/php </dev/null >/dev/null 2>&1; then
+    warn "add-apt-repository couldn't reach Launchpad — adding the repository directly."
+    add_php_repo_by_hand || die "Could not add the PHP package repository (ppa:ondrej/php)."
+  fi
+  ok "PHP package repository added."
 fi
 PHP_PKGS=(); for e in $PHP_EXTS; do PHP_PKGS+=("php$PHP_DEFAULT-$e"); done
 apt_install "${PHP_PKGS[@]}" || die "Installing PHP $PHP_DEFAULT failed — see the output above."
