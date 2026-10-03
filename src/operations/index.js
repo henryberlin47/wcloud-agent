@@ -1,3 +1,4 @@
+import { runPermissions } from './permissions.js';
 import { runDelete } from './delete.js';
 import { runUpdate } from './update.js';
 import { runDeploy } from './deploy.js';
@@ -511,6 +512,24 @@ const canonicalOp = {
 // ============================================================
 //  purge — clear a site's WP Rocket + object caches
 // ============================================================
+// ============================================================
+//  permissions — owner and modes of a site's files back to wcloud's layout
+// ============================================================
+const permissionsOp = {
+  name: 'permissions',
+  timeout: 60 * 60_000, // a site with many files
+  // params: { domain }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain } };
+  },
+  async run(job, helpers, p) {
+    await runPermissions(job, helpers, p);
+  },
+};
+
 const purge = {
   name: 'purge',
   // params: { domain, only?: 'cloudflare' }
@@ -716,7 +735,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { deploy, php: phpOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { permissions: permissionsOp, deploy, php: phpOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

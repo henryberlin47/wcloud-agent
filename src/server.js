@@ -29,6 +29,7 @@ import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuar
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
 import { createPmaLink } from './lib/pma.js';
+import { fixSiteStructure } from './operations/permissions.js';
 import { openTerminal, getTerminal, followTerminal, writeTerminal, resizeTerminal, closeTerminal } from './lib/terminal.js';
 import { listPlugins, searchPlugins } from './lib/plugins.js';
 import { siteTmp, fullchainPath } from './lib/sites.js';
@@ -760,6 +761,7 @@ async function reconcile(job, helpers) {
   await ensureFileLimits(helpers).catch((e) => helpers.err(`Open-file limits: ${e.message}`));
   await ensurePhpTuning(helpers).catch((e) => helpers.err(`PHP tuning: ${e.message}`));
   for (const s of await listSites()) {
+    await fixSiteStructure(s).catch((e) => helpers.err(`Folder permissions of ${s.domain}: ${e.message}`));
     try { await applySite(helpers, s); }
     catch (e) { helpers.err(`Could not re-apply ${s.domain}: ${e.message}`); }
     await syncLiteSpeedGuard(helpers, s).catch((e) => helpers.err(`LiteSpeed Cache guard on ${s.domain}: ${e.message}`));
