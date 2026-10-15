@@ -211,11 +211,41 @@ export function checkNow() {
       else if (busy()) out.push({ key: c.key, label: c.label, status: 'warn', detail: `${problem} — a change is in progress, checking again next round` });
       else out.push({ key: c.key, label: c.label, ...(await heal(c, problem)) });
     }
+    // Which ones the portal may restart by hand (a service, not a measurement).
+    const units = new Set((await checksFor()).filter((c) => c.unit && !c.noHeal).map((c) => c.key));
+    for (const o of out) o.restart = units.has(o.key);
     state.checks = out;
     state.checkedAt = new Date().toISOString();
     return snapshot();
   })().finally(() => { running = null; });
   return running;
+}
+
+/**
+ * Restart one service on request (the portal's Restart button) — whatever its
+ * state. nginx only after nginx -t passes (a restart with a broken config would
+ * leave it down); nginx and PHP-FPM wait for a config change in progress. The
+ * restart is listed with the repairs; the checks are run again after it.
+ */
+export async function restartService(key) {
+  const c = (await checksFor()).find((x) => x.key === key && x.unit && !x.noHeal);
+  if (!c) return { ok: false, status: 404, error: `No service "${key}" on this server.` };
+  if (c.key === 'nginx') {
+    const t = await run(H, 'nginx', ['-t'], { quiet: true, timeout: 30_000 });
+    if (t.code !== 0) {
+      const why = `${t.stderr}\n${t.stdout}`.split('\n').find((l) => /\[emerg\]/.test(l))?.replace(/^.*\[emerg\]\s*\d+#\d+:\s*/, '') || 'its config test fails';
+      return { ok: false, status: 409, error: `nginx was not restarted: ${why.slice(0, 200)}. Fix the configuration first — a restart now would leave every site down.` };
+    }
+  }
+  const restart = () => run(H, 'systemctl', ['restart', c.unit], { quiet: true, timeout: 120_000 });
+  const r = c.lock ? await withLock(c.lock, restart) : await restart();
+  await new Promise((res) => setTimeout(res, 2000));
+  const after = r.code === 0 ? await c.probe().catch((e) => `check failed (${e.message})`) : `restart failed: ${(r.stderr || r.stdout || '').trim().split('\n').pop()}`;
+  // manual: listed with the repairs, but not a repair to alert about (summary).
+  state.heals.unshift({ at: new Date().toISOString(), key: c.key, label: c.label, problem: 'restarted from the portal', ok: !after, detail: after ? `still ${after}` : 'running again', manual: true });
+  state.heals.length = Math.min(state.heals.length, 50);
+  console.log(`[watchdog] ${c.label}: restarted from the portal → ${after || 'healthy'}`);
+  return { ok: !after, label: c.label, detail: after || null, health: await checkNow() };
 }
 
 export const snapshot = () => ({ enabled: WATCHDOG_MS > 0, intervalMs: WATCHDOG_MS, checkedAt: state.checkedAt, checks: state.checks, heals: state.heals.slice(0, 20) });
@@ -229,7 +259,7 @@ export function summary() {
     status: bad.length ? 'error' : warn.length ? 'warn' : 'ok',
     problems: [...bad, ...warn].map((c) => `${c.label}: ${c.detail}`),
     // What was down and is up again after a restart: never among the problems, so the portal can still tell.
-    healed: state.heals.filter((h) => h.ok).slice(0, 10).map((h) => ({ at: h.at, text: `${h.label}: ${h.problem} — restarted, healthy again` })),
+    healed: state.heals.filter((h) => h.ok && !h.manual).slice(0, 10).map((h) => ({ at: h.at, text: `${h.label}: ${h.problem} — restarted, healthy again` })),
     checkedAt: state.checkedAt,
   };
 }

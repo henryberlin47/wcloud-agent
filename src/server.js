@@ -22,7 +22,7 @@ import { readSiteSsl } from './lib/certinfo.js';
 import { readChallenge, startDnsRenewer } from './lib/acme.js';
 import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
 import { readAgentLog } from './lib/agentlog.js';
-import { startWatchdog, checkNow, snapshot, summary } from './lib/watchdog.js';
+import { startWatchdog, checkNow, snapshot, summary, restartService } from './lib/watchdog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning, ensureFileLimits, listDatabases } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard, syncCachePlugin, wantsHelper } from './lib/cache.js';
@@ -453,6 +453,10 @@ app.get('/api/sites/:domain/logs', siteParam, async (req, res) => {
 app.get('/api/health', async (req, res) => res.json(snapshot().checkedAt ? snapshot() : await checkNow()));
 app.post('/api/health/check', async (req, res) => res.json(await checkNow()));
 app.get('/api/stack', (req, res) => res.json(summary()));
+app.post('/api/services/:key/restart', async (req, res) => {
+  const r = await restartService(String(req.params.key || '').slice(0, 40));
+  res.status(r.status || 200).json(r);
+});
 
 // Root terminal (lib/terminal.js) — the portal allows it to workspace owners.
 app.post('/api/terminal', (req, res) => {
