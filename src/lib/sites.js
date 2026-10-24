@@ -8,6 +8,7 @@ import { setupWordPress, pinWpUrls } from './wp.js';
 import { ensureRealIpConf } from './realip.js';
 import { renderCron, cronFilePath, cronLogPath, ensureWrappers } from './cron.js';
 import { poolLines, nginxLimits, phpSettingsOf, fpmOf, PHP_DEFAULTS, FPM_DEFAULTS } from './phpsettings.js';
+import { securityFiles, securityServerLines, securityPhpLines, securityOf, SECURITY_DEFAULTS } from './security.js';
 
 // ============================================================
 //  sites.js — the site model: one spec file → everything else
@@ -178,7 +179,7 @@ export const publicSpec = (s) => ({
   realIp: !!s.realIp, redirects: Array.isArray(s.redirects) ? s.redirects : [], sslDns: s.sslDns || null,
   domainRedirect: s.domainRedirect || null,
   crons: Array.isArray(s.crons) ? s.crons : [], wpCron: s.wpCron === 'server' ? 'server' : 'wordpress',
-  wpCronEvery: s.wpCronEvery || 5, cfCache: !!s.cfCache,
+  wpCronEvery: s.wpCronEvery || 5, cfCache: !!s.cfCache, security: securityOf(s), securityDefaults: SECURITY_DEFAULTS,
   ...(s.type === 'wordpress' ? { phpSettings: phpSettingsOf(s), phpDefaults: PHP_DEFAULTS, fpm: fpmOf(s), fpmDefaults: FPM_DEFAULTS } : {}),
   created_at: s.created_at,
 });
@@ -201,12 +202,13 @@ function cacheSkipRules() {
   ];
 }
 
-function siteBody(s) {
+function siteBody(s, https) {
   const d = s.domain;
   const common = [
     `root ${webRoot(d)};`,
     `access_log /var/log/nginx/${d}.access.log;`,
-    `error_log /var/log/nginx/${d}.error.log;`,
+    // The firewall's "would block" warnings are info-level lines (security.waf = detect).
+    `error_log /var/log/nginx/${d}.error.log${securityOf(s).waf === 'detect' ? ' info' : ''};`,
     '',
     ...(s.realIp ? ['# Real visitor IPs behind Cloudflare (trusted only from Cloudflare\'s ranges).', `include ${REALIP_CONF};`] : []),
     '# Custom rules for this site (root-owned; not overwritten by wcloud).',
@@ -214,6 +216,8 @@ function siteBody(s) {
     '',
     ...redirectLocations(s),
     'location ~ /\\.(?!well-known/) { deny all; }',
+    // Before the PHP location: regex locations match in the order they appear.
+    ...securityServerLines(s, { https }),
   ];
   const assets = (fallback) =>
     `location ~* \\.(?:css|js|mjs|map|jpe?g|gif|png|webp|avif|svg|ico|woff2?|ttf|otf|eot|mp4|webm|pdf)$ { expires 30d; access_log off; log_not_found off; try_files $uri ${fallback}; }`;
@@ -259,6 +263,7 @@ function siteBody(s) {
     '    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;',
     `    fastcgi_pass unix:${sockPath(d)};`,
     `    fastcgi_read_timeout ${lim.readTimeout}s;`,
+    ...securityPhpLines(s),
     '    fastcgi_buffers 16 16k;',
     '    fastcgi_buffer_size 32k;',
     ...(mode === 'fastcgi' ? [
@@ -323,9 +328,9 @@ export function renderVhost(s, { https }) {
       dr ? `location / { return ${dr.code} ${domainRedirectTarget(dr)}; }` : `location / { return 301 https://${canon || '$host'}$request_uri; }`]));
     out.push(server(['listen 443 ssl http2;', 'listen [::]:443 ssl http2;', names,
       `ssl_certificate     ${fullchainPath(d)};`, `ssl_certificate_key ${keyPath(d)};`, '',
-      ...(dr ? [acme, ...redirectBody] : [...toCanon('https'), ...siteBody(s)])]));
+      ...(dr ? [acme, ...redirectBody] : [...toCanon('https'), ...siteBody(s, true)])]));
   } else {
-    out.push(server(['listen 80;', 'listen [::]:80;', names, acme, '', ...(dr ? redirectBody : [...toCanon('http'), ...siteBody(s)])]));
+    out.push(server(['listen 80;', 'listen [::]:80;', names, acme, '', ...(dr ? redirectBody : [...toCanon('http'), ...siteBody(s, false)])]));
   }
   return out.join('\n\n') + '\n';
 }
@@ -412,6 +417,8 @@ async function applySiteNow(helpers, s, { certs, prevPhp } = {}) {
   if (s.php) await stage(poolPath(d, s.php), renderPool(s));
   if (prevPhp && prevPhp !== s.php) await stage(poolPath(d, prevPhp), null);
   await stage(cronFilePath(d), cron); // null = nothing scheduled → no file
+  // Rate-limit zones, visitor-check script, firewall rules (siteconfig installed the packages).
+  for (const [path, content] of securityFiles(s)) await stage(path, content);
 
   const changed = edits.filter((e) => e.before !== e.after);
   if (!changed.length) return { changed: false };

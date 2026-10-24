@@ -1,3 +1,4 @@
+import { cleanSecurity } from '../lib/security.js';
 import { runPermissions } from './permissions.js';
 import { runDelete } from './delete.js';
 import { runUpdate } from './update.js';
@@ -10,7 +11,7 @@ import { runExport } from './export.js';
 import { runImport } from './import.js';
 import { runBackup } from './backup.js';
 import { runRestore } from './restore.js';
-import { runPhp } from './php.js';
+import { runPhp, runPhpUpdate } from './php.js';
 import { runPlugin } from './plugin.js';
 import { runCache } from './cache.js';
 import { runIndexing } from './indexing.js';
@@ -161,6 +162,16 @@ const phpOp = {
   },
 };
 
+const phpUpdateOp = {
+  name: 'phpupdate',
+  timeout: 40 * 60_000, // apt on a slow mirror
+  // params: {} — the whole server (php.js runPhpUpdate)
+  validate() { return { ok: true, errors: [], clean: {} }; },
+  async run(job, helpers) {
+    await runPhpUpdate(job, helpers);
+  },
+};
+
 // ============================================================
 //  plugin — manage a WordPress site's plugins (see plugin.js)
 // ============================================================
@@ -260,6 +271,7 @@ const siteconfigOp = {
   name: 'siteconfig',
   // params: { domain, realIp?: boolean, redirects?: [{ from, to, code, regex, keepQuery }], domainRedirect?: { to, code, keepPath } | null,
   //          phpSettings?: { memory_limit, … }, fpm?: { pm, max_children, … } } (whole sets; lib/phpsettings.js)
+  //          security?: { hardening?, headers?, hsts?, xmlrpc?, challenge?, waf? } (lib/security.js; merged into the site's)
   validate(p = {}) {
     p = sanitize(p);
     const errors = [];
@@ -285,7 +297,11 @@ const siteconfigOp = {
       const r = cleanFpm(p.fpm);
       if (r.error) errors.push(r.error); else clean.fpm = r.value;
     }
-    if (clean.realIp == null && clean.redirects == null && clean.domainRedirect === undefined && !clean.phpSettings && !clean.fpm) errors.push('nothing to change');
+    if (p.security != null) {
+      const r = cleanSecurity(p.security);
+      if (r.error) errors.push(r.error); else clean.security = r.value;
+    }
+    if (clean.realIp == null && clean.redirects == null && clean.domainRedirect === undefined && !clean.phpSettings && !clean.fpm && !clean.security) errors.push('nothing to change');
     return { ok: errors.length === 0, errors, clean };
   },
   async run(job, helpers, p) {
@@ -735,7 +751,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { permissions: permissionsOp, deploy, php: phpOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { permissions: permissionsOp, deploy, php: phpOp, phpupdate: phpUpdateOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

@@ -65,6 +65,34 @@ export async function ensurePhp(helpers, v) {
   ok(`PHP ${v} installed`);
 }
 
+// A version's PHP-FPM package as apt sees it: { installed, candidate } full
+// package versions (8.3.36-1+ubuntu24.04.1+deb.sury.org+1), null when unknown.
+// `candidate` is newer only after apt's lists were refreshed (apt-daily does it daily).
+export async function phpPackageVersions(helpers, v) {
+  const r = await run(helpers, 'apt-cache', ['policy', `php${v}-fpm`], { quiet: true, timeout: 30_000 });
+  const ver = (k) => (r.stdout.match(new RegExp(`${k}:\\s*(\\d\\S*)`)) || [])[1] || null;
+  return { installed: ver('Installed'), candidate: ver('Candidate') };
+}
+// "8.3.36-1+ubuntu…" → "8.3.36"
+export const phpPatch = (pkgVersion) => (String(pkgVersion || '').match(/^\d+\.\d+\.\d+/) || [null])[0];
+
+// Every installed php* package (all versions, extensions, php-common) upgraded
+// to the newest the PPA has — security releases. Nothing new is installed
+// except dependencies the upgrades need.
+export async function upgradePhpPackages(helpers) {
+  return withLock('apt', async () => {
+    await run(helpers, 'dpkg', ['--force-confdef', '--force-confold', '--configure', '-a'], { env: APT_ENV, timeout: 300_000 });
+    const up = await run(helpers, 'apt-get', [...APT_LOCK, 'update', '-qq'], { env: APT_ENV, timeout: 300_000 });
+    if (up.code !== 0) throw new Error('apt could not refresh its package lists (see the log above).');
+    const q = await run(helpers, 'dpkg-query', ['-W', '-f=${db:Status-Status} ${Package}\\n', 'php*'], { quiet: true, timeout: 30_000 });
+    const pkgs = q.stdout.split('\n').filter((l) => l.startsWith('installed ')).map((l) => l.slice(10).trim()).filter(Boolean);
+    if (!pkgs.length) return;
+    const r = await run(helpers, 'apt-get', [...APT_LOCK, 'install', '--only-upgrade', '-y', '-q',
+      '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold', ...pkgs], { env: APT_ENV, timeout: 1_800_000 });
+    if (r.code !== 0) throw new Error('The PHP packages could not be upgraded (see the log above).');
+  });
+}
+
 // The package's default `www` pool runs as www-data — the group that can read
 // every site. Nothing may use it, but php-fpm refuses to start with zero pools,
 // so it's replaced by an inert one: nobody, root-only socket, no idle workers.

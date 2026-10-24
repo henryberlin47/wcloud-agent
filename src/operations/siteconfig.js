@@ -1,3 +1,4 @@
+import { securityOf, ensureChallenge, ensureWaf } from '../lib/security.js';
 import { logger } from '../lib/log.js';
 import { requireSpec, applySite } from '../lib/sites.js';
 import { saveRule, deleteRule } from '../lib/nginxrules.js';
@@ -33,6 +34,17 @@ export async function runSiteconfig(job, helpers, p) {
     if (s.type !== 'wordpress') throw new Error(`${p.domain} is a static site — it doesn't run PHP.`);
     if (p.phpSettings) { step('Save the PHP settings'); next.phpSettings = p.phpSettings; }
     if (p.fpm) { step('Save the PHP-FPM process settings'); next.fpm = p.fpm; }
+  }
+  if (p.security) {
+    const sec = { ...securityOf(s), ...p.security };
+    step('Save the security settings');
+    // The modules a setting needs are installed first (Ubuntu 24.04 only).
+    if (sec.challenge !== 'off') await ensureChallenge(helpers);
+    if (sec.waf !== 'off') await ensureWaf(helpers);
+    next.security = sec;
+    // The pass is bound to the visitor's IP: behind Cloudflare without real IPs
+    // that is a changing edge address and visitors would be checked again and again.
+    if (sec.challenge !== 'off' && !next.realIp) { next.realIp = true; ok('Real visitor IPs turned on (the visitor check needs them behind Cloudflare)'); }
   }
   await applySite(helpers, next);
   ok(p.phpSettings || p.fpm ? 'PHP-FPM and nginx accepted it and were reloaded' : 'Web server updated');

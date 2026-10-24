@@ -24,12 +24,13 @@ import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
 import { readAgentLog } from './lib/agentlog.js';
 import { startWatchdog, checkNow, snapshot, summary, restartService } from './lib/watchdog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
-import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, ensurePhpTuning, ensureFileLimits, listDatabases } from './lib/stack.js';
+import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, phpPackageVersions, phpPatch, ensurePhpTuning, ensureFileLimits, listDatabases } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard, syncCachePlugin, wantsHelper } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
 import { createPmaLink } from './lib/pma.js';
 import { fixSiteStructure } from './operations/permissions.js';
+import { securityAvailable } from './lib/security.js';
 import { openTerminal, getTerminal, followTerminal, writeTerminal, resizeTerminal, closeTerminal } from './lib/terminal.js';
 import { listPlugins, searchPlugins } from './lib/plugins.js';
 import { siteTmp, fullchainPath } from './lib/sites.js';
@@ -182,11 +183,12 @@ app.get('/api/info', async (req, res) => {
 
     // PHP: every installed version with its FPM status; the offered list lets
     // the portal show what a site can switch to.
-    info.php = [];
-    for (const v of await installedPhp()) {
-      const st = await run(helpers, 'systemctl', ['is-active', fpmService(v)], { quiet: true, timeout: 10000 });
-      info.php.push({ version: v, status: st.stdout.trim() === 'active' ? 'active' : 'inactive' });
-    }
+    // patch / latest: the installed release and the newest apt knows (Update PHP).
+    info.php = await Promise.all((await installedPhp()).map(async (v) => {
+      const [st, pkg] = await Promise.all([run(helpers, 'systemctl', ['is-active', fpmService(v)], { quiet: true, timeout: 10000 }), phpPackageVersions(helpers, v)]);
+      return { version: v, status: st.stdout.trim() === 'active' ? 'active' : 'inactive',
+        patch: phpPatch(pkg.installed), latest: pkg.candidate && pkg.candidate !== pkg.installed ? phpPatch(pkg.candidate) : null };
+    }));
     info.phpOffered = PHP_VERSIONS;
     info.phpDefault = DEFAULT_PHP;
 
@@ -258,6 +260,9 @@ async function siteParam(req, res, next) {
 // --- one site's settings (type, PHP version, www, HTTPS) ----------------------
 app.get('/api/sites/:domain', siteParam, async (req, res) =>
   res.json({ ...publicSpec(req.site), objectCache: await objectCacheActive(req.site) }));
+
+// What the server can offer in a site's Security tab (lib/security.js).
+app.get('/api/security', async (req, res) => res.json(await securityAvailable()));
 
 // --- start an operation -----------------------------------------------------
 // POST /api/op/:type   body = operation params
