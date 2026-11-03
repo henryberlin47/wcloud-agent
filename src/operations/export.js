@@ -61,7 +61,7 @@ export async function buildSiteArchive(helpers, domain, opts = {}) {
 }
 
 // The steps of buildSiteArchive, which cleans up after a throw from any of them.
-async function packSite(helpers, domain, s, { tmpDir, dump, archivePath, encryptedPath, includeSsl = false, encryptKey = '', nested = false }) {
+async function packSite(helpers, domain, s, { tmpDir, dump, archivePath, encryptedPath, includeSsl = false, encryptKey = '', nested = false, stageOnly = false }) {
   const { step, ok } = logger(helpers, { nested });
   // Type + PHP version (+ whether the object cache was on) travel with the
   // archive, so a restore rebuilds the same site.
@@ -141,6 +141,9 @@ async function packSite(helpers, domain, s, { tmpDir, dump, archivePath, encrypt
     ok('Certificates copied');
   }
 
+  // Same-server copy: the staging dir itself is handed to the import.
+  if (stageOnly) return { dir: tmpDir };
+
   // 4) Create tarball.
   step('Compress everything into one archive');
   await createPrivateFile(archivePath);
@@ -173,10 +176,38 @@ async function packSite(helpers, domain, s, { tmpDir, dump, archivePath, encrypt
   return { path: encryptKey ? encryptedPath : archivePath };
 }
 
-// params: { domain, includeSsl: boolean, encryptKey: string }
+// Same-server copies: staging dirs (root-only, 0700) waiting for their import,
+// dir → cleanup timer. Only a dir in here is accepted by import (localDir).
+const localDirs = new Map();
+const LOCAL_DIR_TTL = 12 * 3600_000;
+export const isLocalDir = (dir) => localDirs.has(dir);
+/** The import takes the dir over (and its cleanup). False when it is not (any more) ours. */
+export function takeLocalDir(dir) {
+  if (!localDirs.has(dir)) return false;
+  clearTimeout(localDirs.get(dir));
+  localDirs.delete(dir);
+  return true;
+}
+
+// params: { domain, includeSsl: boolean, encryptKey: string, local?: boolean }
+// local: the import runs on this same server — no archive, no compression, no
+// encryption (nothing leaves the machine): the staging dir is handed over.
 export async function runExport(job, helpers, p) {
   const { log, ok } = logger(helpers);
   const domain = p.domain;
+
+  if (p.local) {
+    const { dir } = await buildSiteArchive(helpers, domain, { includeSsl: p.includeSsl, stageOnly: true });
+    // Never imported (portal gone, job cancelled): removed after a while.
+    localDirs.set(dir, setTimeout(() => {
+      localDirs.delete(dir);
+      run({ log() {}, err() {} }, 'rm', ['-rf', '--', dir]).catch(() => {});
+    }, LOCAL_DIR_TTL).unref());
+    job.result = { localDir: dir };
+    ok('Export ready — same server, no archive needed');
+    log(`Export completed: ${domain}`);
+    return;
+  }
 
   const { path: finalPath } = await buildSiteArchive(helpers, domain, {
     includeSsl: p.includeSsl,

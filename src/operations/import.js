@@ -14,6 +14,7 @@ import { cleanJob, fitsCron, CRON_MAX, WP_CRON_EVERY } from '../lib/cron.js';
 import { cleanPhpSettings, cleanFpm } from '../lib/phpsettings.js';
 import { saveRule, deleteRule } from '../lib/nginxrules.js';
 import { checkCustomCert } from '../lib/certcheck.js';
+import { takeLocalDir } from './export.js';
 
 // The custom nginx rule that keeps a WordPress site closed while its database
 // is being restored. Never one of the site's own rules (restore.js skips it).
@@ -83,6 +84,17 @@ export async function runImport(job, helpers, p) {
     throw new Error(`${domain} already exists on this server. Delete it first, or choose a different domain.`);
   }
 
+  // Same server: the export's staging dir, already unpacked (export.js local).
+  if (p.localDir) {
+    if (!takeLocalDir(p.localDir)) throw new Error('The copy prepared on this server is gone (the agent restarted?) — run the clone again.');
+    await runRestoreFromLocal(job, helpers, {
+      tmpDir: p.localDir, domain, sourceDomain, unpacked: true,
+      includeSsl: p.includeSsl, issueSsl: p.issueSsl,
+      canonical: p.canonical, enableWww: p.enableWww,
+    });
+    return;
+  }
+
   const tmpDir = await makeStagingDir(helpers, 'import');
   try {
     // 1) Fetch archive to `${tmpDir}/export.tar.gz.enc` (or copy a local one).
@@ -147,24 +159,26 @@ export async function runRestoreFromLocal(job, helpers, {
   tmpDir, domain, sourceDomain,
   includeSsl = false, issueSsl = true, encryptKey = '', canonical = 'none', enableWww = true,
   cfToken = null, cfZoneId = null,
-  nested = false,
+  nested = false, unpacked = false, // unpacked: tmpDir is a same-server export's staging dir
 }) {
   const { log, step, ok, warn, err, skip } = logger(helpers, { nested });
   const domainChanged = sourceDomain !== domain;
   let siteCreated = false;
 
   try {
-    await prepareArchive(helpers, tmpDir, encryptKey, { step, ok });
+    if (!unpacked) {
+      await prepareArchive(helpers, tmpDir, encryptKey, { step, ok });
 
-    // --no-same-owner: entries land root-owned regardless of the uids recorded
-    // in a (possibly foreign) archive.
-    step('Unpack the archive');
-    const extractR = await run(helpers, 'tar', ['xzf', `${tmpDir}/export.tar.gz`, '--no-same-owner', '-C', tmpDir]);
-    if (extractR.code !== 0) {
-      throw new Error('The archive could not be unpacked — the file may be incomplete or corrupted.');
+      // --no-same-owner: entries land root-owned regardless of the uids recorded
+      // in a (possibly foreign) archive.
+      step('Unpack the archive');
+      const extractR = await run(helpers, 'tar', ['xzf', `${tmpDir}/export.tar.gz`, '--no-same-owner', '-C', tmpDir]);
+      if (extractR.code !== 0) {
+        throw new Error('The archive could not be unpacked — the file may be incomplete or corrupted.');
+      }
+      await removePath(`${tmpDir}/export.tar.gz`);
+      ok('Archive unpacked');
     }
-    await removePath(`${tmpDir}/export.tar.gz`);
-    ok('Archive unpacked');
 
     // What kind of site this was. Archives made before site types existed are
     // WordPress; values are checked, never trusted.
@@ -214,7 +228,10 @@ export async function runRestoreFromLocal(job, helpers, {
       const from = (await isRealDir(srcHtdocs)) ? srcHtdocs : srcSite;
       // createSite's placeholder must not outlive a restore (it would win over index.htm).
       if (type === 'static') await removePath(`${dest}/index.html`);
-      await mustRun(helpers, 'cp', ['-a', `${from}/.`, dest], 'Copying the site files');
+      // Same server: hard links out of staging (instant; staging is removed
+      // afterwards, so the site ends up the only owner). Another filesystem → a copy.
+      const linked = unpacked && (await run(helpers, 'cp', ['-al', `${from}/.`, dest], { quiet: true })).code === 0;
+      if (!linked) await mustRun(helpers, 'cp', ['-a', `${from}/.`, dest], 'Copying the site files');
       // The site keeps its own wp-config.php (non-standard sources leak one in).
       if (type === 'wordpress') await removePath(`${dest}/wp-config.php`);
       // The source's uids mean nothing here. (-R does not follow symlinks, so a

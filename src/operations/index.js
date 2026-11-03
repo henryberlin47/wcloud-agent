@@ -7,7 +7,7 @@ import { runSsl, runSslDnsVerify } from './ssl.js';
 import { runCanonical } from './canonical.js';
 import { runPurge } from './purge.js';
 import { runResetPassword } from './resetPassword.js';
-import { runExport } from './export.js';
+import { runExport, isLocalDir } from './export.js';
 import { runImport } from './import.js';
 import { runBackup } from './backup.js';
 import { runRestore } from './restore.js';
@@ -592,7 +592,7 @@ const BACKUP_TIMEOUT_MS = parseInt(process.env.AGENT_BACKUP_TIMEOUT_MS || String
 const exportOp = {
   name: 'export',
   timeout: BACKUP_TIMEOUT_MS,
-  // params: { domain, includeSsl?: boolean, encryptKey?: string }
+  // params: { domain, includeSsl?: boolean, encryptKey?: string, local?: boolean }
   validate(p = {}) {
     p = sanitize(p);
     const errors = [];
@@ -600,7 +600,7 @@ const exportOp = {
     return {
       ok: errors.length === 0,
       errors,
-      clean: { domain: p.domain, includeSsl: p.includeSsl === true, encryptKey: p.encryptKey || '' },
+      clean: { domain: p.domain, includeSsl: p.includeSsl === true, encryptKey: p.encryptKey || '', local: p.local === true },
     };
   },
   async run(job, helpers, p) {
@@ -620,11 +620,14 @@ const importOp = {
     if (typeof out.domain === 'string') out.domain = normDomain(out.domain);
     if (typeof out.sourceDomain === 'string') out.sourceDomain = normDomain(out.sourceDomain);
     const errors = [];
+    // localDir: a same-server export's staging dir — only one this agent made
+    // and still holds (export.js); it is read and then removed as root.
+    if (out.localDir != null && out.localDir !== '' && !isLocalDir(out.localDir)) errors.push('localDir must be an export prepared by this agent');
     // sourceUrl reaches `curl`. Anything but http(s) turns this into a local-file
     // read or an internal-network probe, so the scheme is checked here and curl
     // is additionally pinned to http/https (including across redirects) in
     // import.js — validate() is the boundary, the flag is the belt.
-    if (!out.sourceUrl || typeof out.sourceUrl !== 'string') {
+    if (out.localDir) { /* nothing is downloaded */ } else if (!out.sourceUrl || typeof out.sourceUrl !== 'string') {
       errors.push('sourceUrl is required');
     } else if (!/^https?:\/\//i.test(out.sourceUrl)) {
       errors.push('sourceUrl must be an http(s) URL');
@@ -660,6 +663,7 @@ const importOp = {
         issueSsl: out.issueSsl !== false,
         sameServer: out.sameServer === true,
         localArchive: out.localArchive || null,
+        localDir: out.localDir || null,
         encryptKey: out.encryptKey || '',
         canonical,
         enableWww,
