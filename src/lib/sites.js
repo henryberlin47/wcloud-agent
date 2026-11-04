@@ -629,6 +629,7 @@ export async function deleteSite(helpers, domain, spec = null) {
   await removePath(pageCacheDir(domain));
   await removePath(cfDnsTokenPath(domain));
   await removePath(cfCachePath(domain));
+  await removePath(`/var/lib/wcloud/scans/${domain}`); // malware scan reports (lib/malware.js)
   for (const f of [phpLogPath(domain), cronLogPath(domain), `/var/log/nginx/${domain}.access.log`, `/var/log/nginx/${domain}.error.log`]) await removePath(f);
   if (ids && ids.uid >= 1000) {
     const del = await run(helpers, 'userdel', [user], { timeout: 30_000 });

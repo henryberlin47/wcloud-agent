@@ -24,6 +24,7 @@ import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
 import { readAgentLog } from './lib/agentlog.js';
 import { startWatchdog, checkNow, snapshot, summary, restartService } from './lib/watchdog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
+import { listScans, readScan } from './lib/malware.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, phpPackageVersions, phpPatch, ensurePhpTuning, ensureFileLimits, listDatabases } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard, syncCachePlugin, wantsHelper } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
@@ -256,6 +257,14 @@ async function siteParam(req, res, next) {
   req.site = spec;
   next();
 }
+
+// --- malware scan reports (lib/malware.js) -----------------------------------
+app.get('/api/sites/:domain/scans', siteParam, async (req, res) => res.json({ scans: await listScans(req.site.domain) }));
+app.get('/api/sites/:domain/scans/:id', siteParam, async (req, res) => {
+  const r = await readScan(req.site.domain, req.params.id);
+  if (!r) return res.status(404).json({ error: 'not_found' });
+  res.json(r);
+});
 
 // --- one site's settings (type, PHP version, www, HTTPS) ----------------------
 app.get('/api/sites/:domain', siteParam, async (req, res) =>

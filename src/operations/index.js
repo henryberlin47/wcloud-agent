@@ -1,5 +1,6 @@
 import { cleanSecurity } from '../lib/security.js';
 import { runPermissions } from './permissions.js';
+import { runMalwareScan } from './malwarescan.js';
 import { runDelete } from './delete.js';
 import { runUpdate } from './update.js';
 import { runDeploy } from './deploy.js';
@@ -531,6 +532,24 @@ const canonicalOp = {
 // ============================================================
 //  permissions — owner and modes of a site's files back to wcloud's layout
 // ============================================================
+// ============================================================
+//  malwarescan — ClamAV scan of a site's files (malwarescan.js)
+// ============================================================
+const malwareScanOp = {
+  name: 'malwarescan',
+  timeout: 7 * 3600_000, // clamscan's own limit is 6h; install + signatures on top
+  // params: { domain }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain } };
+  },
+  async run(job, helpers, p) {
+    await runMalwareScan(job, helpers, p);
+  },
+};
+
 const permissionsOp = {
   name: 'permissions',
   timeout: 60 * 60_000, // a site with many files
@@ -755,7 +774,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { permissions: permissionsOp, deploy, php: phpOp, phpupdate: phpUpdateOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, deploy, php: phpOp, phpupdate: phpUpdateOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;
