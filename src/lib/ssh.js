@@ -83,6 +83,9 @@ async function fail2ban(helpers) {
   };
 }
 
+/** Just the keys — the portal's new-key alert asks every few minutes; no journal read. */
+export const sshKeys = async (helpers) => ({ keys: await listKeys(helpers, await sshdConfig(helpers)) });
+
 /** Everything the portal's Server → Security tab shows. */
 export async function sshStatus(helpers) {
   const cfg = await sshdConfig(helpers);
