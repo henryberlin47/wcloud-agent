@@ -1,6 +1,7 @@
 import { cleanSecurity } from '../lib/security.js';
 import { runPermissions } from './permissions.js';
 import { runMalwareScan } from './malwarescan.js';
+import { runSshSecurity } from './sshsecurity.js';
 import { runDelete } from './delete.js';
 import { runUpdate } from './update.js';
 import { runDeploy } from './deploy.js';
@@ -550,6 +551,35 @@ const malwareScanOp = {
   },
 };
 
+// ============================================================
+//  sshsecurity — password login, fail2ban, remove keys (sshsecurity.js)
+// ============================================================
+const FINGERPRINT_RE = /^SHA256:[A-Za-z0-9+/]{43}$/;
+const UNIX_USER_RE = /^[a-z_][a-z0-9_.-]{0,31}\$?$/i;
+const sshSecurityOp = {
+  name: 'sshsecurity',
+  timeout: 20 * 60_000, // installing fail2ban
+  // params: { passwordLogin?, fail2ban?, removeKeys?: [{ user, fingerprint }] }
+  validate(p = {}) {
+    const errors = [];
+    const clean = {};
+    for (const k of ['passwordLogin', 'fail2ban']) {
+      if (p[k] === undefined) continue;
+      if (typeof p[k] !== 'boolean') errors.push(`${k} must be true or false`); else clean[k] = p[k];
+    }
+    if (p.removeKeys !== undefined) {
+      if (!Array.isArray(p.removeKeys) || p.removeKeys.length > 100
+        || !p.removeKeys.every((k) => k && UNIX_USER_RE.test(k.user) && FINGERPRINT_RE.test(k.fingerprint))) errors.push('removeKeys must be a list of { user, fingerprint }');
+      else clean.removeKeys = p.removeKeys.map((k) => ({ user: k.user, fingerprint: k.fingerprint }));
+    }
+    if (!errors.length && !Object.keys(clean).length) errors.push('nothing to change');
+    return { ok: errors.length === 0, errors, clean };
+  },
+  async run(job, helpers, p) {
+    await runSshSecurity(job, helpers, p);
+  },
+};
+
 const permissionsOp = {
   name: 'permissions',
   timeout: 60 * 60_000, // a site with many files
@@ -774,7 +804,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, deploy, php: phpOp, phpupdate: phpUpdateOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, deploy, php: phpOp, phpupdate: phpUpdateOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

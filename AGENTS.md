@@ -179,6 +179,13 @@ as the source of truth for writing code** — the graph is only a map.
   size (data + indexes, MariaDB's estimate), table count and the site it
   belongs to (a site's database is named after its Linux user; `site: null` =
   left over). `stack.listDatabases`, root over the unix socket, SQL on stdin.
+- `GET /api/ssh` — SSH on the server (`lib/ssh.js`): effective sshd settings
+  (`sshd -T`), every `authorized_keys` entry of users with a login shell
+  (OpenSSH SHA256 fingerprints), the last 7 days of logins / failed attempts
+  from the journal (`-t sshd -t sshd-session`), fail2ban's sshd jail. The key
+  files are read by `src/sshkeys.js` run through `systemd-run --pipe` — the
+  agent's own sandbox (ProtectHome) can't see /root or /home. Which keys are
+  expected is the portal's list (`ssh_trusted_keys` on the server doc).
 - `GET /api/agent-log?lines=&q=` — the agent's own journal (`journalctl -u wcloud -o json`,
   `src/lib/agentlog.js`) → `{ entries: [{ time, level, message }], matched }`, filtered
   over the last 5000 entries. `jobs.js` writes one line per job start/finish there
@@ -224,6 +231,7 @@ Current ops: **deploy** (`type` wordpress|static + `php` → `sites.createSite`,
 **update** (`wp core update` + `update-db` + php-fpm reload), **delete** (custom
 cron/procs/locks, then `sites.deleteSite`; requires `confirm:true`), **ssl** (mode-driven, below),
 **sslDnsVerify** (step 2 of manual DNS-01, below),
+**sshsecurity** (`{ passwordLogin?, fail2ban?, removeKeys? }`: drop-in `/etc/ssh/sshd_config.d/00-wcloud.conf` tested with `sshd -t` then `systemctl reload ssh`; fail2ban jail `jail.d/wcloud-sshd.conf` on the journal, matched by `_COMM` (Ubuntu's unit is ssh.service, not sshd.service); removed keys leave a `.wcloud-<time>.bak`; refuses password-off with no key, and removing every key while password login is off),
 **purge** (WP Rocket + object cache), **siteconfig** (`realIp`, `redirects`,
 `domainRedirect`, `phpSettings`, `fpm` → spec → `applySite`; validated by
 `sites.cleanRedirects` / `cleanDomainRedirect` / `phpsettings.cleanPhpSettings` / `cleanFpm`),

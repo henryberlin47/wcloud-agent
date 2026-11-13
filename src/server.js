@@ -25,6 +25,7 @@ import { readAgentLog } from './lib/agentlog.js';
 import { startWatchdog, checkNow, snapshot, summary, restartService } from './lib/watchdog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
 import { listScans, readScan } from './lib/malware.js';
+import { sshStatus } from './lib/ssh.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, phpPackageVersions, phpPatch, ensurePhpTuning, ensureFileLimits, listDatabases } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard, syncCachePlugin, wantsHelper } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
@@ -269,6 +270,9 @@ app.get('/api/sites/:domain/scans/:id', siteParam, async (req, res) => {
 // --- one site's settings (type, PHP version, www, HTTPS) ----------------------
 app.get('/api/sites/:domain', siteParam, async (req, res) =>
   res.json({ ...publicSpec(req.site), objectCache: await objectCacheActive(req.site) }));
+
+// SSH: settings, keys, last week's logins, fail2ban (lib/ssh.js). Read-only.
+app.get('/api/ssh', async (req, res) => res.json(await sshStatus(NOOP_HELPERS)));
 
 // What the server can offer in a site's Security tab (lib/security.js).
 app.get('/api/security', async (req, res) => res.json(await securityAvailable()));
