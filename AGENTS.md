@@ -263,9 +263,11 @@ another domain would serve a certificate every browser refuses — and never
 when the archived site had HTTPS off (that keeps the certificate on disk, so
 it is in the backup): HTTPS stays off. Refused or missing: Let's Encrypt is
 issued when `issueSsl` is set, otherwise the site stays on HTTP.
-`redirects`, `domainRedirect` (same domain only — it belongs to the domain)
-and `realIp` travel with the archive, re-validated (`cleanRedirects` /
-`cleanDomainRedirect`, entry by entry; a refusal only warns). Custom nginx
+`redirects`, `domainRedirect` (same domain only — it belongs to the domain),
+`realIp` and `security` travel with the archive, re-validated (`cleanRedirects` /
+`cleanDomainRedirect`, entry by entry; `cleanSecurity` — the visitor check /
+firewall modules are installed when needed, or that setting is left off with
+a warning; a refusal only warns). Custom nginx
 rules are never read from an archive: an in-place restore carries over the
 LIVE site's rules (`listRules` before the delete, `saveRule` after the
 restore; a rule nginx refuses now only warns). Until its database is in, a

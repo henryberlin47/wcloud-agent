@@ -15,6 +15,7 @@ import { cleanPhpSettings, cleanFpm } from '../lib/phpsettings.js';
 import { saveRule, deleteRule } from '../lib/nginxrules.js';
 import { checkCustomCert } from '../lib/certcheck.js';
 import { takeLocalDir } from './export.js';
+import { cleanSecurity, ensureChallenge, ensureWaf, SECURITY_DEFAULTS } from '../lib/security.js';
 
 // The custom nginx rule that keeps a WordPress site closed while its database
 // is being restored. Never one of the site's own rules (restore.js skips it).
@@ -412,6 +413,25 @@ export async function runRestoreFromLocal(job, helpers, {
         step('Turn on the object cache (Redis)');
         await setObjectCache(helpers, await readSpec(domain), true)
           .catch((e) => warn(`The object cache couldn't be turned on (${e.message}) — turn it on from the site page.`));
+      }
+    }
+
+    // Security settings (the site's Security tab) travel with the site, checked
+    // like new ones. The visitor check and the firewall need nginx modules this
+    // server may not have yet: installed here, or — where Ubuntu doesn't package
+    // them — left off with a warning. Never fails the restore.
+    const sec = src.security && cleanSecurity(src.security).value;
+    if (sec && Object.entries(sec).some(([k, v]) => SECURITY_DEFAULTS[k] !== v)) {
+      step('Restore the security settings');
+      try {
+        if (sec.challenge && sec.challenge !== 'off') await ensureChallenge(helpers).catch((e) => { warn(`Visitor check left off: ${e.message}`); sec.challenge = 'off'; });
+        if (sec.waf && sec.waf !== 'off') await ensureWaf(helpers).catch((e) => { warn(`Firewall left off: ${e.message}`); sec.waf = 'off'; });
+        const cur = await readSpec(domain);
+        // The visitor check's pass is bound to the visitor's IP: it needs real IPs behind Cloudflare.
+        await applySite(helpers, { ...cur, security: { ...SECURITY_DEFAULTS, ...sec }, ...(sec.challenge && sec.challenge !== 'off' ? { realIp: true } : {}) });
+        ok('As the site had them (Security tab)');
+      } catch (e) {
+        warn(`The security settings could not be restored (${e.message}) — set them again on the Security tab`);
       }
     }
 
