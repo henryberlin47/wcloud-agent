@@ -186,6 +186,12 @@ as the source of truth for writing code** — the graph is only a map.
   files are read by `src/sshkeys.js` run through `systemd-run --pipe` — the
   agent's own sandbox (ProtectHome) can't see /root or /home. Which keys are
   expected is the portal's list (`ssh_trusted_keys` on the server doc).
+  `?only=keys` → just the keys (the portal's new-key alert, every 5 min).
+- `GET /api/ssh/logins?after=<journal cursor>` — accepted SSH logins after that
+  journal position, each with the authorized_keys entry it used (`key: null`
+  = no longer on the server) → `{ cursor, logins }`. No/unknown cursor → a new
+  starting point (`knownIps` = last week's login addresses, nothing alerted).
+  The portal's health sweep asks every minute (watch.ts `checkSshLogins`).
 - `GET /api/agent-log?lines=&q=` — the agent's own journal (`journalctl -u wcloud -o json`,
   `src/lib/agentlog.js`) → `{ entries: [{ time, level, message }], matched }`, filtered
   over the last 5000 entries. `jobs.js` writes one line per job start/finish there

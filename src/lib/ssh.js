@@ -83,6 +83,35 @@ async function fail2ban(helpers) {
   };
 }
 
+/**
+ * SSH logins after a journal cursor (the portal's login alert asks every
+ * minute) → { cursor, logins: [{ time, method, user, ip, fingerprint, key }] }.
+ * key: the authorized_keys entry the login used ({ comment, user }), or null
+ * when that key isn't on the server any more. No `after`, or one the journal
+ * no longer has (rotated): a new starting point at the newest entry — logins
+ * already in the journal are history, returned only as `knownIps`.
+ */
+export const CURSOR_RE = /^[\w=;]{10,400}$/;
+const cursorOf = (out) => (out.match(/^-- cursor: (\S+)\s*$/m) || [])[1] || null;
+export async function sshLoginsSince(helpers, after) {
+  if (after) {
+    const r = await run(helpers, 'journalctl', ['-t', 'sshd', '-t', 'sshd-session', '--after-cursor', after, '-n', '5000',
+      '-o', 'short-iso', '--show-cursor', '--no-pager'], { quiet: true, timeout: 30_000 });
+    if (r.code === 0) {
+      const found = [];
+      for (const l of r.stdout.split('\n')) {
+        const m = l.match(ACCEPTED);
+        if (m) found.push({ time: l.slice(0, l.indexOf(' ')).replace(/([+-]\d\d)(\d\d)$/, '$1:$2'), method: m[1], user: m[2], ip: m[3], fingerprint: m[4] || null });
+      }
+      let byFp = new Map();
+      if (found.some((x) => x.fingerprint)) byFp = new Map((await listKeys(helpers, await sshdConfig(helpers))).map((k) => [k.fingerprint, { comment: k.comment, user: k.user }]));
+      return { cursor: cursorOf(r.stdout) || after, logins: found.map((x) => ({ ...x, key: x.fingerprint ? byFp.get(x.fingerprint) || null : null })) };
+    }
+  }
+  const r = await run(helpers, 'journalctl', ['-n', '1', '-o', 'cat', '--show-cursor', '--no-pager'], { quiet: true, timeout: 30_000 });
+  return { cursor: cursorOf(r.stdout), logins: [], knownIps: [...new Set((await logins(helpers)).accepted.map((a) => a.ip))], restarted: !!after };
+}
+
 /** Just the keys — the portal's new-key alert asks every few minutes; no journal read. */
 export const sshKeys = async (helpers) => ({ keys: await listKeys(helpers, await sshdConfig(helpers)) });
 
