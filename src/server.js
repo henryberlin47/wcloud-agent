@@ -26,7 +26,7 @@ import { startWatchdog, checkNow, snapshot, summary, restartService } from './li
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
 import { listScans, readScan } from './lib/malware.js';
 import { sshStatus, sshKeys, sshLoginsSince, CURSOR_RE } from './lib/ssh.js';
-import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, phpPackageVersions, phpPatch, ensurePhpTuning, ensureFileLimits, listDatabases } from './lib/stack.js';
+import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, phpPackageVersions, phpPatch, ensurePhpTuning, ensureFileLimits, listDatabases, nginxPackageVersions, nginxRunsCurrentBinary } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard, syncCachePlugin, wantsHelper } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
 import { createLoginLink } from './lib/wplogin.js';
@@ -182,6 +182,10 @@ app.get('/api/info', async (req, res) => {
       const m = nginx.stderr.match(/nginx\/([\d.]+)/);
       if (m) info.nginx = m[1];
     }
+    // The Ubuntu package build (its security fixes keep the upstream number) and
+    // whether a newer one is out — Update nginx.
+    const ngx = await nginxPackageVersions(helpers);
+    info.nginxPackage = { installed: ngx.installed, latest: ngx.candidate && ngx.candidate !== ngx.installed ? ngx.candidate : null, running: await nginxRunsCurrentBinary() };
 
     // PHP: every installed version with its FPM status; the offered list lets
     // the portal show what a site can switch to.

@@ -14,6 +14,7 @@ import { runImport } from './import.js';
 import { runBackup } from './backup.js';
 import { runRestore } from './restore.js';
 import { runPhp, runPhpUpdate } from './php.js';
+import { runNginxUpdate } from './nginx.js';
 import { runPlugin } from './plugin.js';
 import { runCache } from './cache.js';
 import { runIndexing } from './indexing.js';
@@ -171,6 +172,16 @@ const phpUpdateOp = {
   validate() { return { ok: true, errors: [], clean: {} }; },
   async run(job, helpers) {
     await runPhpUpdate(job, helpers);
+  },
+};
+
+const nginxUpdateOp = {
+  name: 'nginxupdate',
+  timeout: 40 * 60_000, // apt on a slow mirror
+  // params: {} — the whole server (nginx.js runNginxUpdate)
+  validate() { return { ok: true, errors: [], clean: {} }; },
+  async run(job, helpers) {
+    await runNginxUpdate(job, helpers);
   },
 };
 
@@ -804,7 +815,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, deploy, php: phpOp, phpupdate: phpUpdateOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, deploy, php: phpOp, phpupdate: phpUpdateOp, nginxupdate: nginxUpdateOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

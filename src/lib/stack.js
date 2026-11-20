@@ -93,6 +93,40 @@ export async function upgradePhpPackages(helpers) {
   });
 }
 
+// nginx: Ubuntu's package. Its security fixes are backported into the same
+// upstream version (1.24.0-2ubuntu7.5 → 7.6), so the package version, not
+// `nginx -v`, says whether a fix is in.
+export async function nginxPackageVersions(helpers) {
+  const r = await run(helpers, 'apt-cache', ['policy', 'nginx'], { quiet: true, timeout: 30_000 });
+  const ver = (k) => (r.stdout.match(new RegExp(`${k}:\\s*(\\d\\S*)`)) || [])[1] || null;
+  return { installed: ver('Installed'), candidate: ver('Candidate') };
+}
+
+// Every installed nginx package (nginx, nginx-common, the libnginx-mod-*
+// modules — they must match the binary) to the newest Ubuntu has. Our config
+// files are kept (--force-confold).
+export async function upgradeNginxPackages(helpers) {
+  return withLock('apt', async () => {
+    await run(helpers, 'dpkg', ['--force-confdef', '--force-confold', '--configure', '-a'], { env: APT_ENV, timeout: 300_000 });
+    const up = await run(helpers, 'apt-get', [...APT_LOCK, 'update', '-qq'], { env: APT_ENV, timeout: 300_000 });
+    if (up.code !== 0) throw new Error('apt could not refresh its package lists (see the log above).');
+    const q = await run(helpers, 'dpkg-query', ['-W', '-f=${db:Status-Status} ${Package}\\n', 'nginx*', 'libnginx-mod-*'], { quiet: true, timeout: 30_000 });
+    const pkgs = q.stdout.split('\n').filter((l) => l.startsWith('installed ')).map((l) => l.slice(10).trim()).filter(Boolean);
+    if (!pkgs.length) throw new Error('nginx is not installed from a package on this server.');
+    const r = await run(helpers, 'apt-get', [...APT_LOCK, 'install', '--only-upgrade', '-y', '-q',
+      '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold', ...pkgs], { env: APT_ENV, timeout: 1_800_000 });
+    if (r.code !== 0) throw new Error('The nginx packages could not be upgraded (see the log above).');
+  });
+}
+
+/** Is the running nginx master the binary on disk? (false = an upgrade replaced it; a restart loads it) */
+export async function nginxRunsCurrentBinary() {
+  const pid = (await fs.readFile('/run/nginx.pid', 'utf8').catch(() => '')).trim();
+  if (!/^\d+$/.test(pid)) return null; // not running
+  const exe = await fs.readlink(`/proc/${pid}/exe`).catch(() => '');
+  return !!exe && !exe.endsWith(' (deleted)');
+}
+
 // The package's default `www` pool runs as www-data — the group that can read
 // every site. Nothing may use it, but php-fpm refuses to start with zero pools,
 // so it's replaced by an inert one: nobody, root-only socket, no idle workers.

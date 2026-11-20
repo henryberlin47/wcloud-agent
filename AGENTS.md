@@ -234,7 +234,8 @@ Each descriptor has:
 
 Current ops: **deploy** (`type` wordpress|static + `php` → `sites.createSite`, then HTTPS: Let's Encrypt via `issueSsl` (`acme.issueHttp`, or `acme.issueDnsCloudflare` when the portal passes `cfToken`+`cfZoneId` — Cloudflare-managed DNS, works behind the proxy), or the user's own `cert`+`key` — checked by `lib/certcheck.js` BEFORE the site is created, then installed with `applySslConf({certs})`), `searchEngines: false` (WordPress) sets `blog_public` 0 right after install — same setting as the **indexing** op,
 **php** (switch a site's PHP version: installs it on demand, moves the pool),
-**update** (`wp core update` + `update-db` + php-fpm reload), **delete** (custom
+**update** (`wp core update` + `update-db` + php-fpm reload),
+**nginxupdate** (every installed nginx package to Ubuntu's newest build — its security fixes keep the upstream number, so `/api/info` `nginxPackage` reports the package build; then `nginx -t` and a restart when the running master's binary is `(deleted)`: apt upgrades don't restart nginx, so a patched package can sit next to a vulnerable process), **delete** (custom
 cron/procs/locks, then `sites.deleteSite`; requires `confirm:true`), **ssl** (mode-driven, below),
 **sslDnsVerify** (step 2 of manual DNS-01, below),
 **sshsecurity** (`{ passwordLogin?, fail2ban?, removeKeys? }`: drop-in `/etc/ssh/sshd_config.d/00-wcloud.conf` tested with `sshd -t` then `systemctl reload ssh`; fail2ban jail `jail.d/wcloud-sshd.conf` on the journal, matched by `_COMM` (Ubuntu's unit is ssh.service, not sshd.service); removed keys leave a `.wcloud-<time>.bak`; refuses password-off with no key, and removing every key while password login is off),
