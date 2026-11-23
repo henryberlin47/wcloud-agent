@@ -20,7 +20,7 @@ import { run, withLock, nginxTest, nginxReload } from './lib/sys.js';
 import { listTopLevel, putObject, deleteObject, statObject, explainSpacesError } from './lib/spaces.js';
 import { readSiteSsl } from './lib/certinfo.js';
 import { readChallenge, startDnsRenewer } from './lib/acme.js';
-import { listSites, readSpec, publicSpec, applySite } from './lib/sites.js';
+import { listSites, readSpec, publicSpec, applySite, reclaimSystemFiles } from './lib/sites.js';
 import { readAgentLog } from './lib/agentlog.js';
 import { startWatchdog, checkNow, snapshot, summary, restartService } from './lib/watchdog.js';
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
@@ -815,6 +815,9 @@ app.use((err, req, res, next) => {
 async function reconcile(job, helpers) {
   await ensureFileLimits(helpers).catch((e) => helpers.err(`Open-file limits: ${e.message}`));
   await ensurePhpTuning(helpers).catch((e) => helpers.err(`PHP tuning: ${e.message}`));
+  await reclaimSystemFiles(helpers)
+    .then((p) => p.length && helpers.log(`System files owned by a site user, given back to root: ${p.slice(0, 20).join(', ')}${p.length > 20 ? ` (+${p.length - 20})` : ''}`))
+    .catch((e) => helpers.err(`System file owners: ${e.message}`));
   for (const s of await listSites()) {
     await fixSiteStructure(s).catch((e) => helpers.err(`Folder permissions of ${s.domain}: ${e.message}`));
     try { await applySite(helpers, s); }

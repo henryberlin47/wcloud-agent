@@ -537,6 +537,32 @@ async function freeRedisDb() {
 
 // Create a site: user, directories, the type's own setup, then apply. On any
 // failure everything created so far is removed again.
+export const SITE_UID_MIN = 10000;
+
+/**
+ * System files (/etc, /opt, /usr) owned by a site's user or group go back to root.
+ * A site user never owns anything there; when one does (a package built with uid
+ * 1000 on a server whose first site got uid 1000), that site's PHP could edit what
+ * root runs. Returns the paths changed.
+ */
+export async function reclaimSystemFiles(helpers) {
+  const ids = [];
+  for (const s of await listSites()) ids.push(await userIds(s.user).catch(() => null));
+  const uids = [...new Set(ids.filter(Boolean).map((x) => x.uid))].filter((n) => n > 0);
+  const gids = [...new Set(ids.filter(Boolean).map((x) => x.gid))].filter((n) => n > 0);
+  const fixed = [];
+  for (const [flag, list, cmd] of [['-uid', uids, 'chown'], ['-gid', gids, 'chgrp']]) {
+    if (!list.length) continue;
+    const match = list.flatMap((n, i) => (i ? ['-o', flag, String(n)] : [flag, String(n)]));
+    const r = await run(helpers, 'find', ['/etc', '/opt', '/usr', '-xdev', '(', ...match, ')', '-print0'], { quiet: true, timeout: 300_000 });
+    // -print0 keeps a name with a newline whole; run() adds one '\n' at the end.
+    const paths = r.stdout.split('\0').filter((p) => p && p !== '\n');
+    for (let i = 0; i < paths.length; i += 200) await run(helpers, cmd, ['-h', 'root', '--', ...paths.slice(i, i + 200)], { quiet: true });
+    fixed.push(...paths);
+  }
+  return [...new Set(fixed)];
+}
+
 //   o: { domain, type, php, enableWww, canonical, wp: {...} (see setupWordPress) }
 export async function createSite(helpers, o) {
   const d = o.domain;
@@ -551,7 +577,10 @@ export async function createSite(helpers, o) {
   if (o.type === 'wordpress' && (await listDatabases(helpers)).some((x) => x.name === user)) {
     throw new Error(`A database named ${user} already exists on this server — remove or rename it first.`);
   }
-  const r = await run(helpers, 'useradd', ['--user-group', '--no-create-home', '--home-dir', siteDir(d), '--shell', '/usr/sbin/nologin', user], { timeout: 30_000 });
+  // uid/gid from SITE_UID_MIN: images ship files owned by low uids (DigitalOcean's
+  // do-agent is uid 1000, run as root daily), which must never be a site's.
+  const r = await run(helpers, 'useradd', ['--user-group', '--no-create-home', '--home-dir', siteDir(d), '--shell', '/usr/sbin/nologin',
+    '-K', `UID_MIN=${SITE_UID_MIN}`, '-K', `GID_MIN=${SITE_UID_MIN}`, user], { timeout: 30_000 });
   if (r.code !== 0) throw new Error(`The site's system user could not be created.`);
 
   const s = { domain: d, type: o.type, php, user, enableWww: o.enableWww, canonical: o.canonical, ssl: false, created_at: new Date().toISOString() };
