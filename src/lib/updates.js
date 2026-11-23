@@ -87,7 +87,8 @@ export function setAutoSecurity(helpers, on) {
       const r = await run(helpers, 'apt-get', [...APT_LOCK, ...CONF, 'install', '-y', '-q', 'unattended-upgrades'], { env: APT_ENV, timeout: 900_000 });
       if (r.code !== 0) throw new Error('unattended-upgrades could not be installed (see the log above).');
     }
-    await fs.writeFile(AUTO_FILE, `// Managed by wcloud (agent lib/updates.js)\nAPT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "${on ? 1 : 0}";\n`, { mode: 0o644 });
+    // The label line: the daily list refresh stops for good when a repository renames its label (see APT_LOCK in stack.js).
+    await fs.writeFile(AUTO_FILE, `// Managed by wcloud (agent lib/updates.js)\nAPT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "${on ? 1 : 0}";\nAcquire::AllowReleaseInfoChange::Label "true";\n`, { mode: 0o644 });
   });
 }
 

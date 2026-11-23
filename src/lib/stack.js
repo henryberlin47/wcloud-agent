@@ -20,8 +20,11 @@ export const fpmService = (v) => `php${v}-fpm`;
 export const phpBin = (v) => `/usr/bin/php${v}`;
 
 export const APT_ENV = { DEBIAN_FRONTEND: 'noninteractive', NEEDRESTART_MODE: 'a', NEEDRESTART_SUSPEND: '1' };
-// Wait out unattended-upgrades instead of failing on its dpkg lock.
-export const APT_LOCK = ['-o', 'DPkg::Lock::Timeout=600'];
+// Wait out unattended-upgrades instead of failing on its dpkg lock. AllowReleaseInfoChange::Label:
+// a repository may rename its label (ondrej/php became "PPA for PHP (deprecated)") and apt then
+// refuses to refresh ANY list until someone confirms by hand — accept a new label only; a changed
+// Origin or Suite is still refused.
+export const APT_LOCK = ['-o', 'DPkg::Lock::Timeout=600', '-o', 'Acquire::AllowReleaseInfoChange::Label=true'];
 
 // Installed PHP-FPM versions, oldest first.
 export async function installedPhp() {

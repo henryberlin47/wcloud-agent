@@ -243,7 +243,7 @@ REPO="${REPO:-https://github.com/henryberlin47/wcloud-agent.git}"
 if ! command -v git >/dev/null 2>&1; then
   info "Installing git..."
   apt_wait # first apt call of the run — a fresh box's unattended-upgrades holds the lock
-  apt-get update -qq </dev/null && apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold git </dev/null \
+  apt-get -o Acquire::AllowReleaseInfoChange::Label=true update -qq </dev/null && apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold git </dev/null \
     || die "Could not install git (needed to fetch the agent)."
 fi
 if [ -d /opt/wcloud/.git ]; then
@@ -271,7 +271,7 @@ apt_install() { apt_wait; apt-get "${APT_OPTS[@]}" install "$@" </dev/null; }
 
 step "Installing Nginx, MariaDB and Redis"
 apt_wait
-apt-get -q -o DPkg::Lock::Timeout=600 update </dev/null >/dev/null || warn "apt-get update reported errors — continuing."
+apt-get -q -o DPkg::Lock::Timeout=600 -o Acquire::AllowReleaseInfoChange::Label=true update </dev/null >/dev/null || warn "apt-get update reported errors — continuing."
 if apt_install nginx mariadb-server redis-server cron curl unzip git openssl ca-certificates logrotate software-properties-common; then
   ok "Packages installed."
 else
@@ -298,7 +298,7 @@ add_php_repo_by_hand() {
   rm -f "$tmp"
   echo "deb [signed-by=$key] https://ppa.launchpadcontent.net/ondrej/php/ubuntu $codename main" > "/etc/apt/sources.list.d/ondrej-ubuntu-php-$codename.list"
   apt_wait
-  apt-get -q -o DPkg::Lock::Timeout=600 update </dev/null >/dev/null
+  apt-get -q -o DPkg::Lock::Timeout=600 -o Acquire::AllowReleaseInfoChange::Label=true update </dev/null >/dev/null
 }
 if ! grep -rqs "ondrej/php" /etc/apt/sources.list /etc/apt/sources.list.d/; then
   info "Adding the PHP package repository (ppa:ondrej/php)..."
