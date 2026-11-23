@@ -209,6 +209,13 @@ export async function systemctl(helpers, action, unit) {
   return run(helpers, 'systemctl', [action, unit], { timeout: 60000 });
 }
 
+// sshd -t and -T refuse to run without /run/sshd, which ssh.service makes when it starts. A
+// socket-activated sshd hasn't started after a boot, so make the directory here.
+export async function sshdRun(helpers, args, opts) {
+  await fs.mkdir('/run/sshd', { recursive: true, mode: 0o755 });
+  return run(helpers, '/usr/sbin/sshd', args, opts);
+}
+
 // nginx -t ; returns true if config is valid.
 export async function nginxTest(helpers) {
   const r = await run(helpers, 'nginx', ['-t'], { timeout: 30000 });

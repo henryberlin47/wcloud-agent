@@ -19,9 +19,9 @@ const PHP_EXTS = ['fpm', 'cli', 'mysql', 'curl', 'gd', 'intl', 'mbstring', 'xml'
 export const fpmService = (v) => `php${v}-fpm`;
 export const phpBin = (v) => `/usr/bin/php${v}`;
 
-const APT_ENV = { DEBIAN_FRONTEND: 'noninteractive', NEEDRESTART_MODE: 'a', NEEDRESTART_SUSPEND: '1' };
+export const APT_ENV = { DEBIAN_FRONTEND: 'noninteractive', NEEDRESTART_MODE: 'a', NEEDRESTART_SUSPEND: '1' };
 // Wait out unattended-upgrades instead of failing on its dpkg lock.
-const APT_LOCK = ['-o', 'DPkg::Lock::Timeout=600'];
+export const APT_LOCK = ['-o', 'DPkg::Lock::Timeout=600'];
 
 // Installed PHP-FPM versions, oldest first.
 export async function installedPhp() {

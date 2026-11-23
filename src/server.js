@@ -28,6 +28,8 @@ import { listScans, readScan } from './lib/malware.js';
 import { sshStatus, sshKeys, sshLoginsSince, CURSOR_RE } from './lib/ssh.js';
 import { scanIntegrity } from './lib/integrity.js';
 import { firewallStatus } from './lib/firewall.js';
+import { updateStatus } from './lib/updates.js';
+import { hardeningStatus } from './lib/hardening.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, phpPackageVersions, phpPatch, ensurePhpTuning, ensureFileLimits, listDatabases, nginxPackageVersions, nginxRunsCurrentBinary } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard, syncCachePlugin, wantsHelper } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
@@ -297,6 +299,13 @@ app.get('/api/integrity', async (req, res) => {
 
 // Firewall: settings, blocked addresses, what listens (lib/firewall.js). Read-only; changes are the `firewall` op.
 app.get('/api/firewall', async (req, res) => res.json(await firewallStatus(NOOP_HELPERS)));
+
+// OS updates (lib/updates.js; changes are the `sysupdate` op) and kernel hardening (lib/hardening.js; `harden` op).
+// ?refresh=1 fetches the package lists first.
+app.get('/api/updates', async (req, res) => res.json({
+  ...await updateStatus(NOOP_HELPERS, { refresh: req.query.refresh === '1' }),
+  hardening: await hardeningStatus(),
+}));
 
 // What the server can offer in a site's Security tab (lib/security.js).
 app.get('/api/security', async (req, res) => res.json(await securityAvailable()));

@@ -35,6 +35,15 @@ function ipAllowed(ip) {
   return config.allowedIps.includes(ip);
 }
 
+// Token rotation (op rotatekey): the old token keeps working for a grace window,
+// so the portal can still read the rotation job's result with it.
+let previous = null; // { token, until }
+export function rotateToken(token, graceMs = Number(process.env.AGENT_TOKEN_GRACE_MS) || 5 * 60_000) {
+  previous = { token: config.authToken, until: Date.now() + graceMs };
+  config.authToken = token;
+  process.env.AGENT_TOKEN = token; // child processes inherit the env: the old token must not reach them
+}
+
 // Express middleware: enforces IP allowlist first, then bearer token.
 export function requireAuth(req, res, next) {
   const ip = clientIp(req);
@@ -52,7 +61,8 @@ export function requireAuth(req, res, next) {
   if (!m) {
     return res.status(401).json({ error: 'unauthorized', reason: 'missing_bearer' });
   }
-  if (!safeEqual(m[1], config.authToken)) {
+  const graceToken = previous && Date.now() < previous.until && safeEqual(m[1], previous.token);
+  if (!safeEqual(m[1], config.authToken) && !graceToken) {
     return res.status(401).json({ error: 'unauthorized', reason: 'bad_token' });
   }
 

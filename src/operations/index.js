@@ -2,6 +2,7 @@ import { cleanSecurity } from '../lib/security.js';
 import { runPermissions } from './permissions.js';
 import { runMalwareScan } from './malwarescan.js';
 import { runSshSecurity } from './sshsecurity.js';
+import { portProblem } from '../lib/ssh.js';
 import { runFirewall } from './firewall.js';
 import { runDelete } from './delete.js';
 import { runUpdate } from './update.js';
@@ -16,6 +17,9 @@ import { runBackup } from './backup.js';
 import { runRestore } from './restore.js';
 import { runPhp, runPhpUpdate } from './php.js';
 import { runNginxUpdate } from './nginx.js';
+import { runSysUpdate } from './sysupdate.js';
+import { runHarden } from './harden.js';
+import { runRotateKey } from './rotatekey.js';
 import { runPlugin } from './plugin.js';
 import { runCache } from './cache.js';
 import { runIndexing } from './indexing.js';
@@ -184,6 +188,55 @@ const nginxUpdateOp = {
   validate() { return { ok: true, errors: [], clean: {} }; },
   async run(job, helpers) {
     await runNginxUpdate(job, helpers);
+  },
+};
+
+// ============================================================
+//  sysupdate / harden / rotatekey — OS updates, kernel hardening, agent token (sysupdate.js, harden.js, rotatekey.js)
+// ============================================================
+const sysupdateOp = {
+  name: 'sysupdate',
+  timeout: 60 * 60_000, // a full upgrade on a slow mirror
+  // params: { install?: 'security' | 'all', auto?: bool, reboot?: bool }
+  validate(p = {}) {
+    const errors = [];
+    const clean = {};
+    if (p.install !== undefined) {
+      if (!['security', 'all'].includes(p.install)) errors.push('install must be security or all'); else clean.install = p.install;
+    }
+    for (const k of ['auto', 'reboot']) {
+      if (p[k] === undefined) continue;
+      if (typeof p[k] !== 'boolean') errors.push(`${k} must be true or false`); else clean[k] = p[k];
+    }
+    if (!errors.length && !Object.keys(clean).length) errors.push('nothing to change');
+    return { ok: errors.length === 0, errors, clean };
+  },
+  async run(job, helpers, p) {
+    await runSysUpdate(job, helpers, p);
+  },
+};
+
+const hardenOp = {
+  name: 'harden',
+  // params: { on: bool }
+  validate(p = {}) {
+    if (typeof p.on !== 'boolean') return { ok: false, errors: ['on must be true or false'], clean: {} };
+    return { ok: true, errors: [], clean: { on: p.on } };
+  },
+  async run(job, helpers, p) {
+    await runHarden(job, helpers, p);
+  },
+};
+
+const rotateKeyOp = {
+  name: 'rotatekey',
+  // params: { token } — the new AGENT_TOKEN (≥ 32 random bytes, base64url)
+  validate(p = {}) {
+    if (typeof p.token !== 'string' || !/^[A-Za-z0-9_-]{43,256}$/.test(p.token)) return { ok: false, errors: ['token must be a base64url string of at least 43 characters'], clean: {} };
+    return { ok: true, errors: [], clean: { token: p.token } };
+  },
+  async run(job, helpers, p) {
+    await runRotateKey(job, helpers, p);
   },
 };
 
@@ -566,20 +619,24 @@ const malwareScanOp = {
 };
 
 // ============================================================
-//  sshsecurity — password login, fail2ban, remove keys (sshsecurity.js)
+//  sshsecurity — SSH port, password login, hardening, fail2ban, remove keys (sshsecurity.js)
 // ============================================================
 const FINGERPRINT_RE = /^SHA256:[A-Za-z0-9+/]{43}$/;
 const UNIX_USER_RE = /^[a-z_][a-z0-9_.-]{0,31}\$?$/i;
 const sshSecurityOp = {
   name: 'sshsecurity',
   timeout: 20 * 60_000, // installing fail2ban
-  // params: { passwordLogin?, fail2ban?, removeKeys?: [{ user, fingerprint }] }
+  // params: { passwordLogin?, harden?, port?, fail2ban?, removeKeys?: [{ user, fingerprint }] }
   validate(p = {}) {
     const errors = [];
     const clean = {};
-    for (const k of ['passwordLogin', 'fail2ban']) {
+    for (const k of ['passwordLogin', 'harden', 'fail2ban']) {
       if (p[k] === undefined) continue;
       if (typeof p[k] !== 'boolean') errors.push(`${k} must be true or false`); else clean[k] = p[k];
+    }
+    if (p.port !== undefined) {
+      const why = portProblem(p.port);
+      if (why) errors.push(why); else clean.port = p.port;
     }
     if (p.removeKeys !== undefined) {
       if (!Array.isArray(p.removeKeys) || p.removeKeys.length > 100
@@ -848,7 +905,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, firewall: firewallOp, deploy, php: phpOp, phpupdate: phpUpdateOp, nginxupdate: nginxUpdateOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, firewall: firewallOp, deploy, php: phpOp, phpupdate: phpUpdateOp, nginxupdate: nginxUpdateOp, sysupdate: sysupdateOp, harden: hardenOp, rotatekey: rotateKeyOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

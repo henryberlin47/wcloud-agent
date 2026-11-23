@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import { isIP } from 'node:net';
 import config from '../config.js';
-import { run, pathExists, withLock } from './sys.js';
+import { run, pathExists, withLock, sshdRun } from './sys.js';
 
 // ============================================================
 //  firewall.js — the server's firewall (nftables, one table of ours)
@@ -115,12 +115,12 @@ export function render(s, { allowedIps = [], sshPorts = [22], agentPort = 8787 }
 
 // Every port sshd listens on; they stay open to the SSH sources. A broken sshd config reads as the default.
 async function sshPorts(helpers) {
-  const r = await run(helpers, '/usr/sbin/sshd', ['-T'], quiet);
+  const r = await sshdRun(helpers, ['-T'], quiet);
   const ports = [...r.stdout.matchAll(/^port (\d+)$/gm)].map((m) => Number(m[1]));
   return ports.length ? ports : [22];
 }
 
-async function readSettings() {
+export async function readSettings() {
   const txt = await fs.readFile(SETTINGS, 'utf8').catch((e) => { if (e.code === 'ENOENT') return null; throw e; });
   return txt === null ? { ...DEFAULTS } : JSON.parse(txt);
 }
@@ -158,8 +158,9 @@ export async function firewallStatus(helpers) {
  * write the settings and the rules, check them with `nft -c`, load them with
  * `nft -f`, keep them across reboots. A failure puts the previous files back;
  * nft applies a file all or nothing, so the kernel never holds half of it.
+ * sshPorts: the SSH ports to open instead of sshd's (an SSH port change opens both, then one).
  */
-export async function applyFirewall(helpers, p) {
+export async function applyFirewall(helpers, p, { sshPorts: ports } = {}) {
   return withLock('firewall', async () => {
     if (!(await pathExists(NFT))) {
       const r = await withLock('apt', () => run(helpers, 'apt-get', ['-o', 'DPkg::Lock::Timeout=600', 'install', '-y', '-q', 'nftables'],
@@ -174,7 +175,7 @@ export async function applyFirewall(helpers, p) {
       blocked: [...new Set([...cur.blocked, ...(p.block || [])])].filter((a) => !(p.unblock || []).includes(a)),
     };
     if (next.blocked.length > MAX_BLOCKED) throw new Error(`At most ${MAX_BLOCKED} blocked addresses — unblock some first.`);
-    const rules = render(next, { allowedIps: config.allowedIps, sshPorts: await sshPorts(helpers), agentPort: config.port });
+    const rules = render(next, { allowedIps: config.allowedIps, sshPorts: ports ?? (await sshPorts(helpers)), agentPort: config.port });
 
     const prev = await Promise.all([SETTINGS, RULES].map((f) => fs.readFile(f, 'utf8').catch(() => null)));
     const restore = async () => {

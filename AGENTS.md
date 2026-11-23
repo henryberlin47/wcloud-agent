@@ -40,7 +40,8 @@ as the source of truth for writing code** — the graph is only a map.
   `{ ok, server, version, time }`.
 - Everything else goes through `requireAuth` (`src/auth.js`), which enforces, **in
   order**: (1) IP allowlist — 403 `ip_not_allowed` if the caller IP isn't in
-  `AGENT_ALLOWED_IPS`; (2) bearer token — 401 if missing/wrong. The order matters:
+  `AGENT_ALLOWED_IPS`; (2) bearer token — 401 if missing/wrong (after `rotatekey`
+  the previous token also passes for `AGENT_TOKEN_GRACE_MS`, default 5 min — `auth.js`). The order matters:
   the allowlist must contain the portal's *egress* IP or every `/api/*` call 403s
   while `/healthz` still succeeds (looks "online" but details fail).
 - `GET /api/info` — system info (memory, disk, CPU load, software stack, OS/kernel,
@@ -198,6 +199,7 @@ as the source of truth for writing code** — the graph is only a map.
   alerted). The portal's health sweep asks every minute (watch.ts `checkSshLogins`).
   Self-check: `node src/lib/ssh.js`.
 - `GET /api/firewall` — the firewall (`lib/firewall.js`, §5): `{ available (nft installed), enabled, sshPorts (sshd -T), sshFrom, blocked, openPorts, agentFrom (the allowlist), agentPort, listening (`ss -ltnupH`, non-loopback: `{ proto, port, addr, process }`), persisted (boot unit enabled) }`. Read-only; changes are the `firewall` op.
+- `GET /api/updates[?refresh=1]` — OS updates (`lib/updates.js`): `{ pending, security, packages: [{ name, security }] (security first, ≤50), reboot: { required, packages }, unattended: { installed, enabled }, hardening: { file, applied, mismatches, settings } }`. Read from apt's simulated `dist-upgrade` on the cached lists (`refresh=1` runs `apt-get update` first, under `'apt'`). A package is security when an origin is a `*-security` pocket. Changes are the `sysupdate` and `harden` ops.
 - `GET /api/integrity` — intrusion check: `{ scannedAt, findings: [{ key, severity:
   critical|warning|info, title, detail }] }`. `src/integrity-worker.js` runs as root
   outside the sandbox (`systemd-run --pipe`, like `sshkeys.js`, via `lib/integrity.js`)
@@ -255,7 +257,7 @@ Current ops: **deploy** (`type` wordpress|static + `php` → `sites.createSite`,
 **nginxupdate** (every installed nginx package to Ubuntu's newest build — its security fixes keep the upstream number, so `/api/info` `nginxPackage` reports the package build; then `nginx -t` and a restart when the running master's binary is `(deleted)`: apt upgrades don't restart nginx, so a patched package can sit next to a vulnerable process), **delete** (custom
 cron/procs/locks, then `sites.deleteSite`; requires `confirm:true`), **ssl** (mode-driven, below),
 **sslDnsVerify** (step 2 of manual DNS-01, below),
-**sshsecurity** (`{ passwordLogin?, fail2ban?, removeKeys? }`: drop-in `/etc/ssh/sshd_config.d/00-wcloud.conf` tested with `sshd -t` then `systemctl reload ssh`; fail2ban jail `jail.d/wcloud-sshd.conf` on the journal, matched by `_COMM` (Ubuntu's unit is ssh.service, not sshd.service); removed keys leave a `.wcloud-<time>.bak`; refuses password-off with no key, and removing every key while password login is off),
+**sshsecurity** (`{ passwordLogin?, harden?, port?, fail2ban?, removeKeys? }`: the sshd settings are one drop-in, `/etc/ssh/sshd_config.d/00-wcloud.conf`, parsed and written from one object (`parseDropin` / `renderDropin`), tested with `sshd -t`, then applied. `port` (1–65535; refused below 1024 except 22, on 80/443/3306/6379, on the agent's port, or where another program listens): the firewall opens both ports and fail2ban's jail lists both, sshd moves, the new port must listen within 5 s, only then the old port closes; any failure before that undoes it all. A socket-activated sshd (Ubuntu 24.04 `ssh.socket`) gets `daemon-reload` + `restart ssh.socket`; classic `ssh.service` restarts on a new port and reloads otherwise (a SIGHUP keeps the old listeners). Open sessions survive both (KillMode=process). `harden` sets PermitRootLogin prohibit-password, MaxAuthTries 3, LoginGraceTime 30, X11 and agent forwarding off, PermitEmptyPasswords no, KbdInteractiveAuthentication no, ClientAlive 300/2; refused when no root or sudo user has a login key. Status: `config.port`, `config.harden`. `sshd -t` / `-T` go through `sshdRun`, which makes `/run/sshd` first (a socket-activated box has none until ssh.service starts). Fail2ban jail `jail.d/wcloud-sshd.conf` on the journal, matched by `_COMM` (Ubuntu's unit is ssh.service, not sshd.service); removed keys leave a `.wcloud-<time>.bak`; refuses password-off with no key, and removing every key while password login is off),
 **firewall** (`{ enabled?, sshFrom?, openPorts?, block?, unblock? }`, each optional, at least one: `lib/firewall.js` writes `/etc/wcloud/firewall.json` (the settings) and renders one nftables table `inet wcloud_fw` to `firewall.nft`; `nft -c -f` checks it, `nft -f` loads it (a file applies as one transaction, nothing else is touched — ufw, fail2ban keep their own tables); on any failure the previous files come back. The boot unit `wcloud-firewall.service` reloads the file. Blocked addresses (IPv4/IPv6, CIDR, ≤500, never wider than /8 or /32) drop both ways, with the firewall on or off; when on, the default is drop, with the agent's port open to its allowlist (anywhere if empty), SSH to `sshFrom` on every sshd port, web on 80/443 and UDP 443, and the extra ports),
 **purge** (WP Rocket + object cache), **siteconfig** (`realIp`, `redirects`,
 `domainRedirect`, `phpSettings`, `fpm` → spec → `applySite`; validated by
@@ -380,6 +382,10 @@ syntax.
   arrive in the authenticated body only, the key is written `600 root:root`, and
   neither is ever logged or echoed (job views redact both).
 
+**sysupdate** (`{ install?: 'security' | 'all', auto?, reboot? }`, `operations/sysupdate.js` + `lib/updates.js`): `security` installs the pending security packages by name (the same list the status counts, after `apt-get update`), `all` runs `dist-upgrade`; both under `'apt'`. Then nginx is restarted when its binary was replaced (after `nginx -t`), and `needrestart -r a` restarts the rest — needrestart never restarts the unit it runs in, so this agent and its jobs survive; it is not run with `NEEDRESTART_SUSPEND` (APT_ENV), which turns it off. `auto` writes `/etc/apt/apt.conf.d/20auto-upgrades` (installs `unattended-upgrades` first when missing): daily security upgrades, origins as the package's own config. `reboot` runs `shutdown -r +1`.
+**harden** (`{ on }`, `operations/harden.js` + `lib/hardening.js`): writes `/etc/sysctl.d/99-wcloud-hardening.conf` (SYN cookies, loose rp_filter, no ICMP/source-route redirects, martian logging, kptr/dmesg restrict, protected symlinks/hardlinks/fifos/regular, no suid core dumps) and applies it with `sysctl --system` in a transient unit (the agent's own unit mounts /proc/sys read-only). Off removes the file only: the live values stay until the next boot.
+**rotatekey** (`{ token }`, `operations/rotatekey.js` + `auth.js` `rotateToken`): the portal makes the new token (≥43 base64url chars). The env file is replaced first (temp file, rename, mode 0600, the `AGENT_TOKEN` line only), then the agent switches; the old token keeps working for `AGENT_TOKEN_GRACE_MS` (default 5 min). A failure before the switch changes nothing. `token` is masked in job views (key name matches `token`).
+
 **Manual DNS-01 state machine** — `src/lib/acme.js` owns it. acme.sh clears
 `Le_Vlist` (the saved ACME order) after *every* verification attempt, and a lost
 vlist means a new order = a new TXT the user must re-add. So the agent captures
@@ -496,6 +502,8 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   and IPv4), so the real code lives in `.errors`/`.cause`.
 - **certcheck.js** — `checkCustomCert(domain, cert, key, {www})`: in-memory (Node crypto) validation of a user certificate — PEM parses, key matches, `checkHost` covers the domain, not expired/not-yet-valid; www-coverage and self-signed are warnings. Shared by the ssl op (custom) and deploy. The portal runs the same rules (`server/utils/certcheck.ts`) for its live form check.
 - **firewall.js** — the server's firewall (op `firewall`, §3; `GET /api/firewall`, §2). `render(settings, { allowedIps, sshPorts, agentPort })` is pure and builds the whole table: blocks first (so an already-open connection from a blocked address is cut), then the rules the portal must never lose (the agent's allowlist; an empty or all-invalid list means anywhere). `applyFirewall` runs under the `'firewall'` lock and installs nftables if missing. Self-check: `node src/lib/firewall.js`.
+- **updates.js** — apt status and installs (op `sysupdate`, §3; `GET /api/updates`, §2). `parseSimulation` reads `apt-get -s dist-upgrade`. Self-check: `node src/lib/updates.js`.
+- **hardening.js** — the sysctl drop-in (op `harden`, §3): `HARDENING` is the list, `hardeningStatus` reads each value back from /proc/sys. Self-check: `node src/lib/hardening.js`.
 - **log.js** — the step logger used by operations.
 - **wpcore.js** — `wordpressCore()`: the server's one copy of the latest
   WordPress (`/var/cache/wcloud-wp/wordpress-<v>.tar.gz`, root 0755/0644, newest 2

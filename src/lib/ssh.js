@@ -1,5 +1,7 @@
 import fs from 'node:fs/promises';
-import { run, pathExists, withLock } from './sys.js';
+import { run, pathExists, withLock, sshdRun, sleep } from './sys.js';
+import config from '../config.js';
+import { applyFirewall, readSettings } from './firewall.js';
 
 // ============================================================
 //  ssh.js — who can log in over SSH, who did, who tried
@@ -7,8 +9,8 @@ import { run, pathExists, withLock } from './sys.js';
 // Read-only scan (GET /api/ssh): sshd's effective settings, every
 // authorized_keys entry of every user with a login shell, the last week's
 // logins and failed attempts from the journal, fail2ban's sshd jail.
-// Changes (op `sshsecurity`): password login on/off (one drop-in that wins over
-// cloud-init's), fail2ban for sshd on/off, remove keys. Which keys are
+// Changes (op `sshsecurity`): the SSH port, password login, hardening (one drop-in that wins
+// over cloud-init's), fail2ban for sshd on/off, remove keys. Which keys are
 // *expected* is the portal's to know — the agent only reports and removes.
 // ============================================================
 
@@ -20,7 +22,7 @@ const quiet = { quiet: true, timeout: 30_000 };
 
 // `sshd -T`: the settings sshd actually runs with, every file applied.
 async function sshdConfig(helpers) {
-  const r = await run(helpers, '/usr/sbin/sshd', ['-T'], quiet);
+  const r = await sshdRun(helpers, ['-T'], quiet);
   const c = {};
   for (const l of r.stdout.split('\n')) { const i = l.indexOf(' '); if (i > 0 && !(l.slice(0, i) in c)) c[l.slice(0, i)] = l.slice(i + 1).trim(); }
   return c;
@@ -139,6 +141,7 @@ export async function sshStatus(helpers) {
     config: {
       port: cfg.port || '22', passwordLogin: cfg.passwordauthentication === 'yes', permitRootLogin: cfg.permitrootlogin || null,
       managed: await pathExists(DROPIN),
+      harden: parseDropin(await fs.readFile(DROPIN, 'utf8').catch(() => '')).harden,
     },
     keys: keyList.map((k) => ({ ...k, lastUsed: lastUsed.get(`${k.user}|${k.fingerprint}`) || null })),
     logins: log,
@@ -147,31 +150,166 @@ export async function sshStatus(helpers) {
 }
 
 // ── Changes (op `sshsecurity`) ───────────────────────────────────────────────
+// The drop-in is wcloud's whole SSH config: parseDropin reads it back, renderDropin
+// writes it from one settings object, so port, password login and hardening compose.
 
-/** Test the sshd config and reload; on failure put `prev` (null = no file) back. */
-async function applySshd(helpers, content, prev) {
-  await fs.writeFile(DROPIN, content, { mode: 0o644 });
-  const t = await run(helpers, '/usr/sbin/sshd', ['-t'], { timeout: 30_000 });
-  if (t.code !== 0) {
-    if (prev === null) await fs.rm(DROPIN, { force: true }); else await fs.writeFile(DROPIN, prev);
-    throw new Error(`sshd rejected the change, nothing was applied: ${(t.stderr || t.stdout).trim().slice(0, 300)}`);
-  }
-  // Reload: open sessions stay connected. Ubuntu's unit is ssh, others sshd.
-  const r = await run(helpers, 'systemctl', ['reload', 'ssh'], { quiet: true, timeout: 30_000 });
-  if (r.code !== 0) await run(helpers, 'systemctl', ['reload', 'sshd'], { timeout: 30_000 });
+/** The drop-in's settings: { port, passwordLogin, harden }; null = the drop-in doesn't set it. */
+export function parseDropin(txt) {
+  const v = (k) => (txt.match(new RegExp(`^${k} (\\S+)$`, 'mi')) || [])[1];
+  return {
+    port: v('Port') ? Number(v('Port')) : null,
+    passwordLogin: v('PasswordAuthentication') ? v('PasswordAuthentication') === 'yes' : null,
+    harden: /^# hardening: on$/m.test(txt),
+  };
 }
 
-export async function setPasswordLogin(helpers, on) {
+// Keyboard-interactive follows password login, except under hardening: password auth is
+// PasswordAuthentication alone, so it keeps working with keyboard-interactive off.
+export function renderDropin(s) {
+  return [
+    '# Managed by wcloud (portal: Server → Security). Edits here are overwritten.',
+    `Port ${s.port}`,
+    `PasswordAuthentication ${s.passwordLogin ? 'yes' : 'no'}`,
+    `KbdInteractiveAuthentication ${s.passwordLogin && !s.harden ? 'yes' : 'no'}`,
+    ...(s.harden ? [
+      '# hardening: on',
+      'PermitRootLogin prohibit-password',
+      'MaxAuthTries 3',
+      'LoginGraceTime 30',
+      'X11Forwarding no',
+      'AllowAgentForwarding no',
+      'PermitEmptyPasswords no',
+      'ClientAliveInterval 300', // idle sessions end after 10 minutes
+      'ClientAliveCountMax 2',
+    ] : []),
+  ].join('\n') + '\n';
+}
+
+// A setting the drop-in doesn't set yet is sshd's effective value, so the first change keeps it.
+async function settingsOf(helpers) {
+  const d = parseDropin(await fs.readFile(DROPIN, 'utf8').catch(() => ''));
+  const cfg = await sshdConfig(helpers);
+  return { port: d.port ?? Number(cfg.port || 22), passwordLogin: d.passwordLogin ?? cfg.passwordauthentication === 'yes', harden: d.harden };
+}
+
+// Ports wcloud and the web stack use. Below 1024 only 22 is allowed for SSH.
+const RESERVED = [80, 443, 3306, 6379];
+export function portProblem(port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return 'The SSH port must be a whole number from 1 to 65535.';
+  if (port < 1024 && port !== 22) return 'Below 1024 only port 22 can be used for SSH.';
+  if (port === config.port || RESERVED.includes(port)) return 'That port is used by wcloud or the web stack — pick another.';
+  return null;
+}
+
+// `ss -ltnpH`: the TCP listeners as { port, process }.
+const listeners = async (helpers) => (await run(helpers, 'ss', ['-ltnpH'], quiet)).stdout.split('\n').filter(Boolean).map((l) => {
+  const c = l.trim().split(/\s+/);
+  return { port: Number(c[3].slice(c[3].lastIndexOf(':') + 1)), process: (l.match(/users:\(\("([^"]*)"/) || [])[1] || null };
+});
+const portTaken = async (helpers, port) => (await listeners(helpers)).some((l) => l.port === port && l.process !== 'sshd');
+async function listening(helpers, port) {
+  for (let i = 0; i < 10; i++) { if ((await listeners(helpers)).some((l) => l.port === port)) return true; await sleep(500); }
+  return false;
+}
+const socketMode = async (helpers) => (await run(helpers, 'systemctl', ['is-active', 'ssh.socket'], quiet)).stdout.trim() === 'active';
+
+// How the running sshd picks up a change: 'socket' (a new port, socket-activated), 'restart' (a
+// new port, classic ssh.service), 'reload' (anything else). A SIGHUP reload applies the auth settings
+// but keeps the old listeners, so a port needs a restart. Open sessions stay in every case: the units
+// use KillMode=process, so only the listening sshd process goes.
+async function reloadSshd(helpers, how) {
+  if (how === 'socket') {
+    // sshd-socket-generator copies `Port` into the socket's ListenStream on daemon-reload.
+    await run(helpers, 'systemctl', ['daemon-reload'], quiet);
+    const r = await run(helpers, 'systemctl', ['restart', 'ssh.socket'], { timeout: 30_000 });
+    if (r.code !== 0) throw new Error(`The SSH socket didn't restart: ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
+    return;
+  }
+  // Ubuntu's unit is ssh, others sshd.
+  const act = how === 'restart' ? 'restart' : 'reload';
+  const r = await run(helpers, 'systemctl', [act, 'ssh'], quiet);
+  if (r.code !== 0) await run(helpers, 'systemctl', [act, 'sshd'], { timeout: 30_000 });
+}
+
+const restoreFile = (f, data) => (data === null ? fs.rm(f, { force: true }) : fs.writeFile(f, data));
+const jailText = (on, ports) => `# Managed by wcloud (portal: Server → Security).\n[sshd]\n${on
+  ? `enabled = true\nbackend = systemd\njournalmatch = _COMM=sshd + _COMM=sshd-session\nport = ${ports}\nmaxretry = 5\nfindtime = 10m\nbantime = 1h\n`
+  : 'enabled = false\n'}`;
+
+/**
+ * SSH settings { port?, passwordLogin?, harden? }, merged with the current ones and written as one
+ * drop-in, tested with `sshd -t`, applied. A port change: open the new port in the firewall and
+ * fail2ban (both ports), move sshd, check the new port listens, only then close the old one.
+ * Any failure up to that point undoes everything.
+ */
+export async function setSshd(helpers, change) {
   const main = await fs.readFile('/etc/ssh/sshd_config', 'utf8').catch(() => '');
   if (!/^\s*Include\s+\/etc\/ssh\/sshd_config\.d\/\*\.conf/mi.test(main)) {
-    throw new Error('This server\'s sshd_config doesn\'t read /etc/ssh/sshd_config.d — change PasswordAuthentication there by hand.');
+    throw new Error('This server\'s sshd_config doesn\'t read /etc/ssh/sshd_config.d — change these settings there by hand.');
   }
-  if (!on && !(await listKeys(helpers, await sshdConfig(helpers))).some(loginKey)) {
+  const cur = await settingsOf(helpers);
+  const next = { ...cur, ...change };
+  const keyLogins = async () => (await listKeys(helpers, await sshdConfig(helpers))).filter(loginKey);
+  if (change.passwordLogin === false && !(await keyLogins()).length) {
     throw new Error('No SSH key is set up for any user — turning password login off would lock everyone out. Add a key first.');
   }
-  const v = on ? 'yes' : 'no';
+  if (next.harden) {
+    // Hardening turns root's password login off, so someone has to be able to get in with a key.
+    const users = new Set((await keyLogins()).map((k) => k.user));
+    const sudo = ((await run(helpers, 'getent', ['group', 'sudo'], quiet)).stdout.trim().split(':')[3] || '').split(',');
+    if (!users.has('root') && ![...users].some((u) => sudo.includes(u))) {
+      throw new Error('Hardening turns off root login by password, and no SSH key is set up for root or a sudo user — you would be locked out. Add a key first.');
+    }
+  }
+
+  const moved = next.port !== cur.port;
+  if (moved) {
+    const why = portProblem(next.port);
+    if (why) throw new Error(why);
+    if (await portTaken(helpers, next.port)) throw new Error('That port is already used by another program on this server.');
+  }
+  const fw = (await readSettings()).enabled;
+  const prevJail = await fs.readFile(JAIL, 'utf8').catch(() => null);
+  const f2b = /^enabled = true$/m.test(prevJail ?? '');
   const prev = await fs.readFile(DROPIN, 'utf8').catch(() => null);
-  await applySshd(helpers, `# Managed by wcloud (portal: Server → Security). Edits here are overwritten.\nPasswordAuthentication ${v}\nKbdInteractiveAuthentication ${v}\n`, prev);
+  const how = !moved ? 'reload' : (await socketMode(helpers)) ? 'socket' : 'restart';
+  const restartF2b = async () => {
+    const r = await run(helpers, 'systemctl', ['restart', 'fail2ban'], { timeout: 60_000 });
+    if (r.code !== 0) throw new Error('fail2ban didn\'t restart — see the log above.');
+  };
+
+  const undo = [];
+  let applied = false;
+  try {
+    if (moved && fw) {
+      await applyFirewall(helpers, {}, { sshPorts: [cur.port, next.port] }); // the new port opens before sshd moves
+      undo.push(() => applyFirewall(helpers, {}, { sshPorts: [cur.port] }));
+    }
+    if (moved && f2b) {
+      undo.push(async () => { await restoreFile(JAIL, prevJail); await restartF2b(); });
+      await fs.writeFile(JAIL, jailText(true, `${cur.port},${next.port}`), { mode: 0o644 });
+      await restartF2b();
+    }
+    undo.push(async () => { await restoreFile(DROPIN, prev); if (applied) await reloadSshd(helpers, how).catch(() => {}); });
+    await fs.writeFile(DROPIN, renderDropin(next), { mode: 0o644 });
+    const t = await sshdRun(helpers, ['-t'], { timeout: 30_000 });
+    if (t.code !== 0) throw new Error(`sshd rejected the change, nothing was applied: ${(t.stderr || t.stdout).trim().slice(0, 300)}`);
+    applied = true;
+    await reloadSshd(helpers, how);
+    if (moved && !(await listening(helpers, next.port))) throw new Error(`sshd isn't listening on port ${next.port} — the change was undone.`);
+  } catch (e) {
+    for (const u of undo.reverse()) await u().catch(() => {});
+    throw e;
+  }
+  // Committed: the new port is up. Only now does the old one close.
+  if (moved) {
+    try {
+      if (fw) await applyFirewall(helpers, {});
+      if (f2b) { await fs.writeFile(JAIL, jailText(true, String(next.port)), { mode: 0o644 }); await restartF2b(); }
+    } catch (e) {
+      throw new Error(`SSH now listens on port ${next.port}, but closing port ${cur.port} in the firewall or fail2ban failed: ${e.message}`);
+    }
+  }
 }
 
 export async function setFail2ban(helpers, on) {
@@ -183,10 +321,9 @@ export async function setFail2ban(helpers, on) {
   if (!(await pathExists('/usr/bin/fail2ban-client'))) return; // off and never installed: nothing to do
   // The journal backend: Ubuntu 24.04 has no auth.log unless rsyslog is installed.
   // Matched by program, not unit: fail2ban's default is sshd.service, Ubuntu's unit is ssh.service.
-  await fs.writeFile(JAIL, on
-    ? '# Managed by wcloud (portal: Server → Security).\n[sshd]\nenabled = true\nbackend = systemd\njournalmatch = _COMM=sshd + _COMM=sshd-session\nmaxretry = 5\nfindtime = 10m\nbantime = 1h\n'
-    : '# Managed by wcloud (portal: Server → Security).\n[sshd]\nenabled = false\n', { mode: 0o644 });
-  if (on) await run(helpers, 'systemctl', ['enable', 'fail2ban'], { quiet: true, timeout: 30_000 });
+  // The jail bans on the port sshd listens on now (the port option is what the ban rule blocks).
+  await fs.writeFile(JAIL, jailText(on, (await settingsOf(helpers)).port), { mode: 0o644 });
+  if (on) await run(helpers, 'systemctl', ['enable', 'fail2ban'], quiet);
   const r = await run(helpers, 'systemctl', ['restart', 'fail2ban'], { timeout: 60_000 });
   if (on && r.code !== 0) throw new Error('fail2ban didn\'t start — see the log above.');
 }
@@ -229,5 +366,16 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   assert.equal(loginKey({ options: 'no-pty,command="x"' }), false);
   assert.equal(loginKey({ options: 'from="10.0.0.1",restrict' }), false);
   assert.equal(loginKey({ options: 'no-pty' }), true);
+  const hard = { port: 2222, passwordLogin: true, harden: true };
+  assert.deepEqual(parseDropin(renderDropin(hard)), hard);
+  assert.deepEqual(parseDropin(renderDropin({ port: 22, passwordLogin: false, harden: false })), { port: 22, passwordLogin: false, harden: false });
+  assert.match(renderDropin(hard), /^PermitRootLogin prohibit-password$/m);
+  assert.match(renderDropin(hard), /^KbdInteractiveAuthentication no$/m);
+  assert.match(renderDropin({ ...hard, harden: false }), /^KbdInteractiveAuthentication yes$/m);
+  assert.doesNotMatch(renderDropin({ ...hard, harden: false }), /PermitRootLogin|MaxAuthTries/);
+  assert.equal(portProblem(22), null);
+  assert.equal(portProblem(2222), null);
+  for (const bad of [0, 65536, '2222', 1000, 80, 443, 3306, 6379, config.port]) assert.notEqual(portProblem(bad), null, String(bad));
+  assert.match(jailText(true, '22,2222'), /^port = 22,2222$/m);
   console.log('ssh ok');
 }
