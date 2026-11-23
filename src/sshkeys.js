@@ -6,6 +6,7 @@
 // service. Standalone (builtins only). Request JSON on stdin:
 //   { op: 'list', akf }            → { keys: [{ user, file, type, fingerprint, comment, options, modifiedAt }] }
 //   { op: 'remove', akf, list }    → { removed }   list: [{ user, fingerprint }]
+//   { op: 'add', akf, list }       → { results: [{ user, added, file, fingerprint, comment }] }   list: [{ user, key }]
 // akf = sshd's AuthorizedKeysFile (from `sshd -T`). Failure: { error } on stdout, exit 1.
 // Only users with a login shell; only regular files.
 // Each user's files are read and changed AS that user (asUser: a child process
@@ -35,6 +36,24 @@ export function parseKeyLine(line) {
     type: parts[i], fingerprint: `SHA256:${crypto.createHash('sha256').update(blob).digest('base64').replace(/=+$/, '')}`,
     comment: parts.slice(i + 2).join(' '), options: i > 0 ? parts.slice(0, i).join(' ') : '',
   };
+}
+
+/** A key to add: `<type> <base64> [comment]`, one line, no options → { type, fingerprint, comment, line }, or { error }. */
+export function parseNewKey(input) {
+  const line = String(input ?? '').trim();
+  if (line.length > 16 * 1024) return { error: 'The key is over 16 KB.' };
+  if (/PRIVATE KEY/.test(line)) return { error: 'That is a private key. Paste the public key line (the .pub file).' };
+  const m = line.match(/^(\S+) (\S+)(?: (.*))?$/);
+  if (!m || !KEY_TYPE.test(m[1])) return { error: 'Paste one public key line: its type (ssh-ed25519, ssh-rsa, ecdsa-sha2-…), the key, then an optional comment. Options are not allowed.' };
+  const [, type, b64, comment = ''] = m;
+  // The blob starts with its own type name (uint32 length + name): it must be the declared type.
+  const blob = Buffer.from(b64, 'base64');
+  const n = blob.length >= 4 ? blob.readUInt32BE(0) : -1;
+  if (blob.toString('base64').replace(/=+$/, '') !== b64.replace(/=+$/, '') || n < 0 || 4 + n > blob.length || blob.toString('latin1', 4, 4 + n) !== type) {
+    return { error: `The key data isn't a valid ${type} public key.` };
+  }
+  if (comment.length > 100 || !/^[\x20-\x7e]*$/.test(comment)) return { error: 'The comment is printable ASCII, 100 characters at most.' };
+  return { type, fingerprint: parseKeyLine(line).fingerprint, comment, line };
 }
 
 async function loginUsers() {
@@ -96,6 +115,38 @@ async function userRemove(u, akf, fingerprints) {
   return removed;
 }
 
+// Appends to the user's first key file. Runs as the user: the folder and file must be theirs,
+// and a link is refused (O_NOFOLLOW), so nothing outside their own files can be written.
+async function userAdd(u, akf, key) {
+  const k = parseNewKey(key);
+  if (k.error) throw new Error(k.error);
+  const files = keyFiles(u, akf);
+  if (!files.length) throw new Error('sshd reads no key file for this user (AuthorizedKeysFile none).');
+  const result = (added) => ({ added, file: files[0], fingerprint: k.fingerprint, comment: k.comment });
+  const uid = process.getuid();
+  const dir = path.dirname(files[0]); // ~/.ssh by default
+  await fs.mkdir(dir, { mode: 0o700 }).catch((e) => { if (e.code !== 'EEXIST') throw e; });
+  const d = await fs.lstat(dir);
+  if (!d.isDirectory() || d.uid !== uid) throw new Error(`${dir} must be a folder of this user, not a link.`);
+  const st = await fs.lstat(files[0]).catch(() => null);
+  if (st && (!st.isFile() || st.uid !== uid)) throw new Error(`${files[0]} must be a file of this user, not a link.`);
+  for (const f of files) {
+    const r = await readRegular(f);
+    if (r?.text.split('\n').some((l) => parseKeyLine(l)?.fingerprint === k.fingerprint)) return result(false);
+  }
+  const fh = await fs.open(files[0], fs.constants.O_RDWR | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
+  try {
+    const fst = await fh.stat();
+    if (!fst.isFile() || fst.uid !== uid) throw new Error(`${files[0]} must be a file of this user, not a link.`);
+    let sep = '';
+    if (fst.size) { const last = Buffer.alloc(1); await fh.read(last, 0, 1, fst.size - 1); if (last[0] !== 10) sep = '\n'; }
+    await fh.appendFile(`${sep}${k.line}\n`);
+  } finally {
+    await fh.close();
+  }
+  return result(true);
+}
+
 // ── Root: one child per login user ──────────────────────────────────────────
 
 // Runs this script as the user (uid/gid), in / so no root cwd leaks in, env cleared.
@@ -133,15 +184,32 @@ async function remove(akf, items) {
   return { removed };
 }
 
+// Every user and key is checked before the first write. Users must already exist with a login shell.
+async function add(akf, list) {
+  const users = await loginUsers();
+  const todo = list.map((x) => {
+    const u = users.find((v) => v.name === x.user);
+    if (!u) throw new Error(`${x.user} isn't a user with a login shell on this server. Keys are only added to existing users.`);
+    const k = parseNewKey(x.key);
+    if (k.error) throw new Error(k.error);
+    return { u, user: x.user, key: k.line };
+  });
+  const results = [];
+  for (const t of todo) results.push({ user: t.user, ...(await asUser(t.u, { op: 'add', akf, key: t.key })) });
+  return { results };
+}
+
 if (process.argv[1] === SELF) {
   let input = '';
   for await (const c of process.stdin) input += c;
   try {
     const req = JSON.parse(input);
     let out;
-    if (req.home) out = req.op === 'remove' ? { removed: await userRemove({ name: req.name, home: req.home }, req.akf, req.fingerprints) }
-      : { keys: await userKeys({ name: req.name, home: req.home }, req.akf) };
-    else out = req.op === 'remove' ? await remove(req.akf, req.list || []) : await list(req.akf);
+    const u = { name: req.name, home: req.home };
+    if (req.home) out = req.op === 'remove' ? { removed: await userRemove(u, req.akf, req.fingerprints) }
+      : req.op === 'add' ? await userAdd(u, req.akf, req.key) : { keys: await userKeys(u, req.akf) };
+    else if (req.op === 'remove') out = await remove(req.akf, req.list || []);
+    else out = req.op === 'add' ? await add(req.akf, req.list || []) : await list(req.akf);
     process.stdout.write(JSON.stringify(out));
   } catch (e) {
     process.stdout.write(JSON.stringify({ error: e.message }));

@@ -1,16 +1,26 @@
 import { logger } from '../lib/log.js';
-import { setSshd, setFail2ban, removeKeys } from '../lib/ssh.js';
+import { setSshd, setFail2ban, removeKeys, addKeys } from '../lib/ssh.js';
 
 // ============================================================
 //  sshsecurity — SSH settings of the whole server (lib/ssh.js)
 // ============================================================
-// params: { passwordLogin?: bool, harden?: bool, port?: 1–65535, fail2ban?: bool, removeKeys?: [{ user, fingerprint }] }
-// Each part runs only when given. Keys go first, so the lockout checks of
+// params: { passwordLogin?: bool, harden?: bool, port?: 1–65535, fail2ban?: bool, addKeys?: [{ user, key }], removeKeys?: [{ user, fingerprint }] }
+// Each part runs only when given. Keys go first (added, then removed), so the lockout checks of
 // password login see what's left. The sshd part (port, password login, hardening)
 // is one change to the drop-in.
 export async function runSshSecurity(job, helpers, p) {
   const { step, ok, done } = logger(helpers);
   const did = [];
+  if (p.addKeys?.length) {
+    step(p.addKeys.length === 1 ? 'Add an SSH key' : `Add ${p.addKeys.length} SSH keys`);
+    const added = await addKeys(helpers, p.addKeys);
+    for (const r of added) {
+      const name = r.comment || '(no comment)';
+      ok(r.added ? `Added key ${name} (${r.fingerprint}) for ${r.user}` : `Key ${name} (${r.fingerprint}) for ${r.user} is already there`);
+    }
+    const n = added.filter((r) => r.added).length;
+    if (n) did.push(n === 1 ? 'added 1 key' : `added ${n} keys`);
+  }
   if (p.removeKeys?.length) {
     step(`Remove ${p.removeKeys.length === 1 ? 'an SSH key' : `${p.removeKeys.length} SSH keys`}`);
     const n = await removeKeys(helpers, p.removeKeys);

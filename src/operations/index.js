@@ -3,6 +3,7 @@ import { runPermissions } from './permissions.js';
 import { runMalwareScan } from './malwarescan.js';
 import { runSshSecurity } from './sshsecurity.js';
 import { portProblem } from '../lib/ssh.js';
+import { parseNewKey } from '../sshkeys.js';
 import { runFirewall } from './firewall.js';
 import { runDelete } from './delete.js';
 import { runUpdate } from './update.js';
@@ -626,7 +627,7 @@ const UNIX_USER_RE = /^[a-z_][a-z0-9_.-]{0,31}\$?$/i;
 const sshSecurityOp = {
   name: 'sshsecurity',
   timeout: 20 * 60_000, // installing fail2ban
-  // params: { passwordLogin?, harden?, port?, fail2ban?, removeKeys?: [{ user, fingerprint }] }
+  // params: { passwordLogin?, harden?, port?, fail2ban?, addKeys?: [{ user, key }], removeKeys?: [{ user, fingerprint }] }
   validate(p = {}) {
     const errors = [];
     const clean = {};
@@ -637,6 +638,15 @@ const sshSecurityOp = {
     if (p.port !== undefined) {
       const why = portProblem(p.port);
       if (why) errors.push(why); else clean.port = p.port;
+    }
+    if (p.addKeys !== undefined) {
+      if (!Array.isArray(p.addKeys) || !p.addKeys.length || p.addKeys.length > 20
+        || !p.addKeys.every((k) => k && UNIX_USER_RE.test(k.user) && typeof k.key === 'string')) errors.push('addKeys must be a list of { user, key }, 1 to 20 keys');
+      else {
+        const parsed = p.addKeys.map((k) => parseNewKey(k.key));
+        const bad = parsed.filter((x) => x.error).map((x) => x.error);
+        if (bad.length) errors.push(...bad); else clean.addKeys = p.addKeys.map((k, i) => ({ user: k.user, key: parsed[i].line }));
+      }
     }
     if (p.removeKeys !== undefined) {
       if (!Array.isArray(p.removeKeys) || p.removeKeys.length > 100

@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import { run, pathExists, withLock, sshdRun, sleep } from './sys.js';
 import config from '../config.js';
 import { applyFirewall, readSettings } from './firewall.js';
+import { parseNewKey } from '../sshkeys.js';
 
 // ============================================================
 //  ssh.js — who can log in over SSH, who did, who tried
@@ -10,7 +11,7 @@ import { applyFirewall, readSettings } from './firewall.js';
 // authorized_keys entry of every user with a login shell, the last week's
 // logins and failed attempts from the journal, fail2ban's sshd jail.
 // Changes (op `sshsecurity`): the SSH port, password login, hardening (one drop-in that wins
-// over cloud-init's), fail2ban for sshd on/off, remove keys. Which keys are
+// over cloud-init's), fail2ban for sshd on/off, add and remove keys. Which keys are
 // *expected* is the portal's to know — the agent only reports and removes.
 // ============================================================
 
@@ -329,6 +330,15 @@ export async function setFail2ban(helpers, on) {
 }
 
 /**
+ * Add keys: [{ user, key }] → [{ user, added, file, fingerprint, comment }], in order. Each key goes to
+ * the end of the user's first AuthorizedKeysFile, as that user; a key the user already has is not added.
+ */
+export async function addKeys(helpers, list) {
+  const cfg = await sshdConfig(helpers);
+  return (await keys(helpers, { op: 'add', akf: cfg.authorizedkeysfile, list })).results;
+}
+
+/**
  * Remove keys: [{ user, fingerprint }]. Each changed file is backed up next to
  * itself (authorized_keys.wcloud-<time>.bak) and replaced atomically with the
  * same owner and mode. Returns how many lines were removed.
@@ -377,5 +387,16 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   assert.equal(portProblem(2222), null);
   for (const bad of [0, 65536, '2222', 1000, 80, 443, 3306, 6379, config.port]) assert.notEqual(portProblem(bad), null, String(bad));
   assert.match(jailText(true, '22,2222'), /^port = 22,2222$/m);
+  // Key lines to add: good ones pass; options, private keys, a wrong type, bad base64, a bad comment, oversize fail.
+  const wire = (t) => Buffer.concat([Buffer.from([0, 0, 0, t.length]), Buffer.from(t), Buffer.alloc(40, 7)]).toString('base64');
+  const ed = `ssh-ed25519 ${wire('ssh-ed25519')}`;
+  for (const good of [ed, `ssh-ed25519 ${wire('ssh-ed25519')} you@laptop`, `ssh-rsa ${wire('ssh-rsa')} a b`, `ecdsa-sha2-nistp256 ${wire('ecdsa-sha2-nistp256')}`, `${ed} ${'x'.repeat(100)}`]) {
+    assert.equal(parseNewKey(good).error, undefined, good.slice(0, 40));
+    assert.match(parseNewKey(good).fingerprint, /^SHA256:/);
+  }
+  for (const bad of [`no-pty ${ed}`, `command="id" ${ed}`, '-----BEGIN OPENSSH PRIVATE KEY-----', `ssh-rsa ${wire('ssh-ed25519')}`,
+    'ssh-ed25519 AAAA!!!', `${ed}\nssh-rsa ${wire('ssh-rsa')}`, `${ed} ${'x'.repeat(101)}`, `${ed} café`, `ssh-ed25519 ${'A'.repeat(17000)}`, 'ssh-ed25519', '']) {
+    assert.ok(parseNewKey(bad).error, bad.slice(0, 40));
+  }
   console.log('ssh ok');
 }
