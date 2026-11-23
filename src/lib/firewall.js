@@ -85,6 +85,9 @@ export function render(s, { allowedIps = [], sshPorts = [22], agentPort = 8787 }
     'tcp dport { 80, 443 } accept',
     'udp dport 443 accept', // HTTP/3
     ...accept(allowedIps, 'tcp', agentPort), // the portal must always reach the agent
+    // A migration's destination downloads the export from this port (allowPeer, for a while).
+    `ip saddr @peers4 tcp dport ${agentPort} accept`,
+    `ip6 saddr @peers6 tcp dport ${agentPort} accept`,
     ...sshPorts.flatMap((p) => accept(s.sshFrom, 'tcp', p)),
     ...s.openPorts.map((o) => `${o.proto} dport ${o.port} accept`),
   ] : [];
@@ -94,6 +97,8 @@ export function render(s, { allowedIps = [], sshPorts = [22], agentPort = 8787 }
     'table inet wcloud_fw {',
     ...set('blocked4', 'ipv4_addr', b4),
     ...set('blocked6', 'ipv6_addr', b6),
+    '  set peers4 { type ipv4_addr; flags timeout; }',
+    '  set peers6 { type ipv6_addr; flags timeout; }',
     '  chain input {',
     `    type filter hook input priority 0; policy ${s.enabled ? 'drop' : 'accept'};`,
     // Blocks come first: an attacker already connected is cut off, not left to finish.
@@ -203,6 +208,27 @@ export async function applyFirewall(helpers, p, { sshPorts: ports } = {}) {
   });
 }
 
+// ── Peers ────────────────────────────────────────────────────────────────────
+
+const PEER_TIMEOUT = '2h'; // the export token lives 1h; a download already started stays open (established)
+
+/**
+ * Let these addresses reach the agent port for a while: a migration's destination
+ * downloads the export from it. With the firewall off this does nothing (the port is open).
+ * One nft transaction per address (add, delete, add) so a repeat restarts its timeout.
+ */
+export async function allowPeers(helpers, ips) {
+  if (!ips.length || !(await readSettings()).enabled) return;
+  const script = () => ips.map((ip) => {
+    const el = `inet wcloud_fw peers${addrFamily(ip)} { ${ip} timeout ${PEER_TIMEOUT} }`;
+    return `add element ${el}; delete element ${el}; add element ${el}`;
+  }).join('; ');
+  let r = await run(helpers, NFT, [script()], quiet);
+  // Rules loaded by an agent from before peers: load the current ones, then retry.
+  if (r.code !== 0) { await applyFirewall(helpers, {}); r = await run(helpers, NFT, [script()], quiet); }
+  if (r.code !== 0) throw new Error(`The firewall would not let ${ips.join(', ')} download the export: ${(r.stderr || r.stdout).trim().slice(-200)}`);
+}
+
 // Self-check: node src/lib/firewall.js
 if (import.meta.url === `file://${process.argv[1]}`) {
   const assert = (await import('node:assert')).strict;
@@ -224,6 +250,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   assert.ok(on.includes('ip saddr { 198.51.100.2 } tcp dport 8787 accept'));
   assert.ok(on.includes('ip saddr { 192.0.2.1 } tcp dport 22 accept') && on.includes('ip saddr { 192.0.2.1 } tcp dport 2222 accept'));
   assert.ok(on.includes('tcp dport 3000 accept') && on.includes('tcp dport { 80, 443 } accept'));
+  assert.ok(on.includes('set peers4 { type ipv4_addr; flags timeout; }') && on.includes('ip saddr @peers4 tcp dport 8787 accept'));
   const open = render({ ...s, sshFrom: [] }, { allowedIps: [] });
   assert.ok(open.includes('tcp dport 8787 accept') && open.includes('tcp dport 22 accept') && !open.includes('ip saddr {'));
   const off = render({ ...s, enabled: false, blocked: [] });

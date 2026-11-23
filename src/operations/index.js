@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import { cleanSecurity } from '../lib/security.js';
 import { runPermissions } from './permissions.js';
 import { runMalwareScan } from './malwarescan.js';
@@ -749,6 +750,7 @@ const BACKUP_TIMEOUT_MS = parseInt(process.env.AGENT_BACKUP_TIMEOUT_MS || String
 // ============================================================
 //  export — create a portable archive of a site (files + DB + optional SSL)
 // ============================================================
+const allowFrom = (v) => (Array.isArray(v) ? [...new Set(v.filter((a) => typeof a === 'string' && isIP(a)))].slice(0, 8) : []);
 const exportOp = {
   name: 'export',
   timeout: BACKUP_TIMEOUT_MS,
@@ -760,7 +762,8 @@ const exportOp = {
     return {
       ok: errors.length === 0,
       errors,
-      clean: { domain: p.domain, includeSsl: p.includeSsl === true, encryptKey: p.encryptKey || '', local: p.local === true },
+      // allowFrom: the destination's addresses, let through the firewall to download the archive.
+      clean: { domain: p.domain, includeSsl: p.includeSsl === true, encryptKey: p.encryptKey || '', local: p.local === true, allowFrom: allowFrom(p.allowFrom) },
     };
   },
   async run(job, helpers, p) {

@@ -11,6 +11,7 @@ import { requireSpec, publicSpec, siteDir, siteTmp } from '../lib/sites.js';
 import { wpCli } from '../lib/wp.js';
 import { objectCacheActive } from '../lib/cache.js';
 import { makeStagingDir } from './import.js';
+import { allowPeers } from '../lib/firewall.js';
 
 // Temporary export archives and their one-time tokens.
 const exports = new Map();
@@ -250,6 +251,7 @@ export async function runExport(job, helpers, p) {
   // because no later export runs cleanupExports.
   setTimeout(cleanupExports, 3600_000 + 1000).unref();
 
+  await allowPeers(helpers, p.allowFrom || []);
   const fetchUrl = `${publicUrl()}/api/export/${token}`;
 
   // Return URL as job result (not logged — token is secret).
