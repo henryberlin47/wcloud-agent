@@ -26,6 +26,8 @@ import { startWatchdog, checkNow, snapshot, summary, restartService } from './li
 import { readWpVersion, readDbCredentials, wpCli } from './lib/wp.js';
 import { listScans, readScan } from './lib/malware.js';
 import { sshStatus, sshKeys, sshLoginsSince, CURSOR_RE } from './lib/ssh.js';
+import { scanIntegrity } from './lib/integrity.js';
+import { firewallStatus } from './lib/firewall.js';
 import { PHP_VERSIONS, DEFAULT_PHP, installedPhp, fpmService, phpPackageVersions, phpPatch, ensurePhpTuning, ensureFileLimits, listDatabases, nginxPackageVersions, nginxRunsCurrentBinary } from './lib/stack.js';
 import { startPurgeWatcher, objectCacheActive, wpRocketStatus, syncLiteSpeedGuard, syncCachePlugin, wantsHelper } from './lib/cache.js';
 import { spawnWorker, settle, statusFor, UPLOAD_MAX } from './lib/files.js';
@@ -283,6 +285,18 @@ app.get('/api/ssh/logins', async (req, res) => {
   res.json(await sshLoginsSince(NOOP_HELPERS, after));
 });
 app.get('/api/ssh', async (req, res) => res.json(req.query.only === 'keys' ? await sshKeys(NOOP_HELPERS) : await sshStatus(NOOP_HELPERS)));
+
+// Intrusion check (lib/integrity.js; the checks run as root in the worker). The allowlist is checked here: it needs the caller's IP.
+app.get('/api/integrity', async (req, res) => {
+  const findings = await scanIntegrity(NOOP_HELPERS);
+  for (const ip of config.allowedIps) {
+    if (ip !== req.clientIp) findings.push({ key: `allowlist:${ip}`, severity: 'critical', title: `The agent also accepts requests from ${ip}`, detail: 'AGENT_ALLOWED_IPS lists it. Mark it expected if the portal uses that address too.' });
+  }
+  res.json({ scannedAt: new Date().toISOString(), findings });
+});
+
+// Firewall: settings, blocked addresses, what listens (lib/firewall.js). Read-only; changes are the `firewall` op.
+app.get('/api/firewall', async (req, res) => res.json(await firewallStatus(NOOP_HELPERS)));
 
 // What the server can offer in a site's Security tab (lib/security.js).
 app.get('/api/security', async (req, res) => res.json(await securityAvailable()));
@@ -679,7 +693,7 @@ app.post('/api/self-update', async (req, res) => {
     const reset = await git(['reset', '--hard', 'origin/main']);
     if (reset.code !== 0) return res.status(500).json({ ok: false, error: `git reset failed: ${tail(reset)}` });
     const after = (await git(['rev-parse', '--short', 'HEAD'], 10000)).stdout.trim();
-    const inst = await run(helpers, 'npm', ['install', '--omit=dev', '--no-audit', '--no-fund'],
+    const inst = await run(helpers, 'npm', ['ci', '--omit=dev', '--no-audit', '--no-fund'],
       { cwd: REPO_ROOT, quiet: true, timeout: 300000 });
     if (inst.code !== 0) {
       // New code + old deps would crash-loop on the next restart/reboot — and a

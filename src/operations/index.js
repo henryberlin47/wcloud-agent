@@ -2,6 +2,7 @@ import { cleanSecurity } from '../lib/security.js';
 import { runPermissions } from './permissions.js';
 import { runMalwareScan } from './malwarescan.js';
 import { runSshSecurity } from './sshsecurity.js';
+import { runFirewall } from './firewall.js';
 import { runDelete } from './delete.js';
 import { runUpdate } from './update.js';
 import { runDeploy } from './deploy.js';
@@ -24,7 +25,8 @@ import { runCfCache } from './cfcache.js';
 import { cleanJob, WP_CRON_EVERY } from '../lib/cron.js';
 import { cleanRedirects, cleanDomainRedirect } from '../lib/sites.js';
 import { cleanPhpSettings, cleanFpm } from '../lib/phpsettings.js';
-import { RULE_MAX } from '../lib/nginxrules.js';
+import { addrFamily, tooWide } from '../lib/firewall.js';
+import { RULE_MAX, ruleProblem } from '../lib/nginxrules.js';
 import { CACHE_MODES } from '../lib/sites.js';
 import { PLUGIN_NAME, UPLOAD_NAME } from '../lib/plugins.js';
 import { SITE_TYPES } from '../lib/sites.js';
@@ -343,6 +345,7 @@ const nginxruleOp = {
       const content = typeof p.content === 'string' ? p.content : '';
       if (!name || name.length > 60 || /[\r\n]/.test(name)) errors.push('name is required (60 characters max, one line)');
       if (content.length > RULE_MAX || content.includes('\0')) errors.push('content is too large');
+      else if (ruleProblem(content)) errors.push(ruleProblem(content));
       Object.assign(clean, { name, content, enabled: p.enabled !== false });
     }
     return { ok: errors.length === 0, errors, clean };
@@ -591,6 +594,36 @@ const sshSecurityOp = {
   },
 };
 
+// ============================================================
+//  firewall — the firewall and blocked addresses (firewall.js)
+// ============================================================
+const firewallOp = {
+  name: 'firewall',
+  // params: { enabled?, sshFrom?: [addr], openPorts?: [{ port, proto }], block?: [addr], unblock?: [addr] }
+  validate(p = {}) {
+    const errors = [];
+    const clean = {};
+    if (p.enabled !== undefined) {
+      if (typeof p.enabled !== 'boolean') errors.push('enabled must be true or false'); else clean.enabled = p.enabled;
+    }
+    for (const k of ['sshFrom', 'block', 'unblock']) {
+      if (p[k] === undefined) continue;
+      if (!Array.isArray(p[k]) || p[k].length > 500 || !p[k].every((a) => typeof a === 'string' && addrFamily(a.trim()))) errors.push(`${k} must be a list of IP addresses or CIDR ranges`);
+      else clean[k] = p[k].map((a) => a.trim());
+    }
+    if (clean.block?.some(tooWide)) errors.push('A block can\'t be wider than /8 (IPv4) or /32 (IPv6)');
+    if (p.openPorts !== undefined) {
+      if (!Array.isArray(p.openPorts) || p.openPorts.length > 100 || !p.openPorts.every((o) => o && Number.isInteger(o.port) && o.port >= 1 && o.port <= 65535 && ['tcp', 'udp'].includes(o.proto))) errors.push('openPorts must be a list of { port: 1–65535, proto: tcp or udp }');
+      else clean.openPorts = p.openPorts.map((o) => ({ port: o.port, proto: o.proto }));
+    }
+    if (!errors.length && !Object.keys(clean).length) errors.push('nothing to change');
+    return { ok: errors.length === 0, errors, clean };
+  },
+  async run(job, helpers, p) {
+    await runFirewall(job, helpers, p);
+  },
+};
+
 const permissionsOp = {
   name: 'permissions',
   timeout: 60 * 60_000, // a site with many files
@@ -815,7 +848,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, deploy, php: phpOp, phpupdate: phpUpdateOp, nginxupdate: nginxUpdateOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, firewall: firewallOp, deploy, php: phpOp, phpupdate: phpUpdateOp, nginxupdate: nginxUpdateOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

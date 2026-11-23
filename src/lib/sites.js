@@ -619,13 +619,21 @@ export async function deleteSite(helpers, domain, spec = null) {
   const user = s?.user && USER_RE.test(s.user) ? s.user : null;
   const ids = user ? await userIds(user).catch(() => null) : null;
   if (ids && ids.uid >= 1000) {
-    await run(helpers, 'pkill', ['-KILL', '-u', user], { quiet: true, timeout: 15_000 });
+    // Repeat until none is left: a process forked after one kill would survive
+    // and keep swapping folders. pkill exits 1 when nothing matched.
+    for (let i = 0; i < 10; i++) {
+      if ((await run(helpers, 'pkill', ['-KILL', '-u', user], { quiet: true, timeout: 15_000 })).code !== 0) break;
+      await sleep(300);
+    }
   }
   if (user && s.type === 'wordpress') {
     if (!(await dropDatabase(helpers, user))) warn('The site database could not be removed — remove it manually.');
     await dropRedisUser(helpers, user, s.redisDb);
   }
-  await removePath(siteDir(domain));
+  // rm, not fs.rm: rm walks by file descriptor and unlinks a link rather than
+  // deleting its target; fs.rm walks by path and follows a folder swapped for a link.
+  const rmSite = await run(helpers, 'rm', ['-rf', '--one-file-system', '--', siteDir(domain)], { timeout: 30 * 60_000 });
+  if (rmSite.code !== 0) throw new Error('The site files could not be removed.');
   await removePath(pageCacheDir(domain));
   await removePath(cfDnsTokenPath(domain));
   await removePath(cfCachePath(domain));

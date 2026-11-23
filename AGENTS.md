@@ -140,7 +140,7 @@ as the source of truth for writing code** — the graph is only a map.
    certificate being issued or installed (le-http, le-dns-cf, custom), expiry
    after 7 days, and site delete.
 - `POST /api/op/:type` — validate + enqueue an operation → `{ jobId, state }`.
-- `POST /api/self-update` — refuses (409) while any job is queued/running (the restart would cut it off) or another update runs; `git fetch origin` + `reset --hard origin/main` + `npm install` — an npm failure resets back to the previous commit (new code + old deps would crash-loop on the next restart); respond `{ ok, updated, old_commit, new_commit, version }`, then restart via a *systemd-run 2s timer* (detached — the timer outlives the process that gets SIGTERM'd). Origin/branch hardcoded: this runs remote code as root, no request body ever reaches a shell.
+- `POST /api/self-update` — refuses (409) while any job is queued/running (the restart would cut it off) or another update runs; `git fetch origin` + `reset --hard origin/main` + `npm ci` (lockfile-exact) — an npm failure resets back to the previous commit (new code + old deps would crash-loop on the next restart); respond `{ ok, updated, old_commit, new_commit, version }`, then restart via a *systemd-run 2s timer* (detached — the timer outlives the process that gets SIGTERM'd). Origin/branch hardcoded: this runs remote code as root, no request body ever reaches a shell.
 - `POST /api/backup-test`, `POST /api/backup-delete` — quick S3 calls against the Spaces creds passed **in the request body** (per user, per job). Creds live in the S3 client for one call only — never written to config, never logged. `backup-test` is a full round-trip: list (read), then write a tiny probe object and delete it. A read-only check passes on a Space the key can't write to, so the failure would otherwise surface only after a whole archive was built.
 - `GET /api/jobs`, `/api/jobs/:id`, `/logs`, `/stream` (SSE), `POST /:id/cancel` —
   job status/logs/cancel. Jobs are **in-memory** (`src/jobs.js`), forgotten ~1h
@@ -182,16 +182,33 @@ as the source of truth for writing code** — the graph is only a map.
 - `GET /api/ssh` — SSH on the server (`lib/ssh.js`): effective sshd settings
   (`sshd -T`), every `authorized_keys` entry of users with a login shell
   (OpenSSH SHA256 fingerprints), the last 7 days of logins / failed attempts
-  from the journal (`-t sshd -t sshd-session`), fail2ban's sshd jail. The key
-  files are read by `src/sshkeys.js` run through `systemd-run --pipe` — the
-  agent's own sandbox (ProtectHome) can't see /root or /home. Which keys are
-  expected is the portal's list (`ssh_trusted_keys` on the server doc).
+  from the journal (`_COMM=sshd` / `sshd-session`: the process name journald
+  sets — never `-t`, which any program can write; messages are anchored, since
+  a username is attacker text), fail2ban's sshd jail. The key files are read by
+  `src/sshkeys.js` run through `systemd-run --pipe` — the agent's own sandbox
+  (ProtectHome) can't see /root or /home — and each user's files are read and
+  changed AS that user (a child with its uid), so a symlink a user plants can't
+  reach root's files. Which keys are expected is the portal's list
+  (`ssh_trusted_keys` on the server doc, `user|fingerprint`).
   `?only=keys` → just the keys (the portal's new-key alert, every 5 min).
 - `GET /api/ssh/logins?after=<journal cursor>` — accepted SSH logins after that
-  journal position, each with the authorized_keys entry it used (`key: null`
-  = no longer on the server) → `{ cursor, logins }`. No/unknown cursor → a new
-  starting point (`knownIps` = last week's login addresses, nothing alerted).
-  The portal's health sweep asks every minute (watch.ts `checkSshLogins`).
+  journal position, each with the authorized_keys entry of the SAME user it used
+  (`key: null` = not in that user's file any more) → `{ cursor, logins }`. No/unknown
+  cursor → a new starting point (`knownIps` = last week's login addresses, nothing
+  alerted). The portal's health sweep asks every minute (watch.ts `checkSshLogins`).
+  Self-check: `node src/lib/ssh.js`.
+- `GET /api/firewall` — the firewall (`lib/firewall.js`, §5): `{ available (nft installed), enabled, sshPorts (sshd -T), sshFrom, blocked, openPorts, agentFrom (the allowlist), agentPort, listening (`ss -ltnupH`, non-loopback: `{ proto, port, addr, process }`), persisted (boot unit enabled) }`. Read-only; changes are the `firewall` op.
+- `GET /api/integrity` — intrusion check: `{ scannedAt, findings: [{ key, severity:
+  critical|warning|info, title, detail }] }`. `src/integrity-worker.js` runs as root
+  outside the sandbox (`systemd-run --pipe`, like `sshkeys.js`, via `lib/integrity.js`)
+  and checks login accounts, sudo rules, `ld.so.preload` and unpackaged `ld.so.conf.d`,
+  setuid files in unusual places, attack tools, `dpkg -V` changes to the packages that
+  matter (conffiles skipped), unpackaged units/cron, sshd's key sources, root's private
+  keys, ransom tables in MariaDB and changed agent code. The route adds `allowlist:<ip>`
+  for each `AGENT_ALLOWED_IPS` entry that isn't the caller. Findings are facts to review:
+  the portal marks expected keys (`integrity_ok`) and alerts on new ones every 15 min
+  (watch.ts `checkIntegrity`). A root already taken over can hide things from this scan,
+  so it catches intrusions early, not after. Self-check: `node src/lib/integrity.js`.
 - `GET /api/agent-log?lines=&q=` — the agent's own journal (`journalctl -u wcloud -o json`,
   `src/lib/agentlog.js`) → `{ entries: [{ time, level, message }], matched }`, filtered
   over the last 5000 entries. `jobs.js` writes one line per job start/finish there
@@ -239,6 +256,7 @@ Current ops: **deploy** (`type` wordpress|static + `php` → `sites.createSite`,
 cron/procs/locks, then `sites.deleteSite`; requires `confirm:true`), **ssl** (mode-driven, below),
 **sslDnsVerify** (step 2 of manual DNS-01, below),
 **sshsecurity** (`{ passwordLogin?, fail2ban?, removeKeys? }`: drop-in `/etc/ssh/sshd_config.d/00-wcloud.conf` tested with `sshd -t` then `systemctl reload ssh`; fail2ban jail `jail.d/wcloud-sshd.conf` on the journal, matched by `_COMM` (Ubuntu's unit is ssh.service, not sshd.service); removed keys leave a `.wcloud-<time>.bak`; refuses password-off with no key, and removing every key while password login is off),
+**firewall** (`{ enabled?, sshFrom?, openPorts?, block?, unblock? }`, each optional, at least one: `lib/firewall.js` writes `/etc/wcloud/firewall.json` (the settings) and renders one nftables table `inet wcloud_fw` to `firewall.nft`; `nft -c -f` checks it, `nft -f` loads it (a file applies as one transaction, nothing else is touched — ufw, fail2ban keep their own tables); on any failure the previous files come back. The boot unit `wcloud-firewall.service` reloads the file. Blocked addresses (IPv4/IPv6, CIDR, ≤500, never wider than /8 or /32) drop both ways, with the firewall on or off; when on, the default is drop, with the agent's port open to its allowlist (anywhere if empty), SSH to `sshFrom` on every sshd port, web on 80/443 and UDP 443, and the extra ports),
 **purge** (WP Rocket + object cache), **siteconfig** (`realIp`, `redirects`,
 `domainRedirect`, `phpSettings`, `fpm` → spec → `applySite`; validated by
 `sites.cleanRedirects` / `cleanDomainRedirect` / `phpsettings.cleanPhpSettings` / `cleanFpm`),
@@ -477,6 +495,7 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   `AggregateError` whose own message is just `"AggregateError"` (Node races IPv6
   and IPv4), so the real code lives in `.errors`/`.cause`.
 - **certcheck.js** — `checkCustomCert(domain, cert, key, {www})`: in-memory (Node crypto) validation of a user certificate — PEM parses, key matches, `checkHost` covers the domain, not expired/not-yet-valid; www-coverage and self-signed are warnings. Shared by the ssl op (custom) and deploy. The portal runs the same rules (`server/utils/certcheck.ts`) for its live form check.
+- **firewall.js** — the server's firewall (op `firewall`, §3; `GET /api/firewall`, §2). `render(settings, { allowedIps, sshPorts, agentPort })` is pure and builds the whole table: blocks first (so an already-open connection from a blocked address is cut), then the rules the portal must never lose (the agent's allowlist; an empty or all-invalid list means anywhere). `applyFirewall` runs under the `'firewall'` lock and installs nftables if missing. Self-check: `node src/lib/firewall.js`.
 - **log.js** — the step logger used by operations.
 - **wpcore.js** — `wordpressCore()`: the server's one copy of the latest
   WordPress (`/var/cache/wcloud-wp/wordpress-<v>.tar.gz`, root 0755/0644, newest 2
@@ -681,6 +700,12 @@ loopback; set to the box's IP to accept portal calls), `AGENT_PORT` (8787),
   `/var/www/<d>/conf/nginx/*.conf`.
 - **A site-user process must never get the agent's env** (AGENT_TOKEN would be
   readable via /proc by the site) — `run({as})` builds a clean env.
+- **Root copies or changes nothing a site controls by path.** Export copies the
+  site's files with tar running AS the site (`copySiteFiles`; root only unpacks the
+  stream into staging: `cp` opened children by path, so a folder swapped for a link
+  mid-copy sent root into /etc). Permissions run `chmod`/`find` as the site user;
+  root sets only `chown -h`/`chgrp -h`. Delete kills the user's processes until none
+  are left, then `rm -rf` (rm walks by fd; `fs.rm` walks by path).
 - **Anything a site can write is untrusted to root**: SQL dumps are handed over
   through the site's own `tmp/` (wp-cli runs as the site), cache files are
   deleted as the site user, staging dirs are root-only. Export checks the

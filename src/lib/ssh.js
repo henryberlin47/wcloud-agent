@@ -40,34 +40,52 @@ async function keys(helpers, req) {
   return out;
 }
 const listKeys = (helpers, cfg) => keys(helpers, { op: 'list', akf: cfg.authorizedkeysfile }).then((o) => o.keys);
+// A key limited to a command (command=, restrict) doesn't let anyone log in to a shell: not a way in for the lockout guards.
+const loginKey = (k) => !/(^|[\s,])(restrict|command=)/.test(k.options);
 
 // ── Logins (journal) ─────────────────────────────────────────────────────────
-const ACCEPTED = /Accepted (\S+) for (\S+) from (\S+) port \d+(?: ssh2)?(?:: \S+ (SHA256:\S+))?/;
-const FAILED = /Failed (?:password|publickey) for (?!invalid user )(\S+) from (\S+)/; // invalid users: counted by INVALID
-const INVALID = /Invalid user (\S*) from (\S+)/;
+// _COMM (the process name) is set by journald; SYSLOG_IDENTIFIER (-t) is whatever
+// a program says it is — `logger -t sshd` would forge logins. Messages are anchored
+// because a username is attacker text: `Invalid user Accepted password for root …`.
+const JOURNAL = ['_COMM=sshd', '_COMM=sshd-session', '-o', 'json', '--no-pager'];
+const ACCEPTED = /^Accepted (\S+) for (\S+) from ([0-9a-fA-F.:]+) port \d+(?: ssh2)?(?:: \S+ (SHA256:\S+))?/;
+const FAILED = /^Failed (?:password|publickey) for (?!invalid user )(\S+) from ([0-9a-fA-F.:]+) port \d+/; // invalid users: counted by INVALID
+const INVALID = /^Invalid user ([\s\S]*) from ([0-9a-fA-F.:]+) port \d+$/;
+
+/** `journalctl -o json` lines → { accepted: [{ time, method, user, ip, fingerprint }], failed: [{ time, user, ip }], cursor }. */
+export function parseJournal(out) {
+  const accepted = [];
+  const failed = [];
+  let cursor = null;
+  for (const l of out.split('\n')) {
+    if (!l.trim()) continue;
+    let e;
+    try { e = JSON.parse(l); } catch { continue; }
+    cursor = e.__CURSOR || cursor;
+    if (e._COMM !== 'sshd' && e._COMM !== 'sshd-session') continue;
+    const msg = Array.isArray(e.MESSAGE) ? Buffer.from(e.MESSAGE).toString('utf8') : String(e.MESSAGE ?? ''); // bytes when not UTF-8
+    const time = new Date(Number(e.__REALTIME_TIMESTAMP) / 1000).toISOString();
+    let m = msg.match(ACCEPTED);
+    if (m) accepted.push({ time, method: m[1], user: m[2], ip: m[3], fingerprint: m[4] || null });
+    else if ((m = msg.match(FAILED) || msg.match(INVALID))) failed.push({ time, user: m[1], ip: m[2] });
+  }
+  return { accepted, failed, cursor };
+}
 
 async function logins(helpers) {
-  const r = await run(helpers, 'journalctl', ['-t', 'sshd', '-t', 'sshd-session', '--since', `-${DAYS}d`, '-o', 'short-iso', '--no-pager',
-    '-g', 'Accepted |Failed (password|publickey) for |Invalid user '], { quiet: true, timeout: 90_000 });
-  const accepted = [];
+  const r = await run(helpers, 'journalctl', [...JOURNAL, '--since', `-${DAYS}d`], { quiet: true, timeout: 90_000 });
+  const j = parseJournal(r.stdout);
   const ips = new Map();
-  let failed = 0;
-  for (const l of r.stdout.split('\n')) {
-    const time = l.slice(0, l.indexOf(' ')).replace(/([+-]\d\d)(\d\d)$/, '$1:$2'); // +0000 → +00:00 (ISO)
-    let m = l.match(ACCEPTED);
-    if (m) { accepted.push({ time, method: m[1], user: m[2], ip: m[3], fingerprint: m[4] || null }); continue; }
-    m = l.match(FAILED) || l.match(INVALID);
-    if (!m) continue;
-    failed++;
-    const e = ips.get(m[2]) || { ip: m[2], count: 0, last: time, users: new Set() };
-    e.count++; e.last = time;
-    if (e.users.size < 5) e.users.add(m[1] || '(empty)');
-    ips.set(m[2], e);
+  for (const f of j.failed) {
+    const e = ips.get(f.ip) || { ip: f.ip, count: 0, last: f.time, users: new Set() };
+    e.count++; e.last = f.time;
+    if (e.users.size < 5) e.users.add(f.user || '(empty)');
+    ips.set(f.ip, e);
   }
   return {
     days: DAYS,
-    accepted: accepted.reverse().slice(0, 100), // newest first
-    failed: { total: failed, ips: [...ips.values()].sort((a, b) => b.count - a.count).slice(0, 20).map((e) => ({ ...e, users: [...e.users] })) },
+    accepted: j.accepted.reverse().slice(0, 100), // newest first
+    failed: { total: j.failed.length, ips: [...ips.values()].sort((a, b) => b.count - a.count).slice(0, 20).map((e) => ({ ...e, users: [...e.users] })) },
   };
 }
 
@@ -95,17 +113,13 @@ export const CURSOR_RE = /^[\w=;]{10,400}$/;
 const cursorOf = (out) => (out.match(/^-- cursor: (\S+)\s*$/m) || [])[1] || null;
 export async function sshLoginsSince(helpers, after) {
   if (after) {
-    const r = await run(helpers, 'journalctl', ['-t', 'sshd', '-t', 'sshd-session', '--after-cursor', after, '-n', '5000',
-      '-o', 'short-iso', '--show-cursor', '--no-pager'], { quiet: true, timeout: 30_000 });
+    const r = await run(helpers, 'journalctl', [...JOURNAL, '--after-cursor', after, '-n', '5000'], { quiet: true, timeout: 30_000 });
     if (r.code === 0) {
-      const found = [];
-      for (const l of r.stdout.split('\n')) {
-        const m = l.match(ACCEPTED);
-        if (m) found.push({ time: l.slice(0, l.indexOf(' ')).replace(/([+-]\d\d)(\d\d)$/, '$1:$2'), method: m[1], user: m[2], ip: m[3], fingerprint: m[4] || null });
-      }
-      let byFp = new Map();
-      if (found.some((x) => x.fingerprint)) byFp = new Map((await listKeys(helpers, await sshdConfig(helpers))).map((k) => [k.fingerprint, { comment: k.comment, user: k.user }]));
-      return { cursor: cursorOf(r.stdout) || after, logins: found.map((x) => ({ ...x, key: x.fingerprint ? byFp.get(x.fingerprint) || null : null })) };
+      const j = parseJournal(r.stdout);
+      // The key must be in the login's OWN authorized_keys: the same key in another user's file is not it.
+      let byUserKey = new Map();
+      if (j.accepted.some((x) => x.fingerprint)) byUserKey = new Map((await listKeys(helpers, await sshdConfig(helpers))).map((k) => [`${k.user}|${k.fingerprint}`, { comment: k.comment, user: k.user }]));
+      return { cursor: j.cursor || after, logins: j.accepted.map((x) => ({ ...x, key: x.fingerprint ? byUserKey.get(`${x.user}|${x.fingerprint}`) || null : null })) };
     }
   }
   const r = await run(helpers, 'journalctl', ['-n', '1', '-o', 'cat', '--show-cursor', '--no-pager'], { quiet: true, timeout: 30_000 });
@@ -120,13 +134,13 @@ export async function sshStatus(helpers) {
   const cfg = await sshdConfig(helpers);
   const [keyList, log, f2b] = await Promise.all([listKeys(helpers, cfg), logins(helpers), fail2ban(helpers)]);
   const lastUsed = new Map();
-  for (const a of log.accepted) if (a.fingerprint && !lastUsed.has(a.fingerprint)) lastUsed.set(a.fingerprint, a.time);
+  for (const a of log.accepted) if (a.fingerprint && !lastUsed.has(`${a.user}|${a.fingerprint}`)) lastUsed.set(`${a.user}|${a.fingerprint}`, a.time);
   return {
     config: {
       port: cfg.port || '22', passwordLogin: cfg.passwordauthentication === 'yes', permitRootLogin: cfg.permitrootlogin || null,
       managed: await pathExists(DROPIN),
     },
-    keys: keyList.map((k) => ({ ...k, lastUsed: lastUsed.get(k.fingerprint) || null })),
+    keys: keyList.map((k) => ({ ...k, lastUsed: lastUsed.get(`${k.user}|${k.fingerprint}`) || null })),
     logins: log,
     fail2ban: f2b,
   };
@@ -152,7 +166,7 @@ export async function setPasswordLogin(helpers, on) {
   if (!/^\s*Include\s+\/etc\/ssh\/sshd_config\.d\/\*\.conf/mi.test(main)) {
     throw new Error('This server\'s sshd_config doesn\'t read /etc/ssh/sshd_config.d — change PasswordAuthentication there by hand.');
   }
-  if (!on && !(await listKeys(helpers, await sshdConfig(helpers))).length) {
+  if (!on && !(await listKeys(helpers, await sshdConfig(helpers))).some(loginKey)) {
     throw new Error('No SSH key is set up for any user — turning password login off would lock everyone out. Add a key first.');
   }
   const v = on ? 'yes' : 'no';
@@ -186,8 +200,34 @@ export async function removeKeys(helpers, list) {
   const cfg = await sshdConfig(helpers);
   const all = await listKeys(helpers, cfg);
   const gone = (k) => list.some((x) => x.user === k.user && x.fingerprint === k.fingerprint);
-  if (cfg.passwordauthentication !== 'yes' && all.length && all.every(gone)) {
+  if (cfg.passwordauthentication !== 'yes' && all.some(loginKey) && !all.some((k) => loginKey(k) && !gone(k))) {
     throw new Error('That would remove every SSH key while password login is off — nobody could log in. Keep at least one key.');
   }
   return (await keys(helpers, { op: 'remove', akf: cfg.authorizedkeysfile, list })).removed;
+}
+
+// Self-check: node src/lib/ssh.js
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const assert = (await import('node:assert')).strict;
+  const entry = (comm, message, extra = {}) => JSON.stringify({ _COMM: comm, __CURSOR: `c-${message.length}`, __REALTIME_TIMESTAMP: '1700000000000000', MESSAGE: message, ...extra });
+  const out = [
+    entry('sshd-session', 'Accepted publickey for bob from 1.2.3.4 port 5022 ssh2: ED25519 SHA256:abcDEF+/12'),
+    entry('logger', 'Accepted password for root from 6.6.6.6 port 1 ssh2'), // a local program logging as sshd: ignored
+    entry('sshd', 'Invalid user Accepted password for root from 6.6.6.6 port 1 from 7.7.7.7 port 22'), // the name is attacker text
+    entry('sshd', 'Failed password for invalid user admin from 8.8.8.8 port 22 ssh2'), // counted by its Invalid user line
+    entry('sshd', 'Invalid user admin from 8.8.8.8 port 22'),
+    entry('sshd', 'Failed password for root from 9.9.9.9 port 22 ssh2'),
+    entry('sshd', 'xAccepted password for root from 6.6.6.6 port 1 ssh2'), // not anchored: ignored
+    entry('sshd', 'Accepted password for bob from 1.2.3.4 port 5023 ssh2', { MESSAGE: [...Buffer.from('Accepted password for bob from 1.2.3.4 port 5023 ssh2')] }),
+  ].join('\n');
+  const j = parseJournal(out);
+  assert.deepEqual(j.accepted.map((a) => [a.user, a.ip, a.method, a.fingerprint]), [
+    ['bob', '1.2.3.4', 'publickey', 'SHA256:abcDEF+/12'], ['bob', '1.2.3.4', 'password', null]]);
+  assert.deepEqual(j.failed.map((f) => [f.user, f.ip]), [['Accepted password for root from 6.6.6.6 port 1', '7.7.7.7'], ['admin', '8.8.8.8'], ['root', '9.9.9.9']]);
+  assert.equal(j.cursor, `c-${'Accepted password for bob from 1.2.3.4 port 5023 ssh2'.length}`);
+  assert.equal(j.accepted[0].time, '2023-11-14T22:13:20.000Z');
+  assert.equal(loginKey({ options: 'no-pty,command="x"' }), false);
+  assert.equal(loginKey({ options: 'from="10.0.0.1",restrict' }), false);
+  assert.equal(loginKey({ options: 'no-pty' }), true);
+  console.log('ssh ok');
 }

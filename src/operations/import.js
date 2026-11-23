@@ -9,7 +9,7 @@ import {
 import { wpCli, clearWpCaches, safePrefix, setWpConstant } from '../lib/wp.js';
 import { PHP_VERSIONS, DEFAULT_PHP } from '../lib/stack.js';
 import { issueHttp, issueDnsCloudflare } from '../lib/acme.js';
-import { syncCachePlugin, retireLiteSpeedCache, syncLiteSpeedGuard, setObjectCache } from '../lib/cache.js';
+import { syncCachePlugin, retireLiteSpeedCache, syncLiteSpeedGuard, setObjectCache, readHead } from '../lib/cache.js';
 import { cleanJob, fitsCron, CRON_MAX, WP_CRON_EVERY } from '../lib/cron.js';
 import { cleanPhpSettings, cleanFpm } from '../lib/phpsettings.js';
 import { saveRule, deleteRule } from '../lib/nginxrules.js';
@@ -184,7 +184,9 @@ export async function runRestoreFromLocal(job, helpers, {
     // What kind of site this was. Archives made before site types existed are
     // WordPress; values are checked, never trusted.
     let src = {};
-    try { src = JSON.parse(await fs.readFile(`${tmpDir}/wcloud-site.json`, 'utf8')); } catch { /* older archive */ }
+    // readHead: the archive is untrusted — a link to /dev/zero or a FIFO must
+    // not exhaust memory or hang the reader (no-follow, regular files, bounded).
+    try { src = JSON.parse(await readHead(`${tmpDir}/wcloud-site.json`, 1 << 20)); } catch { /* older archive */ }
     const type = SITE_TYPES.includes(src.type) ? src.type : 'wordpress';
     // canonical "keep" (a restore): the address the site had — www or not.
     if (canonical === 'keep') {
@@ -199,8 +201,7 @@ export async function runRestoreFromLocal(job, helpers, {
     let tablePrefix = 'wp_';
     if (type === 'wordpress') {
       for (const cfgPath of [`${tmpDir}/site/wp-config.php`, `${tmpDir}/site/htdocs/wp-config.php`]) {
-        if (!(await pathExists(cfgPath))) continue;
-        const m = (await fs.readFile(cfgPath, 'utf8')).match(/\$table_prefix\s*=\s*['"]([^'"]+)['"]/);
+        const m = ((await readHead(cfgPath, 256 * 1024)) || '').match(/\$table_prefix\s*=\s*['"]([^'"]+)['"]/);
         if (m) {
           if (safePrefix(m[1])) tablePrefix = m[1];
           else warn('The archived table prefix is not a plain name — using wp_');

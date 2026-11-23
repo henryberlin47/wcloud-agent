@@ -59,7 +59,7 @@ const config = {
   // IP that presents a valid token (NOT recommended for a root agent).
   allowedIps: parseList(process.env.AGENT_ALLOWED_IPS),
 
-  // Whether the agent trusts X-Forwarded-For (only enable behind a known proxy).
+  // Whether the agent trusts X-Forwarded-For — from a proxy on this machine only (auth.js).
   trustProxy: process.env.AGENT_TRUST_PROXY === '1',
 
   // Paths

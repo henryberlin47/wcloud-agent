@@ -19,6 +19,25 @@ const ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const slug = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'rule';
 const read = async (p) => { try { return await fs.readFile(p, 'utf8'); } catch { return null; } };
 
+// Directives a rule may not use: nginx's root master opens their paths as root
+// (include, *_log, *_temp_path, geoip/xslt files), they hand requests to other
+// sockets or code (*_pass, fastcgi_param, perl, njs, lua), or they serve files
+// outside the site (root, alias). An access_log into /etc/profile.d is root
+// code execution. Matched as a word anywhere — quoted names count, and a false
+// positive inside a header value only refuses the rule. `../` likewise: a
+// try_files path can climb out of the site's root.
+// ponytail: denylist, not a parser; switch to an allowlist if rules grow beyond
+// locations/headers/rewrites.
+const BANNED = /(?:^|[\s;{}'"])(include|load_module|root|alias|\w*_log|\w+_temp_path|\w+_cache_path|\w+_pass|fastcgi_param|fastcgi_\w+|ssl_\w+|auth_basic_user_file|geoip\w*|xslt_\w+|perl\w*|js_\w+|\w*lua\w*|modsecurity\w*|ssi|env|user|pid|working_directory)(?=[\s;{'"]|$)/m;
+/** Why a rule's content is refused, or null. */
+export function ruleProblem(content) {
+  // `access_log off;`, `rewrite_log on;` open nothing.
+  const m = content.replace(/(^|[\s;{}])\w*_log\s+(?:on|off)\s*;/gm, '$1;').match(BANNED);
+  if (m) return `"${m[1]}" isn't allowed in a custom rule`;
+  if (/\.\.[\/\\]|[\/\\]\.\./.test(content)) return '"../" isn\'t allowed in a custom rule';
+  return null;
+}
+
 export async function listRules(d) {
   let files = [];
   try { files = await fs.readdir(dir(d)); } catch { return []; }
@@ -91,4 +110,17 @@ export async function deleteRule(helpers, d, id) {
   if (!ID.test(id)) throw new Error('invalid rule id');
   const on = `${dir(d)}/${id}.conf`;
   await commit(helpers, d, { [on]: null, [`${on}.off`]: null });
+}
+
+// Self-check: node src/lib/nginxrules.js
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const assert = (await import('node:assert')).strict;
+  for (const ok of ['return 503;', 'location /old { return 301 /new; }', 'add_header Content-Security-Policy "default-src \'self\'; img-src *";',
+    'location ~* \\.(png|jpg)$ { expires 30d; }', 'client_max_body_size 64m;', 'rewrite ^/a/(.*)$ /b/$1 permanent;', 'deny 1.2.3.4;\nallow all;',
+    'location /x { try_files $uri $uri/ /index.php?$args; }', 'set $rootish 1;', 'proxy_set_header X-A b;', 'location / {access_log off;}', 'location /a { rewrite_log on; }']) assert.equal(ruleProblem(ok), null, ok);
+  for (const bad of ['access_log /etc/profile.d/x.sh;', 'include /etc/shadow;', '"include" /etc/shadow;', "location /a {\n  alias /var/www/;\n}",
+    'root /etc;', 'error_log /root/.bashrc;', 'client_body_temp_path /usr/bin;', 'fastcgi_pass unix:/run/php/x.sock;', 'proxy_pass http://127.0.0.1:8787;',
+    'fastcgi_param PHP_VALUE "auto_prepend_file=php://input";', 'location /p { content_by_lua_block { os.execute("id") } }', 'js_import /tmp/x.js;',
+    'try_files /../../../etc/passwd =404;', 'ssl_certificate_key /etc/letsencrypt/live/o/key.pem;', 'access_log off; access_log /tmp/x;']) assert.ok(ruleProblem(bad), bad);
+  console.log('nginxrules self-check ok');
 }

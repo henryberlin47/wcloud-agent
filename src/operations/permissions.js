@@ -15,7 +15,8 @@ import { requireSpec, siteDir, webRoot, siteTmp, phpLogPath } from '../lib/sites
 // end up with other owners or world-readable modes: PHP can't write them, or
 // other sites' users can read them. Nothing here follows a link the site made:
 // the top folders sit in root's 0711 folder (the site can't replace them), and
-// inside them `chown -h` / `chmod -R` change links themselves, never their targets.
+// inside them root only runs `chown -h` / `chgrp -h` (links themselves); every
+// chmod and find runs AS the site user, so a link can only reach its own files.
 // ============================================================
 
 /** The top-level folders and files only — cheap, run for every site at agent start. */
@@ -47,20 +48,24 @@ export async function runPermissions(job, helpers, p) {
   step(`Owner and permissions of every file (${s.user}:www-data)`);
   // How many had another owner, for the log: one pass of find, nothing changed by it.
   const off = await run(helpers, 'find', [root, '(', '!', '-user', s.user, '-o', '!', '-group', 'www-data', ')', '-printf', '.'], { quiet: true, timeout: 30 * 60_000 });
-  const must = async (what, cmd, args) => {
-    const r = await run(helpers, cmd, args, { timeout: 30 * 60_000 });
+  const must = async (what, cmd, args, opts = {}) => {
+    const r = await run(helpers, cmd, args, { timeout: 30 * 60_000, ...opts });
     if (r.code !== 0) throw new Error(`${what} failed`);
   };
-  await must('Setting the owner', 'chown', ['-R', '-P', '-h', `${s.user}:www-data`, root]);
-  await must('Setting the permissions', 'chmod', ['-R', 'u+rwX,g+rX,g-w,o-rwx', root]);
-  await must('Setting the folder group bit', 'find', [root, '-type', 'd', '-exec', 'chmod', 'g+s', '{}', '+']);
+  // The setgid bit is kept only on a folder whose group the user is in, so the
+  // group is the user's while modes are set and www-data is put back last.
+  const as = await userIds(s.user);
+  await must('Setting the owner', 'chown', ['-R', '-P', '-h', `${s.user}:${s.user}`, root]);
+  await must('Setting the permissions', 'chmod', ['-R', 'u+rwX,g+rX,g-w,o-rwx', root], { as });
+  await must('Setting the folder group bit', 'find', [root, '-type', 'd', '-exec', 'chmod', 'g+s', '{}', '+'], { as });
+  await must('Setting the group', 'chgrp', ['-R', '-P', '-h', 'www-data', root]);
   const n = (off.stdout || '').length;
   ok(n ? `Owner corrected on ${n} file${n === 1 ? '' : 's'} or folder${n === 1 ? '' : 's'}; permissions set on all` : 'Owners were already correct; permissions set on all');
 
   if ((await fs.lstat(tmp).catch(() => null))?.isDirectory()) {
     step('The site\'s private tmp folder');
     await must('Setting the owner', 'chown', ['-R', '-P', '-h', `${s.user}:${s.user}`, tmp]);
-    await must('Setting the permissions', 'chmod', ['-R', 'u+rwX,go-rwx', tmp]);
+    await must('Setting the permissions', 'chmod', ['-R', 'u+rwX,go-rwx', tmp], { as });
     ok('tmp folder private to the site');
   }
   done(`File permissions of ${s.domain} are correct`);

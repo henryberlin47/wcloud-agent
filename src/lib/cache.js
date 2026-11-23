@@ -176,7 +176,7 @@ export async function syncCachePlugin(helpers, s) {
 // First `n` bytes of a site-owned file, read as root: no symlinks (O_NOFOLLOW),
 // never waits on a FIFO (O_NONBLOCK — a blocked open holds one of the agent's
 // few fs threads for good), regular files only. null = not readable.
-async function readHead(file, n) {
+export async function readHead(file, n) {
   let fh;
   try {
     fh = await fs.open(file, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK);

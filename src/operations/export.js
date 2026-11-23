@@ -1,10 +1,11 @@
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { publicUrl } from '../config.js';
-import { run, pathExists, removePath } from '../lib/sys.js';
+import { run, pathExists, removePath, userIds } from '../lib/sys.js';
 import { logger } from '../lib/log.js';
 import { requireSpec, publicSpec, siteDir, siteTmp } from '../lib/sites.js';
 import { wpCli } from '../lib/wp.js';
@@ -27,6 +28,38 @@ async function createPrivateFile(p) {
 // site that creates `<that name>.tar.gz` first makes every export on the
 // server fail.
 const archiveName = (ext) => `/tmp/wcloud_export_${crypto.randomBytes(16).toString('hex')}${ext}`;
+
+// The site's files, read by the site's own user. Root never walks a path the
+// site controls: cp opens children by path, so a directory swapped for a link
+// mid-copy sends root into /etc. Here tar -c runs as the site and streams into
+// a root tar -x that only unpacks it into staging. tar stores a link as a link
+// and never descends into one, so the stream has nothing under a link to write
+// through. The top folder is root's (0711), so its names are fixed; tmp/ is
+// left out (sessions, the dump in flight; it is removed below anyway).
+async function copySiteFiles(helpers, s, dest) {
+  const { uid, gid, home } = await userIds(s.user);
+  const names = (await fs.readdir(siteDir(s.domain))).filter((n) => n !== 'tmp');
+  await fs.mkdir(dest);
+  const env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: home, LANG: 'C.UTF-8', LC_ALL: 'C' };
+  const src = spawn('tar', ['-c', '-C', siteDir(s.domain), ...names], { uid, gid, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const dst = spawn('tar', ['-x', '-C', dest], { env, stdio: ['pipe', 'ignore', 'pipe'] });
+  src.stdout.pipe(dst.stdin);
+  dst.stdin.on('error', () => {}); // dst died: src is killed below
+  const wait = (p) => new Promise((resolve) => {
+    let stderr = '';
+    p.stderr.setEncoding('utf8').on('data', (d) => { stderr += d; });
+    p.on('error', (e) => resolve({ code: -1, stderr: e.message }));
+    p.on('close', (code) => resolve({ code: code ?? -1, stderr }));
+  });
+  const onAbort = () => { src.kill('SIGKILL'); dst.kill('SIGKILL'); };
+  helpers.signal?.addEventListener('abort', onAbort, { once: true });
+  const a = wait(src);
+  const b = wait(dst).then((r) => { if (r.code !== 0) src.kill('SIGKILL'); return r; });
+  const [sr, dr] = await Promise.all([a, b]);
+  helpers.signal?.removeEventListener('abort', onAbort);
+  if (helpers.signal?.aborted) throw new Error(`cancelled (${helpers.signal.reason ?? 'aborted'})`);
+  return { code: sr.code || dr.code, stderr: sr.stderr + dr.stderr };
+}
 
 // Build the site archive (DB dump + files + optional SSL), encrypting it when
 // an encryptKey is given. Shared by the export op (served over HTTP) and the
@@ -88,28 +121,22 @@ async function packSite(helpers, domain, s, { tmpDir, dump, archivePath, encrypt
     ok('Database exported');
   }
 
-  // 2) Copy the site files (root, reading everything).
+  // 2) Copy the site files, read by the site's own user (copySiteFiles).
   step('Copy the site files');
   const destSite = `${tmpDir}/site`;
-  // quiet + LC_ALL=C: cp's own lines are read below, in English.
-  const cpR = await run(helpers, 'cp', ['-a', siteDir(domain), destSite], { quiet: true, env: { LC_ALL: 'C' } });
-  // The site is live: a file cp listed and found gone when it came to read it
-  // (an upload's temp file, a session, a purged cache) is gone from the site
-  // too — not a failed copy. Anything else cp complains about still is.
-  // A directory gone after cp entered it (cache purge, wp-content/upgrade) adds
-  // a line from the permissions step, which reads the source by path again:
-  // the bare path (coreutils 8) or "preserving permissions for <copy>" (9).
-  // Staging is root-only, so "No such file" on these is always the source.
+  const cpR = await copySiteFiles(helpers, s, destSite);
+  // The site is live: a file listed and found gone when tar came to read it (an
+  // upload's temp file, a session, a purged cache) is gone from the site too —
+  // not a failed copy. Anything else tar complains about still is.
   const cpErrs = cpR.stderr.split('\n').filter((l) => l.trim());
-  const vanishedOnly = cpR.code === 1 && cpErrs.length > 0
-    && cpErrs.every((l) => /^cp: (cannot (stat|access|open|read symbolic link) .*|preserving permissions for .*|'.*'): No such file or directory$/.test(l))
-    && await pathExists(destSite); // the site folder itself gone = nothing was copied
+  const vanishedOnly = cpR.code !== 0 && cpErrs.length > 0
+    && cpErrs.every((l) => /^tar: (.*: (File removed before we read it|file changed as we read it|Cannot (stat|open): No such file or directory)|Exiting with failure status due to previous errors)$/.test(l));
   if (cpR.code !== 0 && !vanishedOnly) {
     // A partial copy would still archive and upload "successfully" — a
     // silently incomplete restore point.
     for (const l of cpErrs.slice(-15)) helpers.err?.(`    ${l}`);
     await removePath(tmpDir);
-    throw new Error('Copying the site files failed — the disk may be full.');
+    throw new Error('Copying the site files failed — a file the site can\'t read, or the disk is full.');
   }
   // Sessions, uploads in flight and caches don't belong in a restore point.
   // Removing follows links in every part of a path but the last, and htdocs is
