@@ -13,6 +13,7 @@ import { runSsl, runSslDnsVerify } from './ssl.js';
 import { runCanonical } from './canonical.js';
 import { runPurge } from './purge.js';
 import { runResetPassword } from './resetPassword.js';
+import { runResetPasswords } from './resetPasswords.js';
 import { runExport, isLocalDir } from './export.js';
 import { runImport } from './import.js';
 import { runBackup } from './backup.js';
@@ -742,6 +743,20 @@ const resetPassword = {
   },
 };
 
+// ============================================================
+//  resetpasswords — new random passwords for every WordPress user on the server
+// ============================================================
+const resetPasswordsOp = {
+  name: 'resetpasswords',
+  // params: { appPasswords?: boolean }
+  validate(p = {}) {
+    return { ok: true, errors: [], clean: { appPasswords: p.appPasswords === true } };
+  },
+  async run(job, helpers, p) {
+    await runResetPasswords(job, helpers, p);
+  },
+};
+
 // Archive work (export/import for migrations, backup/restore) can take hours on
 // big sites, so these ops run past the default job timeout. Export/import used
 // to get the 20-minute default, so migrating any large site was killed mid-way.
@@ -918,7 +933,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, firewall: firewallOp, deploy, php: phpOp, phpupdate: phpUpdateOp, nginxupdate: nginxUpdateOp, sysupdate: sysupdateOp, harden: hardenOp, rotatekey: rotateKeyOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, firewall: firewallOp, deploy, php: phpOp, phpupdate: phpUpdateOp, nginxupdate: nginxUpdateOp, sysupdate: sysupdateOp, harden: hardenOp, rotatekey: rotateKeyOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, resetpasswords: resetPasswordsOp, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;
