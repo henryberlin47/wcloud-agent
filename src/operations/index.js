@@ -14,6 +14,7 @@ import { runCanonical } from './canonical.js';
 import { runPurge } from './purge.js';
 import { runResetPassword } from './resetPassword.js';
 import { runResetPasswords } from './resetPasswords.js';
+import { runWpUsers } from './wpUsers.js';
 import { runExport, isLocalDir } from './export.js';
 import { runImport } from './import.js';
 import { runBackup } from './backup.js';
@@ -757,6 +758,28 @@ const resetPasswordsOp = {
   },
 };
 
+// ============================================================
+//  wpusers — chosen WordPress users of one site: new password, logged out
+// ============================================================
+const wpUsersOp = {
+  name: 'wpusers',
+  // params: { domain, user_ids: [int], password?: string (one user only), appPasswords?: boolean }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    const ids = Array.isArray(p.user_ids) ? [...new Set(p.user_ids)] : [];
+    if (!ids.length || ids.length > 1000 || !ids.every((x) => Number.isInteger(x) && x > 0)) errors.push('user_ids must be 1–1000 user ids');
+    const password = typeof p.password === 'string' ? p.password : '';
+    if (password && ids.length !== 1) errors.push('a password can only be set for one user at a time');
+    if (password.length > 200) errors.push('password must be 200 characters or fewer');
+    return { ok: errors.length === 0, errors, clean: { domain: p.domain, user_ids: ids, ...(password ? { password } : {}), appPasswords: p.appPasswords === true } };
+  },
+  async run(job, helpers, p) {
+    await runWpUsers(job, helpers, p);
+  },
+};
+
 // Archive work (export/import for migrations, backup/restore) can take hours on
 // big sites, so these ops run past the default job timeout. Export/import used
 // to get the 20-minute default, so migrating any large site was killed mid-way.
@@ -933,7 +956,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, firewall: firewallOp, deploy, php: phpOp, phpupdate: phpUpdateOp, nginxupdate: nginxUpdateOp, sysupdate: sysupdateOp, harden: hardenOp, rotatekey: rotateKeyOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, resetpasswords: resetPasswordsOp, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, firewall: firewallOp, deploy, php: phpOp, phpupdate: phpUpdateOp, nginxupdate: nginxUpdateOp, sysupdate: sysupdateOp, harden: hardenOp, rotatekey: rotateKeyOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, resetpasswords: resetPasswordsOp, wpusers: wpUsersOp, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

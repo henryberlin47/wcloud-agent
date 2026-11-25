@@ -39,6 +39,7 @@ import { fixSiteStructure } from './operations/permissions.js';
 import { securityAvailable } from './lib/security.js';
 import { openTerminal, getTerminal, followTerminal, writeTerminal, resizeTerminal, closeTerminal } from './lib/terminal.js';
 import { listPlugins, searchPlugins } from './lib/plugins.js';
+import { listWpUsers } from './operations/wpUsers.js';
 import { siteTmp, fullchainPath } from './lib/sites.js';
 import { readSiteLog, LOG_TYPES } from './lib/sitelogs.js';
 import { listRules } from './lib/nginxrules.js';
@@ -474,6 +475,12 @@ app.get('/api/sites/:domain/plugins/search', siteParam, wpOnly, async (req, res)
   if (!q) return res.status(400).json({ error: 'EINVAL', message: 'Type something to search for.' });
   try { res.json({ plugins: await searchPlugins(NOOP_HELPERS, req.site, q) }); }
   catch (e) { res.status(502).json({ error: 'search_failed', message: e.message }); }
+});
+
+// WordPress users (read live; password changes are the `wpusers` op).
+app.get('/api/sites/:domain/users', siteParam, wpOnly, async (req, res) => {
+  try { res.json(await listWpUsers(NOOP_HELPERS, req.site)); }
+  catch (e) { res.status(502).json({ error: 'wp_failed', message: e.message }); }
 });
 
 // Search engine visibility: WordPress's blog_public option (read live).

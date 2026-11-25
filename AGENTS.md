@@ -111,6 +111,14 @@ as the source of truth for writing code** — the graph is only a map.
   refuse a leading `-`, and the search term has leading whitespace/dashes
   stripped (in the route and again in `searchPlugins`). All wp-cli runs as
   the site user.
+- **WordPress users** (`operations/wpUsers.js`): `GET /api/sites/:domain/users`
+  → `{ users: [{ id, login, email, name, roles, registered, sessions,
+  last_login, last_ip, app_passwords }], more }` (first 1000; last login =
+  the newest WordPress session token). The `wpusers` op `{ domain, user_ids,
+  password?, appPasswords? }` gives the users a random password (made inside
+  PHP, never seen) or — one user only — the given one (wp-cli prompt on
+  stdin, never argv), then destroys their sessions (+ application passwords).
+  Both run with `--skip-plugins --skip-themes`.
 - **Search engine visibility** (WordPress): `GET /api/sites/:domain/indexing`
   → `{ indexing }` (WordPress's `blog_public`, read live); the `indexing` op
   `{ domain, enabled }` sets it (same setting as Settings → Reading) and clears
