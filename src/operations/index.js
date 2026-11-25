@@ -292,6 +292,47 @@ const pluginOp = {
 };
 
 // ============================================================
+//  theme — manage a WordPress site's themes (plugin.js, kind "theme")
+// ============================================================
+const THEME_ACTIONS = ['install', 'activate', 'update', 'delete', 'auto-update-on', 'auto-update-off'];
+const themeOp = {
+  name: 'theme',
+  // params: { domain, action, themes?: [name], all?, slug?, upload?, activate?, replace? }
+  validate(p = {}) {
+    p = sanitize(p);
+    const errors = [];
+    reqDomain(errors, 'domain', p.domain);
+    const action = THEME_ACTIONS.includes(p.action) ? p.action : null;
+    if (!action) errors.push(`action must be one of: ${THEME_ACTIONS.join(', ')}`);
+    const clean = { domain: p.domain, action };
+    if (action === 'install') {
+      if (typeof p.upload === 'string' && p.upload) {
+        if (!UPLOAD_NAME.test(p.upload)) errors.push('upload must be a file from the upload endpoint');
+        clean.upload = p.upload;
+      } else if (typeof p.slug === 'string' && /^(?!-)[a-z0-9-]{1,100}$/.test(p.slug)) {
+        clean.slug = p.slug;
+      } else errors.push('slug (a WordPress.org theme slug) or upload is required');
+      clean.activate = p.activate === true;
+      clean.replace = p.replace === true;
+    } else if (action) {
+      if (p.all === true && ['update', 'auto-update-on', 'auto-update-off'].includes(action)) clean.all = true;
+      else {
+        const themes = Array.isArray(p.themes) ? p.themes : [];
+        if (!themes.length || themes.length > 200 || !themes.every((n) => typeof n === 'string' && PLUGIN_NAME.test(n))) {
+          errors.push('themes must be a list of theme names');
+        }
+        if (action === 'activate' && themes.length !== 1) errors.push('activate takes exactly one theme');
+        clean.themes = themes;
+      }
+    }
+    return { ok: errors.length === 0, errors, clean };
+  },
+  async run(job, helpers, p) {
+    await runPlugin(job, helpers, p, 'theme');
+  },
+};
+
+// ============================================================
 //  cache — page cache mode + Redis object cache (see cache.js)
 // ============================================================
 const cacheOp = {
@@ -956,7 +997,7 @@ const restoreOp = {
 
 // ---------------------------------------------------------------------------
 
-export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, firewall: firewallOp, deploy, php: phpOp, phpupdate: phpUpdateOp, nginxupdate: nginxUpdateOp, sysupdate: sysupdateOp, harden: hardenOp, rotatekey: rotateKeyOp, plugin: pluginOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, resetpasswords: resetPasswordsOp, wpusers: wpUsersOp, export: exportOp, import: importOp, backup, restore: restoreOp };
+export const operations = { permissions: permissionsOp, malwarescan: malwareScanOp, sshsecurity: sshSecurityOp, firewall: firewallOp, deploy, php: phpOp, phpupdate: phpUpdateOp, nginxupdate: nginxUpdateOp, sysupdate: sysupdateOp, harden: hardenOp, rotatekey: rotateKeyOp, plugin: pluginOp, theme: themeOp, cache: cacheOp, indexing: indexingOp, siteconfig: siteconfigOp, nginxrule: nginxruleOp, cron: cronOp, cfcache: cfcacheOp, update, delete: del, ssl, sslDnsVerify, canonical: canonicalOp, purge, resetPassword, resetpasswords: resetPasswordsOp, wpusers: wpUsersOp, export: exportOp, import: importOp, backup, restore: restoreOp };
 
 export function getOperation(type) {
   return operations[type] || null;

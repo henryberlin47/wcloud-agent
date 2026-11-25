@@ -111,6 +111,15 @@ as the source of truth for writing code** — the graph is only a map.
   refuse a leading `-`, and the search term has leading whitespace/dashes
   stripped (in the route and again in `searchPlugins`). All wp-cli runs as
   the site user.
+- **Themes** (WordPress sites): `GET /api/sites/:domain/themes` (PHP via
+  `eval-file` with plugins/themes off, so no theme code runs: `{ name, title,
+  version, author, status: active|parent|inactive, parent, update_version,
+  auto_update, screenshot (URL), error }`, broken themes included),
+  `GET …/themes/search?q=`. Changes are the **`theme` op** — `plugin.js`
+  with kind `theme`: `install` (slug or a `plugins/upload` zip), `activate`
+  (exactly one), `update` (names or `all`), `delete` (refused for the active
+  theme and its parent — wp-cli only guards the first), `auto-update-on|off`.
+  No `deactivate`. Theme names use `PLUGIN_NAME`.
 - **WordPress users** (`operations/wpUsers.js`): `GET /api/sites/:domain/users`
   → `{ users: [{ id, login, email, name, roles, registered, sessions,
   last_login, last_ip, app_passwords }], more }` (first 1000; last login =
@@ -476,7 +485,7 @@ Driven by env the portal's install command injects (`init.sh` writes them to
   `certCovers`, nginx/systemctl helpers.
 - **wplogin.js** — one-click wp-admin login links (§2).
 - **pma.js** — one-click phpMyAdmin links for a site's database (§2).
-- **plugins.js** — plugin list + WordPress.org search (changes: the `plugin` op).
+- **plugins.js** — plugin and theme lists + WordPress.org search (changes: the `plugin` / `theme` ops).
 - **files.js** + **../fm-worker.js** — the file manager (§2): spawn the worker
   as the site user, collect its JSON / stream its output, map error codes.
 - **sites.js** — the site model (§6): spec store (`readSpec`/`listSites`),

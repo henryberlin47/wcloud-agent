@@ -38,7 +38,7 @@ import { createPmaLink } from './lib/pma.js';
 import { fixSiteStructure } from './operations/permissions.js';
 import { securityAvailable } from './lib/security.js';
 import { openTerminal, getTerminal, followTerminal, writeTerminal, resizeTerminal, closeTerminal } from './lib/terminal.js';
-import { listPlugins, searchPlugins } from './lib/plugins.js';
+import { listPlugins, searchPlugins, listThemes, searchThemes } from './lib/plugins.js';
 import { listWpUsers } from './operations/wpUsers.js';
 import { siteTmp, fullchainPath } from './lib/sites.js';
 import { readSiteLog, LOG_TYPES } from './lib/sitelogs.js';
@@ -463,7 +463,7 @@ app.post('/api/sites/:domain/pma-login', siteParam, async (req, res) => {
 
 // --- WordPress plugins (changes are the `plugin` op) -------------------------
 const wpOnly = (req, res, next) => (req.site.type === 'wordpress' ? next()
-  : res.status(400).json({ error: 'not_wordpress', message: 'Only WordPress sites have plugins.' }));
+  : res.status(400).json({ error: 'not_wordpress', message: 'Only WordPress sites have plugins and themes.' }));
 
 app.get('/api/sites/:domain/plugins', siteParam, wpOnly, async (req, res) => {
   try { res.json({ plugins: await listPlugins(NOOP_HELPERS, req.site) }); }
@@ -474,6 +474,19 @@ app.get('/api/sites/:domain/plugins/search', siteParam, wpOnly, async (req, res)
   const q = typeof req.query.q === 'string' ? req.query.q.replace(/^[\s-]+/, '').trim().slice(0, 100) : '';
   if (!q) return res.status(400).json({ error: 'EINVAL', message: 'Type something to search for.' });
   try { res.json({ plugins: await searchPlugins(NOOP_HELPERS, req.site, q) }); }
+  catch (e) { res.status(502).json({ error: 'search_failed', message: e.message }); }
+});
+
+// --- WordPress themes (changes are the `theme` op; uploads use plugins/upload) --
+app.get('/api/sites/:domain/themes', siteParam, wpOnly, async (req, res) => {
+  try { res.json({ themes: await listThemes(NOOP_HELPERS, req.site) }); }
+  catch (e) { res.status(502).json({ error: 'themes_failed', message: e.message }); }
+});
+
+app.get('/api/sites/:domain/themes/search', siteParam, wpOnly, async (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.replace(/^[\s-]+/, '').trim().slice(0, 100) : '';
+  if (!q) return res.status(400).json({ error: 'EINVAL', message: 'Type something to search for.' });
+  try { res.json({ themes: await searchThemes(NOOP_HELPERS, req.site, q) }); }
   catch (e) { res.status(502).json({ error: 'search_failed', message: e.message }); }
 });
 
@@ -585,8 +598,8 @@ function stopOnAbort(req, child) {
   if (req.destroyed) abort(); // already gone while the worker was starting
 }
 
-// A plugin .zip → the site's PRIVATE tmp/ (never web-reachable), written as the
-// site's user. Returns { upload } for the `plugin` op's install action.
+// A plugin or theme .zip → the site's PRIVATE tmp/ (never web-reachable), written
+// as the site's user. Returns { upload } for the `plugin`/`theme` op's install.
 app.put('/api/sites/:domain/plugins/upload', siteParam, wpOnly, async (req, res) => {
   if (req.is('application/json')) return res.status(415).json({ error: 'unsupported', message: 'Send the zip as application/octet-stream.' });
   const upload = `wcloud-upload-${randomBytes(8).toString('hex')}.zip`;
